@@ -198,7 +198,9 @@ function paintScroll(wrap, p) {
   const a = rows[lo], b = rows[hi];
   if (!a || !view) return;
   const mid = (a.offsetTop + b.offsetTop + b.offsetHeight) / 2;
-  track.style.transform = `translateY(${Math.round(view.clientHeight * 0.46 - mid)}px)`;
+  // 宽屏（如 2048×896）高度紧张：当前行放正中；16:9 略偏上更符合视线
+  const center = wrap.classList.contains('is-wide') ? 0.5 : 0.46;
+  track.style.transform = `translateY(${Math.round(view.clientHeight * center - mid)}px)`;
 }
 
 function paintStanza(wrap, p, force) {
@@ -206,8 +208,14 @@ function paintStanza(wrap, p, force) {
   const si = p.secOf[p.active | 0] | 0;
   const sec = p.sections[si];
   if (!sec) { box.innerHTML = ''; return; }
-  if (force || box.dataset.sec !== String(si)) {
-    box.dataset.sec = String(si);
+  const n = sec.end - sec.start;
+  // 宽屏且段落较长：两栏排布，避免挤成一长列
+  const cols = wrap.classList.contains('is-wide') && n > 4;
+  const layoutKey = `${si}|${cols}`;
+  if (force || box.dataset.sec !== layoutKey) {
+    box.dataset.sec = layoutKey;
+    box.classList.toggle('cols-2', cols);
+    box.style.setProperty('--rows', String(Math.ceil(n / 2)));
     box.innerHTML = p.lines.slice(sec.start, sec.end)
       .map((t, k) => `<div class="lshow-sline" data-i="${sec.start + k}">${esc(t)}</div>`).join('');
     box.classList.remove('is-in');
@@ -230,7 +238,12 @@ function paintLabel(wrap, p) {
   el.classList.add('is-in');
 }
 
+/** 宽高比 ≥ 1.9（如 2048×896 的长条屏）走宽屏排版 */
+const WIDE_RATIO = 1.9;
+
 function paint(wrap, p, force = false) {
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  if (h > 0) wrap.classList.toggle('is-wide', w / h >= WIDE_RATIO);
   if (p.view === 'stanza') paintStanza(wrap, p, force);
   else paintScroll(wrap, p);
   paintLabel(wrap, p);

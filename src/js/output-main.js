@@ -3,13 +3,30 @@
 import {
   OUTPUT_EVENT, VIDEO_TIME_EVENT, renderOutput, applyFitMode, paintVideoTime,
 } from './output-core.js';
-import { emit, listen, lsGet } from './util.js';
+import { emit, listen, lsGet, lsSet } from './util.js';
 
 let previewEl = null;
 let current = { kind: 'clear' };
 let frozen = false;
 /** 快速切条时只采纳最新一次输出 */
 let outputSeq = 0;
+/** 输出屏宽高比：预览框按它显示（2048×896 这类长条屏与 16:9 差别很大） */
+const LS_OUT_AR = 'sp.output.aspect';
+function applyOutputAspect(ar) {
+  if (!(ar > 0.3 && ar < 6)) return;
+  document.documentElement.style.setProperty('--out-ar', String(ar));
+}
+applyOutputAspect(+lsGet(LS_OUT_AR, 0));
+listen('output:size', (e) => {
+  const { w, h } = e.payload || {};
+  if (!(w > 0 && h > 0)) return;
+  const ar = Math.round((w / h) * 1000) / 1000;
+  if (ar === +lsGet(LS_OUT_AR, 0)) return;
+  lsSet(LS_OUT_AR, ar);
+  applyOutputAspect(ar);
+  renderCurrent();
+}).catch(() => {});
+
 /** 输出窗口最近一次回报的视频进度 { path, t, d, paused, ended, at } */
 let lastVideoReport = null;
 

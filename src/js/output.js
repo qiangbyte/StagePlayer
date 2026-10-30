@@ -37,6 +37,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     controlVideo(e.payload.action, e.payload.value);
   });
 
+  // 回报所在屏幕的尺寸，主控预览按同样比例显示
+  const reportSize = () => emit('output:size', { w: window.screen.width, h: window.screen.height }).catch(() => {});
+  let sizeTimer = 0;
+  window.addEventListener('resize', () => { clearTimeout(sizeTimer); sizeTimer = setTimeout(reportSize, 300); });
+  reportSize();
+
   // 通知主控：输出窗口已就绪，请重推当前画面
   try { await emit('output:ready', {}); } catch { /* ignore */ }
   setTimeout(() => { emit('output:ready', {}).catch(() => {}); }, 300);

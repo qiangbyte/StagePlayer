@@ -743,7 +743,7 @@ button { font-family: inherit; cursor: pointer; }
 #preview-wrap {
   margin: 12px; background: #000; border-radius: 8px; overflow: hidden;
   display: flex; align-items: center; justify-content: center;
-  aspect-ratio: 16 / 9;
+  aspect-ratio: var(--out-ar, 16 / 9);
 }
 #preview-stage { width: 100%; height: 100%; }
 .preview-tips {
@@ -2065,7 +2065,7 @@ button { font-family: inherit; cursor: pointer; }
 }
 .lshow-row:hover { background: #26262b; }
 .lshow-row.active { background: color-mix(in srgb, var(--tc) 30%, #222); color: #fff; font-weight: 600; }
-.lshow-mini { flex: 0 0 auto; aspect-ratio: 16 / 9; height: auto; border-radius: 6px; overflow: hidden; }
+.lshow-mini { flex: 0 0 auto; aspect-ratio: var(--out-ar, 16 / 9); height: auto; border-radius: 6px; overflow: hidden; }
 .lshow-box { background: #222226; border: 1px solid #2c2c30; border-radius: 6px; }
 .lshow-box > summary { cursor: pointer; padding: 7px 10px; font-size: 13px; color: #cfcfd6; user-select: none; }
 .lshow-text {
@@ -2143,7 +2143,7 @@ button { font-family: inherit; cursor: pointer; }
   --d: 3;
   text-align: center; font-weight: 700; line-height: 1.35; padding: .28em 0;
   font-size: calc(6.4cqh * var(--lscale));
-  opacity: calc(.88 - min(var(--d), 4) * .2);
+  opacity: calc(.88 - min(var(--d), 4) * var(--fade, .2));
   transform: scale(calc(1 - min(var(--d), 3) * .06));
   filter: blur(calc(min(var(--d), 4) * .05cqh));
   text-shadow: 0 .06em .3em rgba(0, 0, 0, .45);
@@ -2168,4 +2168,23 @@ button { font-family: inherit; cursor: pointer; }
 .lshow-sline.is-active {
   opacity: 1;
   text-shadow: 0 0 .5em color-mix(in srgb, var(--glow) 55%, transparent), 0 .06em .3em rgba(0, 0, 0, .55);
+}
+
+/* 宽屏（≥1.9:1，如 2048×896）：字更大、当前行居中、只留上下各一两行，整段长时两栏 */
+.out-lshow.is-wide .lshow-viewport {
+  left: 7cqw; right: 7cqw;
+  mask-image: linear-gradient(180deg, transparent 0%, #000 24%, #000 76%, transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 24%, #000 76%, transparent 100%);
+}
+.out-lshow.is-wide .lshow-line { --fade: .3; font-size: calc(8.4cqh * var(--lscale)); padding: .2em 0; }
+.out-lshow.is-wide .lshow-line.is-active { transform: scale(1.1); }
+.out-lshow.is-wide .lshow-line.sec-start { margin-top: .7em; }
+.out-lshow.is-wide .lshow-label { top: 6cqh; left: 3cqw; font-size: 3.6cqh; }
+.out-lshow.is-wide .lshow-title { top: 5cqh; font-size: 3.8cqh; }
+.out-lshow.is-wide .lshow-stanza { inset: 9cqh 6cqw; }
+.out-lshow.is-wide .lshow-sline { font-size: calc(7.6cqh * var(--lscale)); }
+.view-stanza .lshow-stanza.cols-2 {
+  display: grid; grid-template-columns: 1fr 1fr; grid-auto-flow: column;
+  grid-template-rows: repeat(var(--rows), auto); align-content: center; justify-items: center;
+  column-gap: 6cqw; row-gap: .2em;
 }
