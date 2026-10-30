@@ -1,0 +1,2403 @@
+// 节目单 = 一场演出的时间轴（按顺序混排：音频/视频/图片/PPT页/PDF页，逐条播放）
+
+import {
+  pickFiles, esc, fileName, fileExt, lsGet, lsSet, toast, convertFileSrc, fmtTimeLong, listen,
+  lsApproxBytes, AUDIO_EXT, VIDEO_EXT, IMAGE_EXT, PPT_EXT, PDF_EXT, detectMediaType, invoke,
+} from './util.js';
+import { pushToOutput, getCurrentOutput, claimOutputSeq, isOutputFrozen } from './output-main.js';
+import {
+  playByPath as audioPlay,
+  getAudioSnapshot,
+  seekAudio,
+  cycleLoopMode,
+  getLoopModeLabel,
+  toggleAudio,
+  stopAudio,
+} from './audio.js';
+import { playByPath as videoPlay } from './video.js';
+import { getPageCount as pptPages, playPage as pptPlayPage, mountSlidePreview } from './ppt.js';
+import { getPageCount as pdfPages, playPage as pdfPlayPage, mountPdfPreview } from './pdf.js';
+import {
+  createBlankItem,
+  buildSongBlankSet,
+  blankToOutputPayload,
+  mountBlankPreview,
+} from './blank-page.js';
+import {
+  ensureBible, getBooks, getBook, chapterCount, verseCount,
+  parseReference, searchKeyword, getVerses, formatRefFull,
+} from './bible-data.js';
+import {
+  buildBibleItems, bibleToOutputPayload, mountBiblePreview,
+} from './bible-page.js';
+
+const LS_EVENTS = 'sp.program.events';
+const LS_CURRENT = 'sp.program.current';
+const LS_VIEW = 'sp.program.view';
+const LS_ZOOM = 'sp.program.zoom';
+/** 空白页大段歌词外置，避免撑爆 localStorage */
+const LS_BODIES = 'sp.program.bodies';
+
+function bodyStore() {
+  const m = lsGet(LS_BODIES, {});
+  return m && typeof m === 'object' ? m : {};
+}
+
+function hydrateBlankBody(it) {
+  if (!it || (it.type !== 'blank' && it.type !== 'bible')) return it;
+  if (it.body) return it;
+  const bodies = bodyStore();
+  const ref = it._bodyRef || it.id;
+  if (ref && bodies[ref]) it.body = bodies[ref];
+  return it;
+}
+
+function normalizeItem(it) {
+  if (!it || typeof it !== 'object') return null;
+  if (it.type === 'blank') {
+    const blankKind = it.blankKind === 'lyric' ? 'lyric' : 'title';
+    const title = (it.title || '').trim() || (blankKind === 'title' ? '歌曲名称' : '歌词');
+    const name = (it.name != null && String(it.name))
+      || (blankKind === 'lyric'
+        ? `${title} · 歌词${it.lyricIndex != null ? ` ${it.lyricIndex}` : ''}`
+        : `${title} · 歌名`);
+    const item = {
+      ...it,
+      type: 'blank',
+      blankKind,
+      title,
+      subtitle: it.subtitle || '',
+      body: it.body || '',
+      accent: it.accent || '#e8c56a',
+      bgPreset: it.bgPreset || 'auto',
+      bgImage: it.bgImage || '',
+      path: it.path || '',
+      name,
+      note: it.note || '',
+    };
+    return hydrateBlankBody(item);
+  }
+  if (it.type === 'bible') {
+    const ref = (it.ref || '').trim() || '圣经';
+    const item = {
+      ...it,
+      type: 'bible',
+      sn: +it.sn || 0,
+      bookName: it.bookName || '',
+      bookShort: it.bookShort || '',
+      chapter: +it.chapter || 1,
+      verseFrom: +it.verseFrom || 1,
+      verseTo: +it.verseTo || +it.verseFrom || 1,
+      rangeFrom: +it.rangeFrom || +it.verseFrom || 1,
+      rangeTo: +it.rangeTo || +it.verseTo || 1,
+      ref,
+      refFull: it.refFull || ref,
+      body: it.body || '',
+      accent: it.accent || '#e8c56a',
+      pageIndex: +it.pageIndex || 1,
+      pageTotal: +it.pageTotal || 1,
+      path: '',
+      name: (it.name != null && String(it.name)) || ref,
+      note: it.note || '',
+    };
+    return hydrateBlankBody(item);
+  }
+  const path = it.path || '';
+  const name = (it.name != null && String(it.name))
+    || (path ? fileName(path).replace(/\.[^.]+$/, '') : '')
+    || '未命名';
+  return { ...it, path, name, note: it.note || '' };
+}
+
+function normalizeEvents(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map((ev) => {
+    if (!ev || typeof ev !== 'object') return null;
+    const items = Array.isArray(ev.items)
+      ? ev.items.map(normalizeItem).filter(Boolean)
+      : [];
+    return { ...ev, name: ev.name || '未命名演出', items };
+  }).filter(Boolean);
+}
+
+function countItems(list) {
+  return (Array.isArray(list) ? list : []).reduce((n, e) => n + (e.items?.length || 0), 0);
+}
+
+let events = normalizeEvents(lsGet(LS_EVENTS, []));
+let currentId = lsGet(LS_CURRENT, null);
+let activeItemId = null;
+let activateSeq = 0; // 快速切条时只采纳最后一次
+let seekingAudio = false;
+let lobbyAutoArmed = false;
+let lobbyAutoKey = null;
+let cueFiring = false;
+const _savedView = lsGet(LS_VIEW, 'grid');
+let viewMode = _savedView === 'list' ? 'list' : 'grid';
+function initialCardZoom() {
+  const z = Number(lsGet(LS_ZOOM, 260));
+  if (!z || z < 140) return 260;
+  return Math.min(420, Math.max(140, z));
+}
+let cardZoom = initialCardZoom();
+let thumbToken = 0;
+/** path#page → ImageBitmap / dataURL 缓存，切换视图不丢、不重复解析 */
+const thumbCache = new Map();
+const THUMB_CONCURRENCY = 2; // 2 路并发：兼顾速度与内存
+
+const $ = (id) => document.getElementById(id);
+
+function armLobbyAutoStart(ev, L) {
+  const startAt = lobbyStartAtMs(L);
+  if (!L?.autoStart || !startAt || !ev) {
+    lobbyAutoArmed = false;
+    lobbyAutoKey = null;
+    return;
+  }
+  lobbyAutoKey = `${ev.id}:${startAt}`;
+  lobbyAutoArmed = true;
+}
+
+function tickLobbyAutoStart() {
+  if (!lobbyAutoArmed || !lobbyAutoKey) return;
+  const ev = curEvent();
+  if (!ev) return;
+  const L = ensureLobby(ev);
+  if (!L.autoStart) {
+    lobbyAutoArmed = false;
+    return;
+  }
+  const startAt = lobbyStartAtMs(L);
+  if (`${ev.id}:${startAt}` !== lobbyAutoKey) return;
+  if (Date.now() < startAt) return;
+  // 仅在扩展屏仍显示开场页时自动开播（避免误触）
+  if (getCurrentOutput()?.kind !== 'lobby') {
+    lobbyAutoArmed = false;
+    return;
+  }
+  // 冻结时保留 armed，解冻后下一 tick 再开播（与定时 cue 一致）
+  if (isOutputFrozen()) return;
+  lobbyAutoArmed = false;
+  if (!ev.items?.length) {
+    toast('到点了，但节目单还是空的');
+    return;
+  }
+  toast('到点 · 自动播放第一条');
+  activate(ev.items[0]);
+}
+
+const TYPE_META = {
+  audio: { icon: '♪', label: '音乐', color: '#3dd55f' },
+  video: { icon: '▶', label: '视频', color: '#4f8cff' },
+  image: { icon: '图', label: '图片', color: '#e8a23a' },
+  ppt: { icon: 'P', label: 'PPT', color: '#ff6b4a' },
+  pdf: { icon: 'PDF', label: 'PDF', color: '#c45cff' },
+  blank: { icon: '页', label: '空白页', color: '#e8c56a' },
+  bible: { icon: '经', label: '圣经', color: '#c9a227' },
+};
+
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function tomorrowStr() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** 节目开播时间点 → 毫秒时间戳 */
+function cueStartAtMs(item) {
+  if (!item?.cueTime) return 0;
+  const date = item.cueDate || todayStr();
+  const [y, m, d] = date.split('-').map(Number);
+  const parts = String(item.cueTime).split(':').map(Number);
+  if (!y || !m || !d) return 0;
+  return new Date(y, m - 1, d, parts[0] || 0, parts[1] || 0, parts[2] || 0, 0).getTime();
+}
+
+function fmtCueClock(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
+  return `${m}:${pad2(s)}`;
+}
+
+function initAudioFloat() {
+  $('audio-float-toggle')?.addEventListener('click', () => {
+    toggleAudio();
+    syncAudioFloat();
+  });
+  $('audio-float-stop')?.addEventListener('click', async () => {
+    await stopAudio();
+    syncAudioFloat();
+    syncAudioBar(true);
+    syncPlayGoBtn();
+    toast('已停止背景音乐');
+  });
+}
+
+/** 音乐叠播其它节目时显示漂浮条（播放/暂停都保留，方便继续或关闭） */
+function syncAudioFloat() {
+  const dock = $('audio-float');
+  if (!dock) return;
+  const snap = getAudioSnapshot();
+  const item = curEvent()?.items.find((i) => i.id === activeItemId);
+  const onThisAudio = item?.type === 'audio' && snap.path && item.path === snap.path;
+  // 有曲目且（在播 / 已开播过）且当前焦点不是这首歌 → 显示
+  const live = !!(snap.path && (snap.playing || snap.pos > 0.2));
+  const show = live && !onThisAudio;
+  dock.classList.toggle('hidden', !show);
+  if (!show) return;
+  dock.classList.toggle('is-paused', !snap.playing);
+  const title = $('audio-float-title');
+  const sub = $('audio-float-sub');
+  const btn = $('audio-float-toggle');
+  if (title) title.textContent = snap.name || fileName(snap.path) || '音乐播放中';
+  if (sub) {
+    const state = snap.playing ? '' : '已暂停 · ';
+    sub.textContent = `${state}${fmtClock(snap.pos)} / ${fmtClock(snap.duration)}`;
+  }
+  if (btn) {
+    btn.textContent = snap.playing ? '⏸' : '▶';
+    btn.title = snap.playing ? '暂停' : '继续';
+  }
+}
+
+function defaultLobby(name) {
+  return {
+    date: todayStr(),
+    time: '09:30',
+    title: name || '本场演出',
+    subtitle: '敬请入座 · 即将开始',
+    note: '',
+    kicker: 'STAGE',
+    bg: 'radial-gradient(ellipse at 50% 28%, #2a1f3d 0%, #0c0c12 62%)',
+    bgImage: '',
+    accent: '#e8c56a',
+    autoStart: true,
+    countingText: '距离开始还有',
+    startedText: '演出开始',
+  };
+}
+
+function ensureLobby(ev) {
+  if (!ev) return defaultLobby('');
+  if (!ev.lobby) ev.lobby = defaultLobby(ev.name);
+  else ev.lobby = { ...defaultLobby(ev.name), ...ev.lobby };
+  return ev.lobby;
+}
+
+function lobbyStartAtMs(lobby) {
+  if (!lobby?.date || !lobby?.time) return 0;
+  const [y, m, d] = lobby.date.split('-').map(Number);
+  const parts = lobby.time.split(':').map(Number);
+  const hh = parts[0] || 0;
+  const mm = parts[1] || 0;
+  if (!y || !m || !d) return 0;
+  return new Date(y, m - 1, d, hh, mm, 0, 0).getTime();
+}
+
+function curEvent() {
+  return events.find((e) => e.id === currentId);
+}
+
+/** 把长歌词/圣经正文外置；bodies 失败时绝不把主表写成空正文（防重启空白） */
+function persistEventsToStorage() {
+  const bodies = { ...bodyStore() };
+  const used = new Set();
+  let needExternal = false;
+
+  const slim = events.map((ev) => ({
+    ...ev,
+    items: (ev.items || []).map((it) => {
+      if (it.type !== 'blank' && it.type !== 'bible') return it;
+      const body = it.body || '';
+      if (body.length < 64) {
+        const { _bodyRef, ...rest } = it;
+        return rest;
+      }
+      needExternal = true;
+      const id = it.id;
+      bodies[id] = body;
+      used.add(id);
+      const { body: _b, ...rest } = it;
+      return { ...rest, body: '', _bodyRef: id };
+    }),
+  }));
+
+  for (const k of Object.keys(bodies)) {
+    if (!used.has(k)) delete bodies[k];
+  }
+
+  // 无需外置：直接写完整事件
+  if (!needExternal) {
+    return lsSet(LS_EVENTS, slim);
+  }
+
+  // 先写 bodies，成功才写瘦身主表；失败则主表保留完整正文
+  const okBodies = lsSet(LS_BODIES, bodies);
+  if (!okBodies) {
+    return lsSet(LS_EVENTS, events);
+  }
+  const okEvents = lsSet(LS_EVENTS, slim);
+  if (!okEvents) {
+    // 主表失败时尽量回退写带正文的完整表，避免只剩空引用
+    return lsSet(LS_EVENTS, events);
+  }
+  return true;
+}
+
+/** 内存为权威；写入失败时绝不回读旧 LS 覆盖节目
+ *  opts.soft：UI 只做软刷新（不拆缩略图）
+ */
+function save(opts = {}) {
+  const ok = persistEventsToStorage();
+  lsSet(LS_CURRENT, currentId);
+  if (!ok) {
+    const kb = Math.round(lsApproxBytes() / 1024);
+    toast(`节目单未能写入本地存储（约已用 ${kb}KB，空间可能不足），当前列表仍保留在内存中`, 7000);
+  }
+  document.dispatchEvent(new CustomEvent('sp:program-changed', {
+    detail: { source: 'program', soft: !!opts.soft },
+  }));
+}
+
+/** 仅在外部（如音频页）改 LS 时合并；禁止用更空的数据盖掉内存里的演出 */
+function adoptFromStorage() {
+  const next = normalizeEvents(lsGet(LS_EVENTS, null));
+  if (!next.length && events.length) return;
+  const memN = countItems(events);
+  const lsN = countItems(next);
+  if (lsN < memN) {
+    // 外模块读到了过期空数据 — 把内存写回
+    lsSet(LS_EVENTS, events);
+    lsSet(LS_CURRENT, currentId);
+    return;
+  }
+  events = next;
+  const cid = lsGet(LS_CURRENT, null);
+  if (cid) currentId = cid;
+  if (!curEvent() && events.length) currentId = events[0].id;
+}
+
+function activeIndex() {
+  const ev = curEvent();
+  if (!ev || !activeItemId) return -1;
+  return ev.items.findIndex((i) => i.id === activeItemId);
+}
+
+function fmtClock(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+export function initProgram() {
+  if (!events.length) {
+    events.push({ id: genId(), name: '本场演出', items: [] });
+    currentId = events[0].id;
+    save();
+  }
+  if (!curEvent()) {
+    currentId = events[0].id;
+    save();
+  }
+  // 圣经改为首次使用时再加载（启动预热易与 PDF/波形叠成 OOM）
+
+  // 旧数据：整份 PPT/PDF 未按页展开时，启动时自动拆页
+  expandLegacyDocs().finally(() => {
+    renderEvents();
+    renderItems();
+    updateNowBar();
+    syncAudioBar();
+  });
+
+  // 节目单内存权威：仅 source=storage 时才考虑合并 LS；自身 save 只刷新 UI
+  document.addEventListener('sp:program-changed', (e) => {
+    if (e.detail?.source === 'storage') adoptFromStorage();
+    renderEvents();
+    // soft：备注/定时等小改动；增删/重排由调用方显式 hard 刷新或 soft 失败回落
+    renderItems({ soft: !!e.detail?.soft });
+    updateNowBar();
+    syncAudioBar();
+    syncAudioFloat();
+    if (!$('pg-lobby-panel')?.classList.contains('hidden')) fillLobbyForm();
+    syncLobbyRemain();
+  });
+
+  initAudioFloat();
+
+  // 供音频等模块改节目（避免它们直接读旧 LS 覆盖整场演出）
+  document.addEventListener('sp:program-mutate', (e) => {
+    const detail = e.detail || {};
+    const ev = curEvent();
+    if (!ev) {
+      detail.ok = false;
+      toast('请先在「节目单」新建一个活动');
+      return;
+    }
+    try {
+      if (typeof detail.fn === 'function') detail.fn(ev);
+      save();
+      detail.ok = true;
+    } catch (err) {
+      detail.ok = false;
+      toast(`更新节目失败：${err}`, 5000);
+    }
+  });
+
+  $('pg-new').addEventListener('click', () => {
+    const ev = { id: genId(), name: `演出 ${events.length + 1}`, items: [], lobby: defaultLobby(`演出 ${events.length + 1}`) };
+    events.push(ev);
+    currentId = ev.id;
+    activeItemId = null;
+    save();
+    renderEvents();
+    renderItems();
+    updateNowBar();
+    syncAudioBar();
+    fillLobbyForm();
+    startRename();
+  });
+
+  $('pg-add-mixed')?.addEventListener('click', () => addMixed());
+  $('pg-add-audio').addEventListener('click', () => addItems('audio'));
+  $('pg-add-video').addEventListener('click', () => addItems('video'));
+  $('pg-add-image')?.addEventListener('click', () => addItems('image'));
+  $('pg-add-ppt').addEventListener('click', () => addItems('ppt'));
+  $('pg-add-pdf').addEventListener('click', () => addItems('pdf'));
+  initBlankPanels();
+  initBiblePanel();
+
+  $('pg-prev')?.addEventListener('click', () => programStep(-1));
+  $('pg-go')?.addEventListener('click', () => programGo());
+  $('pg-next')?.addEventListener('click', () => programStep(1));
+
+  $('pg-view-list')?.addEventListener('click', () => setViewMode('list'));
+  $('pg-view-grid')?.addEventListener('click', () => setViewMode('grid'));
+  const zoom = $('pg-zoom');
+  if (zoom) {
+    zoom.value = String(cardZoom);
+    zoom.addEventListener('input', () => setCardZoom(+zoom.value));
+  }
+  document.querySelectorAll('.pg-zoom-preset').forEach((btn) => {
+    btn.addEventListener('click', () => setCardZoom(+btn.dataset.zoom));
+  });
+  syncViewToggle();
+  applyCardZoom();
+
+  initProgramDragDrop();
+
+  $('pg-audio-loop')?.addEventListener('click', () => {
+    cycleLoopMode();
+    syncAudioBar(true);
+  });
+
+  const seek = $('pg-audio-seek');
+  if (seek) {
+    seek.addEventListener('pointerdown', () => { seekingAudio = true; });
+    seek.addEventListener('pointerup', () => { seekingAudio = false; });
+    seek.addEventListener('change', async () => {
+      const snap = getAudioSnapshot();
+      if (!snap.duration) return;
+      const t = (+seek.value / 1000) * snap.duration;
+      await seekAudio(t);
+      seekingAudio = false;
+      syncAudioBar(true);
+    });
+    seek.addEventListener('input', () => {
+      const snap = getAudioSnapshot();
+      if (!snap.duration) return;
+      const t = (+seek.value / 1000) * snap.duration;
+      const posEl = $('pg-audio-pos');
+      if (posEl) posEl.textContent = fmtClock(t);
+    });
+  }
+
+  setInterval(() => {
+    try {
+      syncAudioBar();
+      syncItemRemain();
+      syncCueCountdowns();
+      syncPlayGoBtn();
+      syncAudioFloat();
+      syncLobbyRemain();
+      tickLobbyAutoStart();
+      tickCueAutoPlay();
+    } catch (err) {
+      console.warn('[program] tick', err);
+    }
+  }, 250);
+
+  document.addEventListener('sp:audio-state', () => {
+    syncPlayGoBtn();
+    syncItemRemain();
+    syncAudioBar();
+    syncAudioFloat();
+  });
+
+  $('pg-lobby-toggle')?.addEventListener('click', () => {
+    const panel = $('pg-lobby-panel');
+    if (!panel) return;
+    const show = panel.classList.contains('hidden');
+    if (show) {
+      hideBlankPanels();
+      fillLobbyForm();
+      panel.classList.remove('hidden');
+      $('pg-lobby-toggle')?.classList.add('active');
+    } else {
+      panel.classList.add('hidden');
+      $('pg-lobby-toggle')?.classList.remove('active');
+    }
+  });
+  $('pg-lobby-save')?.addEventListener('click', () => {
+    readLobbyForm(true);
+    toast('开场页已保存');
+  });
+  $('pg-lobby-push')?.addEventListener('click', () => pushLobbyPage());
+  $('pg-lobby-push2')?.addEventListener('click', () => pushLobbyPage());
+  $('pg-lobby-bgimg-pick')?.addEventListener('click', async () => {
+    const files = await pickFiles([{ name: '图片', extensions: IMAGE_EXT }], '选择开场背景图');
+    if (!files.length) return;
+    const ev = curEvent();
+    if (!ev) return;
+    ensureLobby(ev).bgImage = files[0];
+    fillLobbyForm();
+    readLobbyForm(true);
+    toast('已设置开场背景图');
+  });
+  $('pg-lobby-bgimg-clear')?.addEventListener('click', () => {
+    const ev = curEvent();
+    if (!ev) return;
+    ensureLobby(ev).bgImage = '';
+    fillLobbyForm();
+    readLobbyForm(true);
+    toast('已清除背景图');
+  });
+  $('pg-lobby-autostart')?.addEventListener('change', () => readLobbyForm(true));
+  ['pg-lobby-date', 'pg-lobby-time', 'pg-lobby-title', 'pg-lobby-sub',
+    'pg-lobby-note', 'pg-lobby-kicker', 'pg-lobby-accent', 'pg-lobby-bg'].forEach((id) => {
+    $(id)?.addEventListener('change', () => readLobbyForm(true));
+    $(id)?.addEventListener('input', () => {
+      if (id === 'pg-lobby-date' || id === 'pg-lobby-time') syncLobbyRemain();
+    });
+  });
+
+  $('pg-rename').addEventListener('click', startRename);
+  $('pg-rename-ok').addEventListener('click', applyRename);
+  $('pg-rename-cancel').addEventListener('click', () => $('pg-rename-row').classList.add('hidden'));
+  $('pg-rename-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') applyRename();
+    if (e.key === 'Escape') $('pg-rename-row').classList.add('hidden');
+  });
+
+  $('pg-delete').addEventListener('click', () => {
+    if (events.length <= 1) {
+      curEvent().items = [];
+      activeItemId = null;
+      save();
+      renderItems();
+      updateNowBar();
+      syncAudioBar();
+      toast('至少保留一场演出，已清空节目内容');
+      return;
+    }
+    events = events.filter((e) => e.id !== currentId);
+    currentId = events[0].id;
+    activeItemId = null;
+    save();
+    renderEvents();
+    renderItems();
+    updateNowBar();
+    syncAudioBar();
+  });
+
+  // 双击左上角序号 → 快速改播放顺序
+  $('pg-items').addEventListener('dblclick', (e) => {
+    const numEl = e.target.closest('.pg-corner-num, .pg-num');
+    if (!numEl) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const row = numEl.closest('.pg-item');
+    const ev = curEvent();
+    const item = ev?.items.find((i) => i.id === row?.dataset.id);
+    if (item) editItemOrder(item);
+  });
+
+  $('pg-items').addEventListener('click', (e) => {
+    const noteEl = e.target.closest('.pg-note');
+    const numEl = e.target.closest('.pg-corner-num, .pg-num');
+    const btn = e.target.closest('button[data-op]');
+    const row = e.target.closest('.pg-item');
+    if (!row) return;
+    const ev = curEvent();
+    const item = ev?.items.find((i) => i.id === row.dataset.id);
+    if (!item) return;
+
+    // 单击序号不播放（留给双击改序）
+    if (numEl) {
+      e.stopPropagation();
+      return;
+    }
+    // 备注文字仅展示，避免误触；只能点「备」按钮编辑
+    if (noteEl) {
+      e.stopPropagation();
+      return;
+    }
+    if (btn?.dataset.op === 'note') {
+      e.stopPropagation();
+      editItemNote(item);
+      return;
+    }
+    if (btn?.dataset.op === 'cue' || e.target.closest('.pg-cue')) {
+      e.stopPropagation();
+      editItemCue(item);
+      return;
+    }
+
+    if (btn) {
+      const op = btn.dataset.op;
+      const idx = ev.items.indexOf(item);
+      if (op === 'play') {
+        // 正在播同一首歌时点 ▶ 改为暂停
+        if (item.type === 'audio') {
+          const snap = getAudioSnapshot();
+          if (snap.path === item.path && snap.playing) {
+            toggleAudio();
+            syncPlayGoBtn();
+            return;
+          }
+        }
+        activate(item);
+      } else if (op === 'up' && idx > 0) {
+        [ev.items[idx - 1], ev.items[idx]] = [ev.items[idx], ev.items[idx - 1]];
+        save(); renderItems({ soft: false }); updateNowBar();
+      } else if (op === 'down' && idx < ev.items.length - 1) {
+        [ev.items[idx + 1], ev.items[idx]] = [ev.items[idx], ev.items[idx + 1]];
+        save(); renderItems({ soft: false }); updateNowBar();
+      } else if (op === 'del') {
+        ev.items.splice(idx, 1);
+        if (activeItemId === item.id) activeItemId = null;
+        save(); renderItems({ soft: false }); updateNowBar(); syncAudioBar();
+      }
+      return;
+    }
+    // 点缩略图或卡片空白处播放；点文字标题也可
+    activate(item);
+  });
+
+  $('program-events').addEventListener('click', (e) => {
+    const item = e.target.closest('.file-item');
+    if (!item) return;
+    currentId = item.dataset.id;
+    activeItemId = null;
+    save();
+    renderEvents();
+    renderItems();
+    updateNowBar();
+    syncAudioBar();
+    fillLobbyForm();
+    syncLobbyRemain();
+  });
+
+  fillLobbyForm();
+  syncLobbyRemain();
+}
+
+function fillLobbyForm() {
+  const ev = curEvent();
+  if (!ev) return;
+  const L = ensureLobby(ev);
+  const set = (id, v) => { const el = $(id); if (el) el.value = v ?? ''; };
+  set('pg-lobby-date', L.date || todayStr());
+  set('pg-lobby-time', L.time || '09:30');
+  set('pg-lobby-title', L.title || '');
+  set('pg-lobby-sub', L.subtitle || '');
+  set('pg-lobby-note', L.note || '');
+  set('pg-lobby-kicker', L.kicker || '');
+  set('pg-lobby-accent', L.accent || '#e8c56a');
+  set('pg-lobby-bg', L.bg || '');
+  set('pg-lobby-bgimg', L.bgImage ? fileName(L.bgImage) : '');
+  const auto = $('pg-lobby-autostart');
+  if (auto) auto.checked = L.autoStart !== false;
+  syncLobbyRemain();
+}
+
+function readLobbyForm(doSave = false, refreshOutput = true) {
+  const ev = curEvent();
+  if (!ev) return null;
+  const L = ensureLobby(ev);
+  const val = (id) => $(id)?.value?.trim() ?? '';
+  L.date = val('pg-lobby-date') || todayStr();
+  L.time = val('pg-lobby-time') || '09:30';
+  L.title = val('pg-lobby-title') || ev.name || '本场演出';
+  L.subtitle = val('pg-lobby-sub');
+  L.note = val('pg-lobby-note');
+  L.kicker = val('pg-lobby-kicker');
+  L.accent = val('pg-lobby-accent') || '#e8c56a';
+  L.bg = val('pg-lobby-bg') || defaultLobby(ev.name).bg;
+  // bgImage 由选图按钮写入，此处保留
+  L.autoStart = !!$('pg-lobby-autostart')?.checked;
+  ev.lobby = L;
+  if (doSave) save();
+  syncLobbyRemain();
+  // 若扩展屏正显示开场页，同步刷新文案，并按最新时间重武装自动开播
+  if (refreshOutput && getCurrentOutput()?.kind === 'lobby') {
+    pushToOutput(lobbyPayload(L, ev.name));
+    armLobbyAutoStart(ev, L);
+  }
+  return L;
+}
+
+function syncLobbyRemain() {
+  const el = $('pg-lobby-remain');
+  if (!el) return;
+  const ev = curEvent();
+  if (!ev) {
+    el.textContent = '未选择演出';
+    return;
+  }
+  const L = ensureLobby(ev);
+  // 表单打开时优先用表单里的时间预览
+  const date = $('pg-lobby-date')?.value || L.date;
+  const time = $('pg-lobby-time')?.value || L.time;
+  const startAt = lobbyStartAtMs({ date, time });
+  if (!startAt) {
+    el.textContent = '请设置开始日期与时间';
+    return;
+  }
+  const remain = Math.floor((startAt - Date.now()) / 1000);
+  if (remain <= 0) {
+    el.textContent = `开始时间 ${date} ${time} · 已到点`;
+    el.classList.add('is-due');
+  } else {
+    el.textContent = `开始时间 ${date} ${time} · 倒计时 ${fmtTimeLong(remain)}`;
+    el.classList.remove('is-due');
+  }
+}
+
+function lobbyPayload(L, evName) {
+  const startAt = lobbyStartAtMs(L);
+  const startLabel = L.date && L.time ? `开始时间 ${L.date} ${L.time}` : '';
+  return {
+    kind: 'lobby',
+    startAt,
+    startLabel,
+    title: L.title || evName || '本场演出',
+    subtitle: L.subtitle || '',
+    note: L.note || '',
+    kicker: L.kicker || '',
+    bg: L.bg || defaultLobby('').bg,
+    bgImage: L.bgImage ? convertFileSrc(L.bgImage) : '',
+    accent: L.accent || '#e8c56a',
+    countingText: L.countingText || '距离开始还有',
+    startedText: L.startedText || '演出开始',
+  };
+}
+
+/** 推送开场倒计时页到扩展屏；openOutput=true 时自动打开输出窗 */
+export function pushLobbyPage(openOutput = true) {
+  const ev = curEvent();
+  if (!ev) {
+    toast('请先选择一场演出');
+    return false;
+  }
+  const L = readLobbyForm(true, false) || ensureLobby(ev);
+  if (!lobbyStartAtMs(L)) {
+    toast('请先设置开始日期和时间');
+    return false;
+  }
+  pushToOutput(lobbyPayload(L, ev.name));
+  armLobbyAutoStart(ev, L);
+  if (openOutput) {
+    document.dispatchEvent(new CustomEvent('sp:open-output', { detail: { fullscreen: true } }));
+  }
+  const tip = L.autoStart
+    ? (ev.items?.length ? '已推送开场页 · 到点将自动播第一条' : '已推送开场页 · 到点自动播需先添加节目')
+    : '已推送开场倒计时到扩展屏';
+  toast(tip);
+  return true;
+}
+
+function syncAudioBar(forceLabel = false) {
+  const bar = $('pg-audio-bar');
+  if (!bar) return;
+  const item = curEvent()?.items.find((i) => i.id === activeItemId);
+  const isAudio = item?.type === 'audio';
+  bar.classList.toggle('hidden', !isAudio);
+  if (!isAudio) return;
+
+  const snap = getAudioSnapshot();
+  const same = snap.path && item.path === snap.path;
+  const posEl = $('pg-audio-pos');
+  const durEl = $('pg-audio-dur');
+  const seek = $('pg-audio-seek');
+  const loopBtn = $('pg-audio-loop');
+  const dur = same ? snap.duration : 0;
+  const pos = same ? snap.pos : 0;
+
+  if (posEl && !seekingAudio) posEl.textContent = fmtClock(pos);
+  if (durEl) durEl.textContent = fmtClock(dur);
+  if (seek && !seekingAudio) {
+    seek.disabled = !dur;
+    seek.value = dur ? String(Math.round((pos / dur) * 1000)) : '0';
+  }
+  if (loopBtn && (forceLabel || loopBtn.dataset.mode !== snap.loopMode)) {
+    loopBtn.textContent = getLoopModeLabel();
+    loopBtn.dataset.mode = snap.loopMode;
+  }
+}
+
+let expandLegacyGen = 0;
+
+/** 按条目 id 原地拆页，避免 await 期间用户新加的节目被整表覆盖 */
+async function expandLegacyDocs() {
+  const gen = ++expandLegacyGen;
+  let changed = false;
+
+  for (const ev of events) {
+    if (gen !== expandLegacyGen) return;
+    if (!Array.isArray(ev.items) || !ev.items.length) continue;
+
+    // 先收集需要拆的 id（快照），再逐个按 id 定位替换
+    const legacyIds = ev.items
+      .filter((it) => (it.type === 'ppt' || it.type === 'pdf') && (it.page == null || it.pages == null))
+      .map((it) => it.id);
+
+    for (const id of legacyIds) {
+      if (gen !== expandLegacyGen) return;
+      const idx = ev.items.findIndex((x) => x.id === id);
+      if (idx < 0) continue; // 等待期间已被用户删除
+      const it = ev.items[idx];
+      if ((it.type !== 'ppt' && it.type !== 'pdf') || (it.page != null && it.pages != null)) continue;
+
+      try {
+        const pages = it.type === 'ppt' ? await pptPages(it.path) : await pdfPages(it.path);
+        if (gen !== expandLegacyGen) return;
+        // await 后再找一次位置
+        const at = ev.items.findIndex((x) => x.id === id);
+        if (at < 0) continue;
+        if (!pages || pages < 1) continue;
+
+        const base = (it.name || fileName(it.path)).replace(/\s*·\s*\d+\/\d+$/, '').replace(/\.[^.]+$/, '');
+        const expanded = [];
+        for (let i = 0; i < pages; i++) {
+          expanded.push(normalizeItem({
+            id: genId(),
+            type: it.type,
+            path: it.path,
+            name: `${base} · ${i + 1}/${pages}`,
+            page: i,
+            pages,
+            note: it.note || '',
+            cueTime: it.cueTime || '',
+            cueDate: it.cueDate || '',
+          }));
+        }
+        ev.items.splice(at, 1, ...expanded);
+        changed = true;
+      } catch (err) {
+        toast(`拆页失败：${it.name || fileName(it.path)} — ${err}`, 5000);
+      }
+      // 让出主线程，保持界面流畅
+      await new Promise((r) => requestAnimationFrame(() => r()));
+    }
+  }
+  if (changed && gen === expandLegacyGen) save();
+}
+
+async function addItems(type) {
+  const ev = curEvent();
+  if (!ev) return;
+  const filters = {
+    audio: [{ name: '音频', extensions: AUDIO_EXT }],
+    video: [{ name: '视频', extensions: VIDEO_EXT }],
+    image: [{ name: '图片', extensions: IMAGE_EXT }],
+    ppt: [{ name: 'PowerPoint', extensions: PPT_EXT }],
+    pdf: [{ name: 'PDF', extensions: PDF_EXT }],
+  }[type];
+  const files = await pickFiles(filters, '添加到节目单');
+  if (!files.length) return;
+  await appendFiles(ev, files, type);
+}
+
+async function addMixed() {
+  const ev = curEvent();
+  if (!ev) return;
+  const all = [...AUDIO_EXT, ...VIDEO_EXT, ...IMAGE_EXT, ...PPT_EXT, ...PDF_EXT];
+  const files = await pickFiles([{ name: '演出素材', extensions: all }], '混排导入（可多选）');
+  if (!files.length) return;
+  let n = 0;
+  toast('正在导入并拆页…');
+  for (const f of files) {
+    const type = detectMediaType(f);
+    if (!type) {
+      toast(`跳过不支持的格式：${fileName(f)}`);
+      continue;
+    }
+    n += await pushMedia(ev, f, type);
+  }
+  save();
+  renderItems();
+  updateNowBar();
+  toast(`已按顺序加入 ${n} 条节目`);
+}
+
+async function appendFiles(ev, files, type) {
+  toast(type === 'ppt' || type === 'pdf' ? '正在按页展开…' : '正在添加…');
+  let n = 0;
+  for (const f of files) n += await pushMedia(ev, f, type);
+  save();
+  renderItems();
+  updateNowBar();
+  toast(`已添加 ${n} 条${TYPE_META[type]?.label || ''}节目`);
+}
+
+async function pushMedia(ev, path, type) {
+  if (type === 'ppt' || type === 'pdf') {
+    try {
+      const pages = type === 'ppt' ? await pptPages(path) : await pdfPages(path);
+      const base = fileName(path).replace(/\.[^.]+$/, '');
+      if (!pages) throw new Error('文档没有页面');
+      for (let i = 0; i < pages; i++) {
+        ev.items.push({
+          id: genId(),
+          type,
+          path,
+          name: `${base} · ${i + 1}/${pages}`,
+          page: i,
+          pages,
+          note: '',
+        });
+      }
+      return pages;
+    } catch (err) {
+      toast(`导入失败：${fileName(path)} — ${err}`, 6000);
+      return 0;
+    }
+  }
+  ev.items.push({
+    id: genId(),
+    type,
+    path,
+    name: fileName(path).replace(/\.[^.]+$/, ''),
+    note: '',
+  });
+  return 1;
+}
+
+function editItemNote(item) {
+  if (!item) return;
+  const cur = item.note || '';
+  const v = window.prompt('节目备注（如：第 2:30 切入 / 说完「欢迎」后起）', cur);
+  if (v === null) return;
+  item.note = v.trim();
+  save({ soft: true });
+  renderItems({ soft: true });
+  updateNowBar();
+  toast(item.note ? '备注已保存' : '已清除备注');
+}
+
+/** 双击序号：把本条快速移到指定位置（1-based） */
+function editItemOrder(item) {
+  const ev = curEvent();
+  if (!ev?.items?.length || !item) return;
+  const from = ev.items.findIndex((i) => i.id === item.id);
+  if (from < 0) return;
+  const total = ev.items.length;
+  const v = window.prompt(
+    `改播放顺序\n当前第 ${from + 1} 条 / 共 ${total} 条\n输入要移到的位置（1–${total}）`,
+    String(from + 1),
+  );
+  if (v === null) return;
+  const n = parseInt(String(v).trim(), 10);
+  if (!Number.isFinite(n) || n < 1 || n > total) {
+    toast(`请输入 1–${total} 之间的整数`);
+    return;
+  }
+  moveItemToIndex(from, n - 1);
+}
+
+function moveItemToIndex(from, to) {
+  const ev = curEvent();
+  if (!ev?.items?.length) return;
+  const len = ev.items.length;
+  if (from < 0 || from >= len) return;
+  to = Math.max(0, Math.min(len - 1, to));
+  if (to === from) return;
+  const [it] = ev.items.splice(from, 1);
+  ev.items.splice(to, 0, it);
+  save();
+  renderItems();
+  updateNowBar();
+  toast(`已移到第 ${to + 1} 位`);
+}
+
+/** 设定本条节目的开播时刻（到点自动播放 + 倒计时） */
+function editItemCue(item) {
+  if (!item) return;
+  const display = item.cueTime
+    ? (item.cueTime.length >= 8 && item.cueTime.endsWith(':00') ? item.cueTime.slice(0, 5) : item.cueTime)
+    : '';
+  const v = window.prompt(
+    '开播时间（今天 HH:mm，如 09:35）\n到点后自动播放本条；留空清除定时',
+    display,
+  );
+  if (v === null) return;
+  const t = v.trim();
+  if (!t) {
+    item.cueTime = '';
+    item.cueDate = '';
+    item.cueFired = false;
+    save({ soft: true });
+    renderItems({ soft: true });
+    toast('已清除开播定时');
+    return;
+  }
+  const m = t.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) {
+    toast('格式应为 09:35 或 09:35:00');
+    return;
+  }
+  const hh = +m[1];
+  const mm = +m[2];
+  const ss = m[3] != null ? +m[3] : 0;
+  if (hh > 23 || mm > 59 || ss > 59) {
+    toast('时间无效');
+    return;
+  }
+  item.cueTime = `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`;
+  item.cueDate = todayStr();
+  item.cueFired = false;
+  let at = cueStartAtMs(item);
+  if (at <= Date.now()) {
+    item.cueDate = tomorrowStr();
+    at = cueStartAtMs(item);
+    toast(`该时刻已过，已排到明天 ${item.cueTime.slice(0, 5)} 开播`);
+  } else {
+    toast(`已设定 ${item.cueTime.slice(0, 5)} 开播，将自动倒计时`);
+  }
+  save({ soft: true });
+  renderItems({ soft: true });
+  syncCueCountdowns();
+}
+
+function syncCueCountdowns() {
+  const ev = curEvent();
+  const nodes = document.querySelectorAll('.pg-cue');
+  if (!nodes.length) return;
+  nodes.forEach((el) => {
+    const id = el.closest('.pg-item')?.dataset.id;
+    const item = ev?.items.find((i) => i.id === id);
+    if (!item?.cueTime) {
+      if (!el.classList.contains('hidden')) el.classList.add('hidden');
+      return;
+    }
+    el.classList.remove('hidden');
+    const at = cueStartAtMs(item);
+    const remain = Math.floor((at - Date.now()) / 1000);
+    const atEl = el.querySelector('.pg-cue-at');
+    const cdEl = el.querySelector('.pg-cue-cd');
+    const label = item.cueTime.slice(0, 5);
+    if (atEl && atEl.textContent !== `开播 ${label}`) atEl.textContent = `开播 ${label}`;
+    if (item.cueFired || remain <= 0) {
+      el.classList.remove('is-live', 'is-urgent');
+      el.classList.add('is-due');
+      const dueText = item.cueFired ? '已开播' : '到点';
+      if (cdEl && cdEl.textContent !== dueText) cdEl.textContent = dueText;
+      el.dataset.sec = '';
+      return;
+    }
+    el.classList.add('is-live');
+    el.classList.remove('is-due');
+    el.classList.toggle('is-urgent', remain <= 60);
+    // 仅秒数变化时写 DOM，避免 250ms 空转
+    if (cdEl && el.dataset.sec !== String(remain)) {
+      el.dataset.sec = String(remain);
+      cdEl.textContent = fmtCueClock(remain);
+    }
+  });
+}
+
+async function tickCueAutoPlay() {
+  if (cueFiring) return;
+  const ev = curEvent();
+  if (!ev?.items?.length) return;
+  const now = Date.now();
+  for (const it of ev.items) {
+    if (!it.cueTime || it.cueFired) continue;
+    if (it._cueRetryAt && now < it._cueRetryAt) continue;
+    const at = cueStartAtMs(it);
+    if (!at || now < at) continue;
+    // 冻结时不抢标「已开播」，解冻后重试，避免扩展屏没换页
+    if (isOutputFrozen()) {
+      it._cueRetryAt = now + 2000;
+      if (!it._cueFrozenTip) {
+        it._cueFrozenTip = true;
+        toast('输出已冻结：定时到点但扩展屏未换页，解冻后将自动重试', 5000);
+      }
+      continue;
+    }
+    cueFiring = true;
+    toast(`⏰ 定时开播：${it.name}`);
+    try {
+      const ok = await activate(it);
+      if (ok && !isOutputFrozen()) {
+        it.cueFired = true;
+        delete it._cueRetryAt;
+        delete it._cueFrozenTip;
+        save({ soft: true });
+        syncCueCountdowns();
+      } else if (ok && isOutputFrozen()) {
+        it._cueRetryAt = now + 2000;
+        toast('输出冻结中，扩展屏未更新，解冻后重试', 4000);
+      } else {
+        it._cueRetryAt = now + 3000;
+        toast(`定时开播失败，将稍后重试：${it.name}`, 4000);
+      }
+    } finally {
+      cueFiring = false;
+    }
+    break;
+  }
+}
+
+function hideBlankPanels() {
+  $('pg-blank-panel')?.classList.add('hidden');
+  $('pg-songset-panel')?.classList.add('hidden');
+  $('pg-bible-panel')?.classList.add('hidden');
+  $('pg-add-blank')?.classList.remove('active');
+  $('pg-add-songset')?.classList.remove('active');
+  $('pg-add-bible')?.classList.remove('active');
+}
+
+function hideLobbyPanel() {
+  $('pg-lobby-panel')?.classList.add('hidden');
+  $('pg-lobby-toggle')?.classList.remove('active');
+}
+
+function syncBlankKindFields() {
+  const kind = $('pg-blank-kind')?.value || 'title';
+  const isLyric = kind === 'lyric';
+  $('pg-blank-sub-wrap')?.classList.toggle('hidden', isLyric);
+  $('pg-blank-body-wrap')?.classList.toggle('hidden', !isLyric);
+}
+
+function readBlankForm() {
+  return {
+    blankKind: $('pg-blank-kind')?.value === 'lyric' ? 'lyric' : 'title',
+    title: ($('pg-blank-title')?.value || '').trim(),
+    subtitle: ($('pg-blank-sub')?.value || '').trim(),
+    body: ($('pg-blank-body')?.value || '').trim(),
+    accent: $('pg-blank-accent')?.value || '#e8c56a',
+    bgPreset: $('pg-blank-preset')?.value || 'auto',
+    bgImage: $('pg-blank-bgimg')?.dataset.path || '',
+  };
+}
+
+function addBlankFromForm() {
+  const ev = curEvent();
+  if (!ev) return;
+  const f = readBlankForm();
+  if (!f.title) {
+    toast('请填写主标题 / 歌名');
+    return;
+  }
+  if (f.blankKind === 'lyric' && !f.body) {
+    toast('请填写这一段歌词正文');
+    return;
+  }
+  const item = createBlankItem(f);
+  ev.items.push(item);
+  save();
+  renderItems();
+  updateNowBar();
+  toast(`已加入空白页：${item.name}`);
+}
+
+function addSongSetFromForm() {
+  const ev = curEvent();
+  if (!ev) return;
+  const title = ($('pg-songset-title')?.value || '').trim();
+  if (!title) {
+    toast('请填写歌名');
+    return;
+  }
+  const items = buildSongBlankSet({
+    title,
+    subtitle: ($('pg-songset-sub')?.value || '').trim(),
+    lyrics: $('pg-songset-lyrics')?.value || '',
+    accent: $('pg-songset-accent')?.value || '#e8c56a',
+    bgPreset: $('pg-songset-preset')?.value || 'auto',
+    bgImage: $('pg-songset-bgimg')?.dataset.path || '',
+  });
+  if (items.length <= 1) {
+    toast('未检测到歌词段落（请用空行分段）；已加入歌名片');
+  }
+  ev.items.push(...items);
+  save();
+  renderItems();
+  updateNowBar();
+  toast(`已加入 ${items.length} 页（歌名片 + 歌词）`);
+  $('pg-songset-panel')?.classList.add('hidden');
+  $('pg-add-songset')?.classList.remove('active');
+}
+
+async function pickBlankBg(inputId) {
+  const files = await pickFiles([{ name: '图片', extensions: IMAGE_EXT }], '选择空白页背景图');
+  if (!files.length) return;
+  const el = $(inputId);
+  if (!el) return;
+  el.dataset.path = files[0];
+  el.value = fileName(files[0]);
+}
+
+function clearBlankBg(inputId) {
+  const el = $(inputId);
+  if (!el) return;
+  el.dataset.path = '';
+  el.value = '';
+}
+
+function initBlankPanels() {
+  $('pg-add-blank')?.addEventListener('click', () => {
+    const panel = $('pg-blank-panel');
+    if (!panel) return;
+    const show = panel.classList.contains('hidden');
+    hideLobbyPanel();
+    hideBlankPanels();
+    panel.classList.toggle('hidden', !show);
+    $('pg-add-blank')?.classList.toggle('active', show);
+    if (show) syncBlankKindFields();
+  });
+  $('pg-add-songset')?.addEventListener('click', () => {
+    const panel = $('pg-songset-panel');
+    if (!panel) return;
+    const show = panel.classList.contains('hidden');
+    hideLobbyPanel();
+    hideBlankPanels();
+    panel.classList.toggle('hidden', !show);
+    $('pg-add-songset')?.classList.toggle('active', show);
+  });
+  $('pg-blank-kind')?.addEventListener('change', syncBlankKindFields);
+  $('pg-blank-cancel')?.addEventListener('click', () => {
+    $('pg-blank-panel')?.classList.add('hidden');
+    $('pg-add-blank')?.classList.remove('active');
+  });
+  $('pg-blank-add')?.addEventListener('click', () => addBlankFromForm());
+  $('pg-blank-bgimg-pick')?.addEventListener('click', () => pickBlankBg('pg-blank-bgimg'));
+  $('pg-blank-bgimg-clear')?.addEventListener('click', () => clearBlankBg('pg-blank-bgimg'));
+  $('pg-songset-cancel')?.addEventListener('click', () => {
+    $('pg-songset-panel')?.classList.add('hidden');
+    $('pg-add-songset')?.classList.remove('active');
+  });
+  $('pg-songset-add')?.addEventListener('click', () => addSongSetFromForm());
+  $('pg-songset-bgimg-pick')?.addEventListener('click', () => pickBlankBg('pg-songset-bgimg'));
+  $('pg-songset-bgimg-clear')?.addEventListener('click', () => clearBlankBg('pg-songset-bgimg'));
+  syncBlankKindFields();
+}
+
+function biblePreviewEl() {
+  return $('pg-bible-preview');
+}
+
+function setBiblePreviewText(htmlOrText, isHtml = false) {
+  const el = biblePreviewEl();
+  if (!el) return;
+  if (isHtml) el.innerHTML = htmlOrText;
+  else el.textContent = htmlOrText;
+}
+
+async function fillBibleBookSelect() {
+  const sel = $('pg-bible-book');
+  if (!sel || sel.dataset.ready === '1') return;
+  try {
+    await ensureBible();
+  } catch (err) {
+    toast('圣经数据加载失败：' + err, 6000);
+    return;
+  }
+  const books = getBooks();
+  const ot = books.filter((b) => !b.nt);
+  const nt = books.filter((b) => b.nt);
+  sel.innerHTML = '';
+  const gOt = document.createElement('optgroup');
+  gOt.label = '旧约';
+  for (const b of ot) {
+    const o = document.createElement('option');
+    o.value = String(b.sn);
+    o.textContent = `${b.short} ${b.name}`;
+    gOt.appendChild(o);
+  }
+  const gNt = document.createElement('optgroup');
+  gNt.label = '新约';
+  for (const b of nt) {
+    const o = document.createElement('option');
+    o.value = String(b.sn);
+    o.textContent = `${b.short} ${b.name}`;
+    gNt.appendChild(o);
+  }
+  sel.appendChild(gOt);
+  sel.appendChild(gNt);
+  sel.dataset.ready = '1';
+  // 默认约翰福音
+  sel.value = '43';
+  syncBibleChapterOptions();
+}
+
+function syncBibleChapterOptions() {
+  const sn = +($('pg-bible-book')?.value || 0);
+  const chSel = $('pg-bible-chapter');
+  const vsFrom = $('pg-bible-from');
+  const vsTo = $('pg-bible-to');
+  if (!chSel || !sn) return;
+  const n = chapterCount(sn) || 1;
+  const cur = +chSel.value || 1;
+  chSel.innerHTML = '';
+  for (let i = 1; i <= n; i++) {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = String(i);
+    chSel.appendChild(o);
+  }
+  chSel.value = String(Math.min(Math.max(1, cur), n));
+  syncBibleVerseOptions();
+  if (vsFrom) vsFrom.value = '1';
+  if (vsTo) vsTo.value = '1';
+  refreshBibleRangePreview();
+}
+
+function syncBibleVerseOptions() {
+  const sn = +($('pg-bible-book')?.value || 0);
+  const ch = +($('pg-bible-chapter')?.value || 1);
+  const max = verseCount(sn, ch) || 1;
+  for (const id of ['pg-bible-from', 'pg-bible-to']) {
+    const el = $(id);
+    if (!el) continue;
+    el.max = String(max);
+    el.min = '1';
+    if (+el.value > max) el.value = String(max);
+    if (+el.value < 1) el.value = '1';
+  }
+}
+
+function readBibleRange() {
+  const sn = +($('pg-bible-book')?.value || 0);
+  const chapter = +($('pg-bible-chapter')?.value || 1);
+  let from = +($('pg-bible-from')?.value || 1);
+  let to = +($('pg-bible-to')?.value || from);
+  if (!sn) return null;
+  if (to < from) [from, to] = [to, from];
+  return { sn, chapter, from, to };
+}
+
+function refreshBibleRangePreview() {
+  const range = readBibleRange();
+  if (!range) {
+    setBiblePreviewText('请选择书卷与章节');
+    return;
+  }
+  const book = getBook(range.sn);
+  const verses = getVerses(range.sn, range.chapter, range.from, range.to);
+  if (!verses.length) {
+    setBiblePreviewText('该范围没有经文');
+    return;
+  }
+  const head = formatRefFull(book, range.chapter, range.from, range.to);
+  const body = verses.map((v) => `${v.n} ${v.text}`).join('\n');
+  setBiblePreviewText(`${head}\n\n${body}`);
+}
+
+async function applyBibleQuickRef() {
+  const input = $('pg-bible-quick');
+  const raw = input?.value?.trim() || '';
+  if (!raw) {
+    toast('请输入经文，如：约3:16 或 约翰福音 3:16-18');
+    return false;
+  }
+  try {
+    await ensureBible();
+    await fillBibleBookSelect();
+  } catch (err) {
+    toast('圣经数据加载失败：' + err);
+    return false;
+  }
+  const hit = parseReference(raw);
+  if (!hit) {
+    toast('无法识别经文引用，请用「约3:16」或「约翰福音 3:16-18」');
+    return false;
+  }
+  const bookSel = $('pg-bible-book');
+  if (bookSel) bookSel.value = String(hit.book.sn);
+  syncBibleChapterOptions();
+  const chSel = $('pg-bible-chapter');
+  if (chSel) chSel.value = String(hit.chapter);
+  syncBibleVerseOptions();
+  const max = verseCount(hit.book.sn, hit.chapter) || 1;
+  const from = Math.min(hit.from, max);
+  const to = Math.min(hit.to, max);
+  if ($('pg-bible-from')) $('pg-bible-from').value = String(from);
+  if ($('pg-bible-to')) $('pg-bible-to').value = String(to);
+  refreshBibleRangePreview();
+  toast(`已定位：${formatRefFull(hit.book, hit.chapter, from, to)}`);
+  return true;
+}
+
+async function runBibleKeywordSearch() {
+  const q = $('pg-bible-kw')?.value?.trim() || '';
+  const box = $('pg-bible-hits');
+  if (!box) return;
+  if (!q) {
+    box.innerHTML = '<div class="empty-tip">输入关键字后搜索，点击结果可定位</div>';
+    return;
+  }
+  try {
+    await ensureBible();
+  } catch (err) {
+    toast('圣经数据加载失败：' + err);
+    return;
+  }
+  const hits = searchKeyword(q, 36);
+  if (!hits.length) {
+    box.innerHTML = '<div class="empty-tip">没有匹配经文</div>';
+    return;
+  }
+  box.innerHTML = hits.map((h) => `
+    <button type="button" class="pg-bible-hit" data-sn="${h.sn}" data-ch="${h.chapter}" data-vs="${h.verse}">
+      <span class="pg-bible-hit-ref">${esc(h.short)}${h.chapter}:${h.verse}</span>
+      <span class="pg-bible-hit-text">${esc(h.text)}</span>
+    </button>`).join('');
+}
+
+async function addBibleToProgram({ play = false } = {}) {
+  const ev = curEvent();
+  if (!ev) {
+    toast('请先新建一场演出');
+    return;
+  }
+  const range = readBibleRange();
+  if (!range) {
+    toast('请选择书卷章节');
+    return;
+  }
+  try {
+    await ensureBible();
+    const accent = $('pg-bible-accent')?.value || '#e8c56a';
+    const items = await buildBibleItems({ ...range, accent });
+    ev.items.push(...items);
+    save();
+    renderItems({ soft: false });
+    updateNowBar();
+    toast(`已加入 ${items.length} 页：${items[0]?.refFull || items[0]?.ref}`);
+    if (play && items[0]) await activate(items[0]);
+    // 保持面板打开，方便继续查
+  } catch (err) {
+    toast('加入失败：' + err, 5000);
+  }
+}
+
+function initBiblePanel() {
+  $('pg-add-bible')?.addEventListener('click', async () => {
+    const panel = $('pg-bible-panel');
+    if (!panel) return;
+    const show = panel.classList.contains('hidden');
+    hideLobbyPanel();
+    hideBlankPanels();
+    panel.classList.toggle('hidden', !show);
+    $('pg-add-bible')?.classList.toggle('active', show);
+    if (show) {
+      toast('正在加载和合本…', 1200);
+      await fillBibleBookSelect();
+      refreshBibleRangePreview();
+      $('pg-bible-quick')?.focus();
+    }
+  });
+  $('pg-bible-cancel')?.addEventListener('click', () => {
+    $('pg-bible-panel')?.classList.add('hidden');
+    $('pg-add-bible')?.classList.remove('active');
+  });
+  $('pg-bible-book')?.addEventListener('change', () => syncBibleChapterOptions());
+  $('pg-bible-chapter')?.addEventListener('change', () => {
+    syncBibleVerseOptions();
+    if ($('pg-bible-from')) $('pg-bible-from').value = '1';
+    if ($('pg-bible-to')) $('pg-bible-to').value = '1';
+    refreshBibleRangePreview();
+  });
+  $('pg-bible-from')?.addEventListener('change', () => {
+    syncBibleVerseOptions();
+    const from = +($('pg-bible-from')?.value || 1);
+    const toEl = $('pg-bible-to');
+    if (toEl && +toEl.value < from) toEl.value = String(from);
+    refreshBibleRangePreview();
+  });
+  $('pg-bible-to')?.addEventListener('change', () => {
+    syncBibleVerseOptions();
+    refreshBibleRangePreview();
+  });
+  $('pg-bible-quick-go')?.addEventListener('click', () => applyBibleQuickRef());
+  $('pg-bible-quick')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applyBibleQuickRef();
+    }
+  });
+  $('pg-bible-kw-go')?.addEventListener('click', () => runBibleKeywordSearch());
+  $('pg-bible-kw')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      runBibleKeywordSearch();
+    }
+  });
+  $('pg-bible-hits')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.pg-bible-hit');
+    if (!btn) return;
+    const sn = +btn.dataset.sn;
+    const ch = +btn.dataset.ch;
+    const vs = +btn.dataset.vs;
+    const bookSel = $('pg-bible-book');
+    if (bookSel) bookSel.value = String(sn);
+    syncBibleChapterOptions();
+    if ($('pg-bible-chapter')) $('pg-bible-chapter').value = String(ch);
+    syncBibleVerseOptions();
+    if ($('pg-bible-from')) $('pg-bible-from').value = String(vs);
+    if ($('pg-bible-to')) $('pg-bible-to').value = String(vs);
+    refreshBibleRangePreview();
+  });
+  $('pg-bible-add')?.addEventListener('click', () => addBibleToProgram({ play: false }));
+  $('pg-bible-add-play')?.addEventListener('click', () => addBibleToProgram({ play: true }));
+}
+
+function initProgramDragDrop() {
+  const panel = $('panel-program');
+  const box = $('pg-items');
+  if (!panel || !box) return;
+
+  let dragDepth = 0;
+  const setActive = (on) => {
+    if (!on) dragDepth = 0;
+    panel.classList.toggle('pg-drop-active', on);
+    box.classList.toggle('pg-drop-active', on);
+  };
+  const clearDropStyle = () => setActive(false);
+
+  const ingestPaths = async (paths) => {
+    const list = (paths || []).filter(Boolean);
+    clearDropStyle();
+    if (!list.length) return;
+    const tab = document.querySelector('.tab.active')?.dataset.module;
+    if (tab && tab !== 'program') {
+      document.dispatchEvent(new CustomEvent('sp:switch-module', { detail: 'program' }));
+    }
+    const ev = curEvent();
+    if (!ev) return;
+    toast('正在导入拖入的文件…');
+    let n = 0;
+    try {
+      for (const p of list) {
+        const type = detectMediaType(p);
+        if (!type) {
+          toast(`跳过：${fileName(p)}`);
+          continue;
+        }
+        n += await pushMedia(ev, p, type);
+      }
+      save();
+      renderItems();
+      updateNowBar();
+      toast(n ? `拖拽导入 ${n} 条节目 · 双击左上角序号可改顺序` : '没有可导入的文件');
+    } finally {
+      clearDropStyle();
+    }
+  };
+
+  ['dragenter', 'dragover'].forEach((type) => {
+    panel.addEventListener(type, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (type === 'dragenter') dragDepth += 1;
+      setActive(true);
+    });
+  });
+  panel.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0 || !panel.contains(e.relatedTarget)) clearDropStyle();
+  });
+  panel.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearDropStyle();
+    const files = [...(e.dataTransfer?.files || [])];
+    const paths = files.map((f) => f.path || f.name).filter((p) => p && /[\\/]/.test(p));
+    // Tauri WebView 的 File 带 path；若只有文件名则等 tauri://drag-drop
+    if (paths.length) await ingestPaths(paths);
+  });
+  // 系统拖放取消 / 失焦时也清掉高亮
+  window.addEventListener('dragend', clearDropStyle);
+  window.addEventListener('blur', clearDropStyle);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearDropStyle();
+  });
+
+  listen('tauri://drag-drop', (e) => {
+    clearDropStyle();
+    const paths = e.payload?.paths || [];
+    if (paths.length) ingestPaths(paths);
+  }).catch(() => {});
+  listen('tauri://drag-enter', () => {
+    if (document.querySelector('.tab.active')?.dataset.module === 'program') setActive(true);
+  }).catch(() => {});
+  listen('tauri://drag-leave', () => clearDropStyle()).catch(() => {});
+  listen('tauri://drag-over', () => {
+    if (document.querySelector('.tab.active')?.dataset.module === 'program') setActive(true);
+  }).catch(() => {});
+}
+
+/** 只更新高亮，避免整表重绘 + 重刷缩略图（切换卡顿主因） */
+function paintActiveState() {
+  const box = $('pg-items');
+  if (!box) return;
+  const rows = box.querySelectorAll('.pg-item');
+  if (!rows.length) {
+    renderItems();
+    return;
+  }
+  const aidx = activeIndex();
+  rows.forEach((el, i) => {
+    const on = el.dataset.id === activeItemId;
+    el.classList.toggle('active', on);
+    el.classList.toggle('done', aidx >= 0 && i < aidx);
+  });
+}
+
+async function activate(item) {
+  if (!item) return false;
+  const seq = claimOutputSeq();
+  activateSeq = seq;
+  activeItemId = item.id;
+  paintActiveState();
+  updateNowBar();
+  syncAudioBar(true);
+  syncAudioFloat();
+  syncPlayGoBtn();
+  syncItemRemain();
+  scrollActiveIntoView();
+
+  const stay = { stay: true, outputSeq: seq };
+  try {
+    if (item.type === 'image') {
+      if (!pushToOutput({ kind: 'image', src: convertFileSrc(item.path) }, seq)) return false;
+    } else if (item.type === 'blank') {
+      if (!pushToOutput(blankToOutputPayload(item), seq)) return false;
+    } else if (item.type === 'bible') {
+      if (!pushToOutput(bibleToOutputPayload(item), seq)) return false;
+    } else if (item.type === 'ppt') {
+      await pptPlayPage(item.path, item.page ?? 0, stay);
+    } else if (item.type === 'pdf') {
+      await pdfPlayPage(item.path, item.page ?? 0, stay);
+    } else if (item.type === 'audio') {
+      // 叠播：只出声，不推音频卡盖掉当前画面；需要标题卡可在音频页手动推
+      await Promise.resolve(audioPlay(item.path, { ...stay, pushOutput: false }));
+    } else if (item.type === 'video') {
+      await Promise.resolve(videoPlay(item.path, stay));
+    } else {
+      throw new Error('未知类型：' + item.type);
+    }
+    if (seq !== activateSeq) return false;
+    // 冻结时预览已更新但扩展屏未换——对 cue 视为未完成
+    if (isOutputFrozen()) return true;
+    return true;
+  } catch (err) {
+    if (seq === activateSeq) toast('播放失败：' + err);
+    return false;
+  } finally {
+    if (seq === activateSeq) {
+      syncAudioBar(true);
+      syncAudioFloat();
+    }
+  }
+}
+
+/** 播放当前条；若还没选则播第一条。音乐正在播时改为暂停/继续 */
+export function programGo() {
+  const ev = curEvent();
+  if (!ev?.items.length) {
+    toast('请先添加节目内容');
+    return false;
+  }
+  let idx = activeIndex();
+  if (idx < 0) idx = 0;
+  const item = ev.items[idx];
+  if (item.type === 'audio') {
+    const snap = getAudioSnapshot();
+    if (snap.path === item.path) {
+      toggleAudio();
+      syncPlayGoBtn();
+      syncItemRemain();
+      return true;
+    }
+  }
+  activate(item);
+  return true;
+}
+
+function syncPlayGoBtn() {
+  const go = $('pg-go');
+  if (!go) return;
+  const item = curEvent()?.items.find((i) => i.id === activeItemId);
+  const snap = getAudioSnapshot();
+  const live = item?.type === 'audio' && snap.path === item.path && snap.playing;
+  go.textContent = live ? '⏸' : '▶';
+  go.title = live ? '暂停（G / 空格）' : '播放当前（G）';
+  go.classList.toggle('is-pause', live);
+}
+
+/** 列表行上的「还剩多久播完」LED 倒计时 */
+function syncItemRemain() {
+  const item = curEvent()?.items.find((i) => i.id === activeItemId);
+  const snap = getAudioSnapshot();
+  document.querySelectorAll('.pg-remain').forEach((el) => {
+    const row = el.closest('.pg-item');
+    const id = row?.dataset.id;
+    const isActiveAudio = item?.type === 'audio' && id === item.id && snap.path === item.path && snap.duration > 0;
+    if (!isActiveAudio) {
+      el.classList.add('hidden');
+      el.classList.remove('is-live', 'is-urgent', 'is-paused');
+      el.dataset.sec = '';
+      return;
+    }
+    const remainSec = Math.floor(Math.max(0, snap.duration - snap.pos));
+    const m = Math.floor(remainSec / 60);
+    const s = remainSec % 60;
+    el.classList.remove('hidden');
+    el.classList.toggle('is-live', !!snap.playing);
+    el.classList.toggle('is-paused', !snap.playing);
+    el.classList.toggle('is-urgent', snap.playing && remainSec <= 30);
+    if (el.dataset.sec === String(remainSec) && el.querySelector('.pg-r-num')) return;
+    el.dataset.sec = String(remainSec);
+    el.innerHTML = `<span class="pg-r-label">剩余</span><span class="pg-r-num">${m}</span><span class="pg-r-colon">:</span><span class="pg-r-num">${String(s).padStart(2, '0')}</span>`;
+  });
+}
+
+/** 上一条 / 下一条并立即播放（演出走台核心） */
+export function programStep(delta) {
+  const ev = curEvent();
+  if (!ev?.items.length) {
+    toast('请先添加节目内容');
+    return false;
+  }
+  let idx = activeIndex();
+  if (idx < 0) idx = delta > 0 ? -1 : 0;
+  const next = idx + delta;
+  if (next < 0 || next >= ev.items.length) {
+    return false;
+  }
+  activate(ev.items[next]);
+  return true;
+}
+
+export function programHasItems() {
+  return !!curEvent()?.items?.length;
+}
+
+export function programActiveType() {
+  const ev = curEvent();
+  const item = ev?.items.find((i) => i.id === activeItemId);
+  return item?.type || null;
+}
+
+function updateNowBar() {
+  const now = $('pg-now');
+  const ev = curEvent();
+  if (!now) return;
+  if (!ev?.items.length) {
+    now.innerHTML = '<span class="pg-now-empty">还没有节目 · 用「混排导入」按演出顺序一次加齐</span>';
+    return;
+  }
+  const idx = activeIndex();
+  const total = ev.items.length;
+  if (idx < 0) {
+    now.innerHTML = `<span class="pg-now-meta">共 ${total} 条</span>
+      <span class="pg-now-title">准备就绪 · 点「播放」或按 Enter 开始第 1 条</span>`;
+    return;
+  }
+  const it = ev.items[idx];
+  const meta = TYPE_META[it.type] || { label: '?', color: '#888' };
+  const next = ev.items[idx + 1];
+  const pageHint = (it.type === 'ppt' || it.type === 'pdf') && it.pages
+    ? ` · 第 ${(it.page ?? 0) + 1}/${it.pages} 页`
+    : it.type === 'blank'
+      ? (it.blankKind === 'lyric' ? ` · 歌词段${it.lyricIndex != null ? it.lyricIndex : ''}` : ' · 歌名片')
+      : '';
+  now.innerHTML = `
+    <span class="pg-now-meta" style="color:${meta.color}">${idx + 1} / ${total} · ${meta.label}${pageHint}</span>
+    <span class="pg-now-title">${esc(it.name)}</span>
+    <span class="pg-now-next">${next ? '下一条：' + esc(next.name) : '（最后一条）'}</span>`;
+}
+
+function scrollActiveIntoView() {
+  const el = document.querySelector('.pg-item.active');
+  // auto：避免 smooth 与输出渲染叠在一起造成卡顿感
+  el?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+}
+
+function startRename() {
+  const row = $('pg-rename-row');
+  row.classList.remove('hidden');
+  const input = $('pg-rename-input');
+  input.value = curEvent()?.name || '';
+  input.focus();
+  input.select();
+}
+
+function applyRename() {
+  const ev = curEvent();
+  const v = $('pg-rename-input').value.trim();
+  if (ev && v) {
+    ev.name = v;
+    save();
+    renderEvents();
+  }
+  $('pg-rename-row').classList.add('hidden');
+}
+
+function renderEvents() {
+  const box = $('program-events');
+  if (!box) return;
+  box.innerHTML = events.map((e) => `
+    <div class="file-item ${e.id === currentId ? 'active' : ''}" data-id="${e.id}">
+      <span class="fi-icon">📅</span>
+      <span class="fi-name" title="${esc(e.name)}">${esc(e.name)}</span>
+      <span class="fi-badge">${(e.items || []).length}项</span>
+    </div>`).join('');
+}
+
+function setViewMode(mode) {
+  if (mode !== 'list' && mode !== 'grid') return;
+  if (mode === viewMode) {
+    syncViewToggle();
+    return;
+  }
+  // 先取消进行中的缩略图任务，避免旧任务写穿新 DOM
+  thumbToken += 1;
+  viewMode = mode;
+  lsSet(LS_VIEW, mode);
+  syncViewToggle();
+  renderItems({ soft: false });
+}
+
+function syncViewToggle() {
+  $('pg-view-list')?.classList.toggle('active', viewMode === 'list');
+  $('pg-view-grid')?.classList.toggle('active', viewMode === 'grid');
+  const bar = $('pg-zoom-bar');
+  if (bar) bar.classList.toggle('hidden', viewMode === 'list');
+  const zoom = $('pg-zoom');
+  if (zoom) zoom.value = String(cardZoom);
+  const val = $('pg-zoom-val');
+  if (val) val.textContent = String(cardZoom);
+}
+
+function setCardZoom(v) {
+  cardZoom = Math.min(420, Math.max(140, Number(v) || 260));
+  lsSet(LS_ZOOM, cardZoom);
+  const zoom = $('pg-zoom');
+  if (zoom) zoom.value = String(cardZoom);
+  applyCardZoom();
+}
+
+function applyCardZoom() {
+  const box = $('pg-items');
+  if (!box) return;
+  // 卡片实际宽度 = 滑条值，整体像右侧预览一样变大变小
+  box.style.setProperty('--pg-card-w', `${cardZoom}px`);
+  const val = $('pg-zoom-val');
+  if (val) val.textContent = String(cardZoom);
+  const nearest = [180, 260, 340].reduce((a, b) =>
+    (Math.abs(b - cardZoom) < Math.abs(a - cardZoom) ? b : a), 260);
+  document.querySelectorAll('.pg-zoom-preset').forEach((btn) => {
+    btn.classList.toggle('active', +btn.dataset.zoom === nearest && Math.abs(nearest - cardZoom) < 12);
+  });
+}
+
+/** 条目顺序未变时只改文案/状态，保留缩略图 DOM */
+function trySoftRefreshItems() {
+  const ev = curEvent();
+  const box = $('pg-items');
+  if (!box || !ev) return false;
+  const items = Array.isArray(ev.items) ? ev.items : [];
+  const rows = [...box.querySelectorAll('.pg-item')];
+  if (!items.length || rows.length !== items.length) return false;
+  if (!rows.every((r, i) => r.dataset.id === items[i].id)) return false;
+  const isGrid = viewMode === 'grid';
+  // 列表/网格 DOM 结构不同，不能软刷
+  if (isGrid !== rows[0].classList.contains('card')) return false;
+
+  const aidx = activeIndex();
+  items.forEach((it, i) => {
+    const row = rows[i];
+    row.classList.toggle('active', it.id === activeItemId);
+    row.classList.toggle('done', aidx >= 0 && i < aidx);
+    const meta = TYPE_META[it.type] || { icon: '▪', label: '', color: '#888' };
+    const pageBadge = itemPageBadge(it);
+    const displayName = String(it.name ?? fileName(it.path || '') ?? '未命名');
+    const noteText = (it.note || '').trim();
+    const noteShow = noteText || '无备注';
+
+    const numEl = row.querySelector('.pg-corner-num, .pg-num');
+    if (numEl && numEl.textContent !== String(i + 1)) numEl.textContent = String(i + 1);
+
+    const nameEl = row.querySelector('.pg-name');
+    if (nameEl) {
+      const short = isGrid && displayName.length > 28 ? `${displayName.slice(0, 26)}…` : displayName;
+      if (nameEl.textContent !== short) nameEl.textContent = short;
+      nameEl.title = isGrid
+        ? `${displayName}${noteText ? ' · ' + noteText : ''}`
+        : (it.path || displayName);
+    }
+
+    const noteEl = row.querySelector('.pg-note');
+    if (noteEl) {
+      noteEl.textContent = noteShow;
+      noteEl.title = noteShow;
+      noteEl.classList.toggle('has-text', !!noteText);
+      noteEl.classList.toggle('is-empty', !noteText);
+    }
+
+    const tag = row.querySelector('.pg-corner-tag');
+    if (tag) {
+      tag.textContent = `${meta.label}${pageBadge ? ' · ' + pageBadge : ''}`;
+      tag.style.color = meta.color;
+    }
+    const pageEl = row.querySelector('.pg-page');
+    if (pageEl) pageEl.textContent = pageBadge || '';
+
+    const cue = row.querySelector('.pg-cue');
+    if (cue) cue.classList.toggle('hidden', !it.cueTime);
+  });
+  syncItemRemain();
+  syncCueCountdowns();
+  syncPlayGoBtn();
+  return true;
+}
+
+function itemPageBadge(it) {
+  if ((it.type === 'ppt' || it.type === 'pdf') && it.pages != null) {
+    return `${(it.page ?? 0) + 1}/${it.pages}`;
+  }
+  if (it.type === 'blank') {
+    return it.blankKind === 'lyric' ? `歌词${it.lyricIndex != null ? it.lyricIndex : ''}` : '歌名';
+  }
+  if (it.type === 'bible') {
+    if (it.pageTotal > 1) return `${it.pageIndex || 1}/${it.pageTotal}`;
+    return it.ref || '经文';
+  }
+  return fileExt(it.path);
+}
+
+function renderItems(opts = {}) {
+  // TEMP-DIAG
+  try {
+    window.__diagN = window.__diagN || { r: 0, f: 0 };
+    window.__diagN.r++;
+    const stack = (new Error().stack || '').split('\n').slice(2, 5).map((s) => s.trim()).join(' <- ');
+    invoke('append_file', { path: 'E:\\my\\音乐播放器和视频播放器，还有ppt 播放pdf 导入播放器\\diag-log.txt', dataB64: btoa(unescape(encodeURIComponent(`renderItems #${window.__diagN.r} t=${Date.now()} ${stack}\n`))), create: false });
+  } catch { /* ignore */ }
+  const ev = curEvent();
+  const box = $('pg-items');
+  if (!box) return;
+  const items = Array.isArray(ev?.items) ? ev.items : [];
+  box.classList.remove('view-list', 'view-grid', 'view-small', 'view-large');
+  box.classList.add(`view-${viewMode}`);
+  applyCardZoom();
+  syncViewToggle();
+  if (!ev || !items.length) {
+    thumbToken++;
+    box.innerHTML = `<div class="empty-tip big">
+      按演出时间顺序添加节目<br/>
+      <span style="font-size:13px;opacity:.8">混排导入 · 或直接把音乐/图片/视频/PPT/PDF 拖进这里</span>
+    </div>`;
+    syncPlayGoBtn();
+    return;
+  }
+  if (opts.soft !== false && trySoftRefreshItems()) return;
+
+  const aidx = activeIndex();
+  const isGrid = viewMode === 'grid';
+  try {
+    box.innerHTML = items.map((it, i) => {
+      const meta = TYPE_META[it.type] || { icon: '▪', label: '', color: '#888' };
+      const state = it.id === activeItemId ? 'active' : (aidx >= 0 && i < aidx ? 'done' : '');
+      const pageBadge = itemPageBadge(it);
+      const noteText = (it.note || '').trim();
+      const noteCls = noteText ? 'pg-note has-text' : 'pg-note is-empty';
+      const noteShow = noteText || '无备注';
+      const displayName = String(it.name ?? fileName(it.path || '') ?? '未命名');
+      const remainSlot = it.type === 'audio'
+        ? `<span class="pg-remain ${it.id === activeItemId ? '' : 'hidden'}" title="剩余播放时间"></span>`
+        : '';
+      const cueSlot = `<span class="pg-cue ${it.cueTime ? '' : 'hidden'}" title="开播倒计时">
+          <span class="pg-cue-at"></span>
+          <span class="pg-cue-cd"></span>
+        </span>`;
+
+      if (isGrid) {
+        const shortName = displayName.length > 28 ? `${displayName.slice(0, 26)}…` : displayName;
+        // 倒计时/定时放在标题区，避免被缩略图悬停条挡住
+        return `
+        <div class="pg-item card ${state}" data-id="${it.id}" title="${esc(displayName)}${noteText ? ' · ' + esc(noteText) : ''}">
+          <div class="pg-thumb" data-thumb-for="${it.id}">
+            <span class="pg-thumb-ph">${meta.icon || '▪'}</span>
+            <span class="pg-corner-num" title="双击改顺序">${i + 1}</span>
+            <span class="pg-corner-tag" style="color:${meta.color}">${meta.label}${pageBadge ? ' · ' + esc(pageBadge) : ''}</span>
+            <div class="pg-hover-bar">
+              <button type="button" data-op="play" class="primary" title="播放">▶ 播放</button>
+              <button type="button" data-op="cue" title="定时开播">定时</button>
+              <button type="button" data-op="note" title="备注">备注</button>
+              <button type="button" data-op="up" title="上移">↑</button>
+              <button type="button" data-op="down" title="下移">↓</button>
+              <button type="button" data-op="del" class="danger" title="删除">删除</button>
+            </div>
+          </div>
+          <div class="pg-caption">
+            <div class="pg-caption-row">
+              <span class="pg-name">${esc(shortName)}</span>
+              ${remainSlot}
+              ${cueSlot}
+            </div>
+            <span class="${noteCls}" title="${esc(noteShow)}">${esc(noteShow)}</span>
+          </div>
+        </div>`;
+      }
+
+      return `
+      <div class="pg-item ${state}" data-id="${it.id}">
+        <span class="pg-num" title="双击改顺序">${i + 1}</span>
+        <span class="pg-type-badge" style="background:${meta.color}22;color:${meta.color};border-color:${meta.color}55">${meta.label}</span>
+        <div class="pg-main">
+          <span class="pg-name" title="${esc(it.path)}">${esc(displayName)}</span>
+          <span class="${noteCls}">${esc(noteShow || '无备注')}</span>
+        </div>
+        ${cueSlot}
+        ${remainSlot}
+        <span class="pg-page mono">${esc(pageBadge)}</span>
+        <div class="pg-toolbar inline">
+          <button type="button" data-op="play" title="播放">▶</button>
+          <button type="button" data-op="cue" title="设定开播时间">⏱</button>
+          <button type="button" data-op="note" title="编辑备注">备</button>
+          <button type="button" data-op="up" title="上移">↑</button>
+          <button type="button" data-op="down" title="下移">↓</button>
+          <button type="button" data-op="del" class="danger" title="移除">✕</button>
+        </div>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    console.error('renderItems failed', err);
+    toast(`列表渲染异常：${err}`, 5000);
+    // 保底列表，避免整页空白
+    box.classList.remove('view-grid');
+    box.classList.add('view-list');
+    box.innerHTML = items.map((it, i) => `
+      <div class="pg-item" data-id="${it.id}">
+        <span class="pg-num">${i + 1}</span>
+        <div class="pg-main"><span class="pg-name">${esc(it.name || it.path || '未命名')}</span></div>
+      </div>`).join('');
+  }
+  syncItemRemain();
+  syncCueCountdowns();
+  syncPlayGoBtn();
+  if (isGrid && viewMode === 'grid') fillItemThumbs();
+}
+
+function thumbCacheKey(item) {
+  if (item.type === 'blank') {
+    return [
+      'blank', item.id, item.blankKind, item.title, item.subtitle,
+      (item.body || '').slice(0, 48), item.accent, item.bgPreset, item.bgImage || '',
+    ].join('|');
+  }
+  if (item.type === 'bible') {
+    return [
+      'bible', item.id, item.ref, (item.body || '').slice(0, 48), item.accent,
+      item.pageIndex, item.pageTotal,
+    ].join('|');
+  }
+  return `${item.type}|${item.path}|${item.page ?? 0}`;
+}
+
+function rememberThumb(key, value) {
+  thumbCache.set(key, value);
+  while (thumbCache.size > 64) {
+    thumbCache.delete(thumbCache.keys().next().value);
+  }
+}
+
+function captureVideoThumb(path) {
+  const key = `video|${path}|0`;
+  if (thumbCache.has(key)) return Promise.resolve(thumbCache.get(key));
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.src = convertFileSrc(path);
+    let settled = false;
+    const finish = (url) => {
+      if (settled) return;
+      settled = true;
+      try { v.removeAttribute('src'); v.load(); } catch { /* ignore */ }
+      v.remove();
+      resolve(url || null);
+    };
+    const timer = setTimeout(() => finish(null), 4000);
+    v.addEventListener('seeked', () => {
+      try {
+        const w = 320;
+        const h = 180;
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d').drawImage(v, 0, 0, w, h);
+        const url = c.toDataURL('image/jpeg', 0.72);
+        rememberThumb(key, url);
+        clearTimeout(timer);
+        finish(url);
+      } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    }, { once: true });
+    v.addEventListener('loadeddata', () => {
+      try { v.currentTime = Math.min(0.25, (v.duration || 1) * 0.05); } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    }, { once: true });
+    v.addEventListener('error', () => {
+      clearTimeout(timer);
+      finish(null);
+    }, { once: true });
+  });
+}
+
+async function fillItemThumbs() {
+  const token = ++thumbToken;
+  // TEMP-DIAG
+  try {
+    window.__diagN = window.__diagN || { r: 0, f: 0 };
+    window.__diagN.f++;
+    await invoke('append_file', { path: 'E:\\my\\音乐播放器和视频播放器，还有ppt 播放pdf 导入播放器\\diag-log.txt', dataB64: btoa(unescape(encodeURIComponent(`fillItemThumbs #${window.__diagN.f} t=${Date.now()}\n`))), create: false });
+  } catch { /* ignore */ }
+  const box = $('pg-items');
+  if (!box || viewMode !== 'grid') return;
+  const thumbs = [...box.querySelectorAll('.pg-thumb')];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < thumbs.length) {
+      if (token !== thumbToken || viewMode !== 'grid') return;
+      const el = thumbs[cursor++];
+      const row = el.closest('.pg-item');
+      const id = row?.dataset.id;
+      const item = curEvent()?.items.find((i) => i.id === id);
+      if (!item) continue;
+      try {
+        await mountItemThumb(el, item, token);
+      } catch {
+        if (token !== thumbToken) return;
+        restoreThumbFallback(el, item);
+      }
+      // 让出主线程，切换列表时不卡死
+      await new Promise((r) => requestAnimationFrame(() => r()));
+    }
+  };
+  const n = Math.min(THUMB_CONCURRENCY, thumbs.length || 1);
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  if (token === thumbToken) {
+    syncItemRemain();
+    syncCueCountdowns();
+  }
+}
+
+function restoreThumbFallback(el, item) {
+  const keep = [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
+  el.innerHTML = `<span class="pg-thumb-ph">${TYPE_META[item.type]?.icon || '▪'}</span>`;
+  for (const node of keep) el.appendChild(node);
+}
+
+/** 填充预览时保留角标与悬停操作条 */
+function preserveThumbChrome(el, fillFn) {
+  const keep = [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
+  fillFn();
+  for (const node of keep) el.appendChild(node);
+}
+
+function captureThumbChrome(el) {
+  return [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
+}
+
+function applyThumbChrome(el, keep) {
+  for (const node of keep) el.appendChild(node);
+}
+
+function putThumbImage(el, url, alt = '') {
+  preserveThumbChrome(el, () => {
+    el.innerHTML = '';
+    const img = document.createElement('img');
+    img.className = 'pg-thumb-img';
+    img.src = url;
+    img.draggable = false;
+    img.alt = alt;
+    el.appendChild(img);
+  });
+}
+
+async function captureImageThumb(path) {
+  const key = `image|${path}|0`;
+  if (thumbCache.has(key)) return thumbCache.get(key);
+  try {
+    // 由 Rust 原生生成小图 dataURL，避免渲染进程解码原图 OOM
+    const url = await invoke('make_image_thumb', { path });
+    if (url) rememberThumb(key, url);
+    return url || null;
+  } catch {
+    return null;
+  }
+}
+
+async function mountItemThumb(el, item, token = thumbToken) {
+  if (!el || !item || token !== thumbToken) return;
+  const key = thumbCacheKey(item);
+  if (el.dataset.thumbKey === key && el.querySelector('.pg-thumb-img, .slide-canvas, .pg-blank-thumb, .pg-bible-thumb, .pg-thumb-audio')) {
+    return;
+  }
+
+  if (item.type === 'image') {
+    let url = thumbCache.get(key);
+    if (!url) url = await captureImageThumb(item.path);
+    if (token !== thumbToken || viewMode !== 'grid') return;
+    if (url) {
+      putThumbImage(el, url, item.name || '');
+      el.dataset.thumbKey = key;
+      return;
+    }
+    restoreThumbFallback(el, item);
+    return;
+  }
+  if (item.type === 'video') {
+    let url = thumbCache.get(key);
+    if (!url) url = await captureVideoThumb(item.path);
+    if (token !== thumbToken || viewMode !== 'grid') return;
+    if (url) {
+      putThumbImage(el, url, item.name || '');
+      el.dataset.thumbKey = key;
+      return;
+    }
+    restoreThumbFallback(el, item);
+    return;
+  }
+  if (item.type === 'blank') {
+    const cached = thumbCache.get(key);
+    if (cached?.nodeType === 1) {
+      preserveThumbChrome(el, () => {
+        el.innerHTML = '';
+        el.appendChild(cached.cloneNode(true));
+      });
+      el.dataset.thumbKey = key;
+      return;
+    }
+    mountBlankPreview(el, item);
+    const stage = el.querySelector('.pg-blank-thumb');
+    if (stage) rememberThumb(key, stage.cloneNode(true));
+    el.dataset.thumbKey = key;
+    return;
+  }
+  if (item.type === 'bible') {
+    const cached = thumbCache.get(key);
+    if (cached?.nodeType === 1) {
+      preserveThumbChrome(el, () => {
+        el.innerHTML = '';
+        el.appendChild(cached.cloneNode(true));
+      });
+      el.dataset.thumbKey = key;
+      return;
+    }
+    mountBiblePreview(el, item);
+    const stage = el.querySelector('.pg-bible-thumb');
+    if (stage) rememberThumb(key, stage.cloneNode(true));
+    el.dataset.thumbKey = key;
+    return;
+  }
+  // PPT：缓存克隆的 slide-canvas，避免每次重解析/重渲
+  if (item.type === 'ppt') {
+    const cached = thumbCache.get(key);
+    if (cached?.nodeType === 1) {
+      preserveThumbChrome(el, () => {
+        el.innerHTML = '';
+        const node = cached.cloneNode(true);
+        node.style.width = '100%';
+        node.style.height = '100%';
+        node.style.aspectRatio = 'auto';
+        el.appendChild(node);
+      });
+      el.dataset.thumbKey = key;
+      return;
+    }
+    const ok = await mountSlidePreview(el, item.path, item.page ?? 0);
+    if (token !== thumbToken || viewMode !== 'grid') return;
+    const canvas = el.querySelector('.slide-canvas');
+    if (!ok || !canvas) {
+      restoreThumbFallback(el, item);
+      return;
+    }
+    rememberThumb(key, canvas.cloneNode(true));
+    el.dataset.thumbKey = key;
+    return;
+  }
+  if (item.type === 'pdf') {
+    let url = thumbCache.get(key);
+    if (!url) {
+      const holder = document.createElement('div');
+      holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:320px;height:180px;overflow:hidden;pointer-events:none';
+      document.body.appendChild(holder);
+      try {
+        await mountPdfPreview(holder, item.path, item.page ?? 0);
+        if (token !== thumbToken) return;
+        const canvas = holder.querySelector('canvas');
+        if (canvas) {
+          url = canvas.toDataURL('image/jpeg', 0.72);
+          rememberThumb(key, url);
+        }
+      } finally {
+        holder.remove();
+      }
+    }
+    if (token !== thumbToken || viewMode !== 'grid') return;
+    if (url) {
+      putThumbImage(el, url, item.name || '');
+      el.dataset.thumbKey = key;
+      return;
+    }
+    const keep = captureThumbChrome(el);
+    await mountPdfPreview(el, item.path, item.page ?? 0);
+    if (token !== thumbToken) return;
+    applyThumbChrome(el, keep);
+    el.dataset.thumbKey = key;
+    return;
+  }
+  // audio / fallback
+  const meta = TYPE_META[item.type] || { icon: '♪', label: '音乐', color: '#3dd55f' };
+  preserveThumbChrome(el, () => {
+    el.innerHTML = `<div class="pg-thumb-audio" style="--c:${meta.color}"><span>${meta.icon}</span><em>${esc(meta.label)}</em></div>`;
+  });
+  el.dataset.thumbKey = key;
+}

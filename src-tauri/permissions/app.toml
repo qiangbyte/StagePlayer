@@ -1,0 +1,35 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "允许演出播放器全部自定义命令"
+commands.allow = [
+  "pick_files",
+  "pick_save_path",
+  "append_file",
+  "copy_file",
+  "make_image_thumb",
+  "vocal_cancel_export",
+  "parse_pptx",
+  "open_output_window",
+  "set_output_fullscreen",
+  "close_output_window",
+  "set_output_always_on_top",
+  "list_monitors",
+  "place_output_on_monitor",
+  "list_audio_output_devices",
+  "audio_play",
+  "audio_pause",
+  "audio_resume",
+  "audio_stop",
+  "audio_set_volume",
+  "audio_seek",
+  "audio_state",
+  "audio_set_vocal_cancel",
+  "stem_get_instrumental",
+  "stem_ensure_instrumental",
+  "stem_job_status",
+  "spl_list_inputs",
+  "spl_start",
+  "spl_stop",
+  "spl_set_params",
+  "spl_get_snapshot"
+]

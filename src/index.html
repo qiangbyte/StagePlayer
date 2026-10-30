@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StagePlayer 演出播放器</title>
+  <link rel="stylesheet" href="css/app.css?v=audio-dock2" />
+</head>
+<body>
+  <div id="app">
+    <!-- 顶栏 -->
+    <header id="topbar">
+      <div class="logo">
+        <span class="logo-icon">▶</span>
+        <span class="logo-text">StagePlayer</span>
+        <span class="logo-sub">演出播放器</span>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-module="program">节目单</button>
+        <button class="tab" data-module="audio">音频</button>
+        <button class="tab" data-module="video">视频</button>
+        <button class="tab" data-module="ppt">PPT</button>
+        <button class="tab" data-module="pdf">PDF</button>
+        <button class="tab" data-module="spl">声压</button>
+      </nav>
+
+      <div class="spacer"></div>
+
+      <!-- 计时器 -->
+      <div class="timers">
+        <div class="timer-box">
+          <span class="timer-label">正计时</span>
+          <span class="timer-display green" id="sw-display">00:00:00</span>
+          <span class="timer-btns">
+            <button id="sw-start" class="mini-btn">开始</button>
+            <button id="sw-reset" class="mini-btn">清零</button>
+          </span>
+        </div>
+        <div class="timer-box">
+          <span class="timer-label">倒计时</span>
+          <span class="timer-display red" id="cd-display">00:00:00</span>
+          <input type="number" id="cd-minutes" min="0" max="600" value="5" class="cd-input" title="分钟" />
+          <span class="timer-btns">
+            <button id="cd-start" class="mini-btn">开始</button>
+            <button id="cd-reset" class="mini-btn">重置</button>
+          </span>
+        </div>
+      </div>
+
+      <!-- 输出控制（均在主控操作，无需到扩展屏点击） -->
+      <div class="output-controls">
+        <button id="btn-fs-output" class="btn primary" title="投到扩展屏并全屏（快捷键 F）">全屏输出</button>
+        <button id="btn-close-output" class="btn danger" title="关闭扩展屏输出（快捷键 Esc / X）">关闭输出</button>
+        <button id="btn-open-output" class="btn" title="仅打开输出窗口（不全屏）" style="display:none">打开输出</button>
+        <button id="btn-black" class="btn dark" title="黑屏 / 恢复（快捷键 B）">黑屏</button>
+        <button id="btn-freeze" class="btn" title="冻结输出：主控可切换内容，输出画面保持不动">冻结</button>
+        <div class="settings-wrap">
+          <button id="btn-settings" class="btn" title="显示器 / 画面适配 / 音频声卡">⚙ 设置</button>
+          <div id="settings-pop" class="pop hidden">
+            <div class="pop-title">投屏设置</div>
+            <div class="pop-row">
+              <label>输出显示器</label>
+              <select id="sel-monitor"></select>
+            </div>
+            <div class="pop-row">
+              <label>画面适配</label>
+              <select id="sel-fit">
+                <option value="contain">适配（留黑边）</option>
+                <option value="stretch">拉伸铺满</option>
+                <option value="cover">填充裁切</option>
+              </select>
+            </div>
+            <button id="btn-apply-monitor" class="btn primary full">投屏到所选显示器并全屏</button>
+            <div class="pop-tip">有扩展屏时，「全屏输出」默认投到扩展屏；可在此改选并点上方按钮</div>
+            <label class="check pop-check"><input type="checkbox" id="chk-topmost" /> 输出窗口置顶（防止被其他窗口遮挡）</label>
+            <div class="pop-divider"></div>
+            <div class="pop-title">音频输出设备（声卡）</div>
+            <div class="pop-row">
+              <select id="sel-audio-device" style="flex:1"></select>
+              <button id="btn-refresh-devices" class="mini-btn">刷新</button>
+            </div>
+            <div class="pop-tip">切换声卡后立即生效，正在播放的音频会无缝续播</div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main id="body">
+      <!-- 侧栏 -->
+      <aside id="sidebar">
+        <div class="side-head">
+          <span id="list-title">播放列表</span>
+          <span class="side-actions">
+            <button id="btn-import" class="mini-btn">导入</button>
+            <button id="btn-clear" class="mini-btn">清空</button>
+          </span>
+        </div>
+        <!-- 左栏：目录（媒体库）/ 演出列表 -->
+        <div id="audio-list-wrap" class="file-list-wrap dir-wrap" style="display:none">
+          <div id="audio-dirs" class="dir-list"></div>
+          <div class="dir-foot">
+            <button type="button" class="mini-btn" id="audio-dir-add" title="新建目录">＋目录</button>
+            <button type="button" class="mini-btn" id="audio-dir-rename" title="重命名当前目录">改名</button>
+            <button type="button" class="mini-btn danger" id="audio-dir-del" title="删除当前目录">删</button>
+          </div>
+        </div>
+        <div id="video-list-wrap" class="file-list-wrap dir-wrap" style="display:none">
+          <div id="video-dirs" class="dir-list"></div>
+          <div class="dir-foot">
+            <button type="button" class="mini-btn" id="video-dir-add">＋目录</button>
+            <button type="button" class="mini-btn" id="video-dir-rename">改名</button>
+            <button type="button" class="mini-btn danger" id="video-dir-del">删</button>
+          </div>
+        </div>
+        <div id="ppt-docs-wrap" class="file-list-wrap dir-wrap" style="display:none">
+          <div id="ppt-dirs" class="dir-list"></div>
+          <div class="dir-docs-head">文稿列表 <span class="dir-docs-count" id="ppt-docs-count">0</span></div>
+          <div id="ppt-docs" class="file-list dir-docs"></div>
+          <div class="dir-foot">
+            <button type="button" class="mini-btn" id="ppt-dir-add">＋目录</button>
+            <button type="button" class="mini-btn" id="ppt-dir-rename">改名</button>
+            <button type="button" class="mini-btn danger" id="ppt-dir-del">删</button>
+          </div>
+        </div>
+        <div id="pdf-docs-wrap" class="file-list-wrap dir-wrap" style="display:none">
+          <div id="pdf-dirs" class="dir-list"></div>
+          <div class="dir-docs-head">文档列表 <span class="dir-docs-count" id="pdf-docs-count">0</span></div>
+          <div id="pdf-docs" class="file-list dir-docs"></div>
+          <div class="dir-foot">
+            <button type="button" class="mini-btn" id="pdf-dir-add">＋目录</button>
+            <button type="button" class="mini-btn" id="pdf-dir-rename">改名</button>
+            <button type="button" class="mini-btn danger" id="pdf-dir-del">删</button>
+          </div>
+        </div>
+        <div id="program-events-wrap" class="file-list-wrap" style="display:none"><div id="program-events" class="file-list"></div></div>
+      </aside>
+
+      <!-- 主区域 -->
+      <section id="stage">
+        <!-- 音频：中列表 + 底部署控（不占满全屏） -->
+        <div class="panel active" data-module="audio" id="panel-audio">
+          <audio id="audio-meta" preload="metadata" style="display:none"></audio>
+          <div class="lib-layout">
+            <div class="lib-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">音频卡片</span>
+                  <span class="lib-folder-title" id="audio-folder-title">全部</span>
+                </div>
+                <input type="search" id="audio-search" class="lib-search" placeholder="搜索歌名…" />
+                <select id="audio-move-folder" class="lib-move" title="将选中歌曲移入目录">
+                  <option value="">移入目录…</option>
+                </select>
+                <label class="view-zoom-inline" title="卡片大小">
+                  <span class="pg-zoom-label">大小</span>
+                  <input type="range" id="audio-zoom" min="140" max="320" value="176" />
+                  <span class="pg-zoom-val mono" id="audio-zoom-val">176</span>
+                </label>
+              </div>
+              <div class="audio-card-wrap">
+                <span class="audio-card-count" id="audio-card-count" title="本目录歌曲数">[0]</span>
+                <div id="audio-song-list" class="audio-card-grid"></div>
+              </div>
+            </div>
+            <div class="lib-dock audio-pro" id="audio-dock">
+              <div class="audio-dock-bar">
+                <button type="button" class="mini-btn" id="audio-extra-toggle" title="起播 / 渐变 / 备注">本曲设置</button>
+                <button type="button" class="mini-btn is-on" id="audio-monitor-toggle" title="显示/隐藏波形与计时">监视器</button>
+                <span class="audio-file" id="audio-title">未选择音频</span>
+                <span class="audio-tech mono" id="audio-tech">总时长 --:--:-- · 采样率 --</span>
+              </div>
+
+              <div class="audio-extra hidden" id="audio-extra">
+                <div class="audio-cue-bar" id="audio-cue-bar" title="针对当前选中/播放的歌曲">
+                  <span class="cue-kicker">本曲</span>
+                  <label class="cue-field">起播
+                    <input type="number" id="audio-start-min" class="cue-num" min="0" max="999" value="0" title="分钟" />
+                    <span class="cue-sep">:</span>
+                    <input type="number" id="audio-start-sec" class="cue-num" min="0" max="59" value="0" title="秒" />
+                  </label>
+                  <label class="cue-field">渐起
+                    <input type="number" id="audio-fade-in" class="cue-num" min="0" max="60" step="1" value="0" />
+                    <span class="cue-unit">秒</span>
+                  </label>
+                  <label class="cue-field">渐弱
+                    <input type="number" id="audio-fade-out" class="cue-num" min="0" max="60" step="1" value="0" />
+                    <span class="cue-unit">秒</span>
+                  </label>
+                  <button type="button" class="mini-btn primary" id="audio-cue-apply">保存</button>
+                  <span class="cue-tip" id="audio-cue-tip">先选一首歌</span>
+                </div>
+                <div class="media-note-bar">
+                  <span class="cue-kicker">备注</span>
+                  <input type="text" id="audio-note" class="media-note-input" maxlength="200"
+                    placeholder="开播前提示，例如：等司仪介绍完再放…" />
+                  <button type="button" class="mini-btn" id="audio-note-save">存备注</button>
+                </div>
+              </div>
+
+              <div class="audio-monitor" id="audio-monitor">
+                <div class="audio-leds" id="audio-leds">
+                  <div class="led-box">
+                    <span class="led-label">正计时</span>
+                    <span class="led-display green" id="audio-elapsed">00:00:00.00</span>
+                  </div>
+                  <div class="led-box">
+                    <span class="led-label">倒计时</span>
+                    <span class="led-display red" id="audio-remain">00:00:00.00</span>
+                  </div>
+                  <div class="audio-meter-panel" title="控台监视：VOL=软件推子 · RMS/PEAK≈输出电平(dBFS)">
+                    <div class="meter-readouts">
+                      <div class="meter-cell">
+                        <span class="meter-k">VOL</span>
+                        <span class="meter-v mono" id="audio-vol-pct">90%</span>
+                      </div>
+                      <div class="meter-cell">
+                        <span class="meter-k">RMS</span>
+                        <span class="meter-v mono" id="audio-rms-db">-∞ dB</span>
+                      </div>
+                      <div class="meter-cell">
+                        <span class="meter-k">PEAK</span>
+                        <span class="meter-v mono" id="audio-peak-db">-∞ dB</span>
+                      </div>
+                    </div>
+                    <div class="meter-bar-wrap">
+                      <canvas id="audio-vu" width="220" height="36"></canvas>
+                      <div class="meter-scale mono" aria-hidden="true" title="参考 Midas M32 主表刻度">
+                        <span style="left:0%">-60</span>
+                        <span style="left:12%">-48</span>
+                        <span style="left:24%">-36</span>
+                        <span style="left:41%">-24</span>
+                        <span style="left:53%">-18</span>
+                        <span style="left:65%">-12</span>
+                        <span style="left:76%">-6</span>
+                        <span style="left:82%">-3</span>
+                        <span style="left:100%">0</span>
+                      </div>
+                    </div>
+                    <div class="meter-clip hidden" id="audio-clip" title="点击清除过载提示">CLIP</div>
+                  </div>
+                </div>
+                <div class="wave-row">
+                  <div class="wave-wrap" id="audio-wave-wrap">
+                    <canvas id="audio-wave"></canvas>
+                    <div class="wave-seek-tip hidden mono" id="audio-wave-tip">0:00.00</div>
+                  </div>
+                  <div class="wave-wrap spec"><canvas id="audio-spec"></canvas></div>
+                </div>
+              </div>
+
+              <div class="audio-controls">
+                <button class="ctrl-btn" id="audio-prev" title="上一首">⏮</button>
+                <button class="ctrl-btn big" id="audio-play" title="播放/暂停">▶</button>
+                <button class="ctrl-btn" id="audio-next" title="下一首">⏭</button>
+                <span class="vol-wrap" title="软件推子">
+                  <span class="vol-label">VOL</span>
+                  <input type="range" id="audio-volume" min="0" max="1" step="0.01" value="0.9" />
+                  <span class="vol-pct mono" id="audio-vol-label">90%</span>
+                  <span class="vol-db mono" id="audio-vol-db">-0.9 dB</span>
+                </span>
+                <button class="mini-btn" id="audio-vol-unity" title="音量回到 100%（0 dB）">0 dB</button>
+                <button class="mini-btn" id="audio-loop">列表循环</button>
+                <button class="mini-btn" id="audio-push-card" title="推到扩展屏：有同名 .lrc/.txt 则滚歌词，否则标题卡">推送歌词/标题</button>
+                <button class="mini-btn hl" id="audio-karaoke" title="消除立体声中置人声（保留贝斯），导出 WAV 伴奏文件">消除人声导出</button>
+                <label class="check"><input type="checkbox" id="audio-auto-push" checked />自动推送</label>
+                <span class="grow"></span>
+                <span class="hint-inline">VOL%=推子 · 电平表≈M32刻度(dBFS)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 视频：中列表 + 右侧小预览 -->
+        <div class="panel" data-module="video" id="panel-video">
+          <div class="lib-layout video-lib">
+            <div class="lib-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">视频卡片</span>
+                  <span class="lib-folder-title" id="video-folder-title">全部</span>
+                </div>
+                <input type="search" id="video-search" class="lib-search" placeholder="搜索视频…" />
+                <select id="video-move-folder" class="lib-move" title="移入目录">
+                  <option value="">移入目录…</option>
+                </select>
+                <label class="view-zoom-inline" title="卡片大小">
+                  <span class="pg-zoom-label">大小</span>
+                  <input type="range" id="video-card-zoom" min="140" max="320" value="176" />
+                  <span class="pg-zoom-val mono" id="video-card-zoom-val">176</span>
+                </label>
+              </div>
+              <div class="audio-card-wrap">
+                <span class="audio-card-count" id="video-card-count" title="本目录视频数">[0]</span>
+                <div id="video-song-list" class="audio-card-grid"></div>
+              </div>
+            </div>
+            <div class="lib-dock video-dock">
+              <div class="media-note-bar video-note-bar">
+                <span class="cue-kicker">备注</span>
+                <input type="text" id="video-note" class="media-note-input" maxlength="200"
+                  placeholder="开播前提示，例如：等祷告结束再推屏…" />
+                <button type="button" class="mini-btn" id="video-note-save">存备注</button>
+              </div>
+              <div class="video-monitor">
+                <div class="video-wrap compact">
+                  <video id="video-preview" preload="metadata"></video>
+                  <span class="video-monitor-tag">本地预览</span>
+                </div>
+                <div class="video-monitor-side">
+                  <div class="video-monitor-head">
+                    <span class="video-monitor-title" id="video-preview-title">未选择视频</span>
+                    <label class="view-zoom-inline" title="预览窗高度">
+                      <span class="pg-zoom-label">预览</span>
+                      <input type="range" id="video-zoom" min="140" max="320" value="200" />
+                      <span class="pg-zoom-val mono" id="video-zoom-val">200</span>
+                    </label>
+                  </div>
+                  <div class="video-controls">
+                    <button class="ctrl-btn" id="video-play" title="播放/暂停">▶</button>
+                    <div class="progress grow" id="video-bar"><div class="progress-fill" id="video-bar-fill"></div></div>
+                    <span class="mono video-time" id="video-time">00:00 / 00:00</span>
+                    <span class="vol-wrap">🔊 <input type="range" id="video-volume" min="0" max="1" step="0.01" value="0.9" /></span>
+                  </div>
+                  <div class="video-monitor-actions">
+                    <button class="btn primary" id="video-push">推送到输出</button>
+                    <button class="btn" id="video-stop">停止输出</button>
+                    <span class="hint-inline">单击卡片预览 · ⇥ 推大屏 · ✎改名</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PPT：中页列表 + 底部署控（缩略图不再铺满） -->
+        <div class="panel" data-module="ppt" id="panel-ppt">
+          <div class="lib-layout slide-lib">
+            <div class="lib-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">文稿 / 页面</span>
+                  <span class="lib-folder-title" id="ppt-folder-title">全部</span>
+                </div>
+                <select id="ppt-doc-select" class="lib-move" title="选择文稿"></select>
+                <button type="button" class="mini-btn" id="ppt-rename-doc" title="重命名当前文稿显示名">改名</button>
+                <select id="ppt-move-folder" class="lib-move" title="文稿移入目录">
+                  <option value="">移入目录…</option>
+                </select>
+              </div>
+              <div class="panel-toolbar tight">
+                <button class="mini-btn" id="ppt-prev">◀ 上一页</button>
+                <button class="mini-btn" id="ppt-next">下一页 ▶</button>
+                <span class="mono" id="ppt-info"></span>
+                <span class="grow"></span>
+                <label class="view-zoom-inline">
+                  <span class="pg-zoom-label">大小</span>
+                  <input type="range" id="ppt-zoom" min="120" max="420" value="180" />
+                  <span class="pg-zoom-val mono" id="ppt-zoom-val">180</span>
+                </label>
+                <span class="hint-inline">点击页面即输出</span>
+              </div>
+              <div id="ppt-grid" class="thumb-grid compact-grid">
+                <div class="empty-tip">导入 .pptx 后在此浏览页面</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PDF -->
+        <div class="panel" data-module="pdf" id="panel-pdf">
+          <div class="lib-layout slide-lib">
+            <div class="lib-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">文档 / 页面</span>
+                  <span class="lib-folder-title" id="pdf-folder-title">全部</span>
+                </div>
+                <select id="pdf-doc-select" class="lib-move" title="选择文档"></select>
+                <button type="button" class="mini-btn" id="pdf-rename-doc" title="重命名当前文档显示名">改名</button>
+                <select id="pdf-move-folder" class="lib-move" title="文档移入目录">
+                  <option value="">移入目录…</option>
+                </select>
+              </div>
+              <div class="panel-toolbar tight">
+                <button class="mini-btn" id="pdf-prev">◀ 上一页</button>
+                <button class="mini-btn" id="pdf-next">下一页 ▶</button>
+                <span class="mono" id="pdf-info"></span>
+                <span class="grow"></span>
+                <label class="view-zoom-inline">
+                  <span class="pg-zoom-label">大小</span>
+                  <input type="range" id="pdf-zoom" min="120" max="420" value="180" />
+                  <span class="pg-zoom-val mono" id="pdf-zoom-val">180</span>
+                </label>
+                <span class="hint-inline">点击页面即输出</span>
+              </div>
+              <div id="pdf-grid" class="thumb-grid compact-grid">
+                <div class="empty-tip">导入 PDF 后在此浏览页面</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 节目单：一场演出的时间轴 -->
+        <div class="panel" data-module="program" id="panel-program">
+          <div class="pg-showbar">
+            <button class="ctrl-btn" id="pg-prev" title="上一条（Shift+Enter）">⏮</button>
+            <button class="ctrl-btn big" id="pg-go" title="播放当前（G）">▶</button>
+            <button class="ctrl-btn" id="pg-next" title="下一条并播放（Enter）">⏭</button>
+            <div id="pg-now" class="pg-now">
+              <span class="pg-now-empty">按演出顺序编排节目，一条条往下播</span>
+            </div>
+            <div id="pg-audio-bar" class="pg-audio-bar hidden">
+              <span id="pg-audio-pos" class="mono">0:00</span>
+              <input type="range" id="pg-audio-seek" min="0" max="1000" value="0" step="1" title="拖动跳转进度" />
+              <span id="pg-audio-dur" class="mono">0:00</span>
+              <button type="button" class="mini-btn" id="pg-audio-loop" title="循环模式：列表循环 / 单曲循环 / 顺序播放">列表循环</button>
+            </div>
+          </div>
+          <div class="panel-toolbar">
+            <button class="mini-btn primary" id="pg-add-mixed" title="一次多选，按文件顺序加入">＋混排导入</button>
+            <span class="toolbar-sep"></span>
+            <button class="mini-btn" id="pg-add-audio">＋音乐</button>
+            <button class="mini-btn" id="pg-add-image">＋图片</button>
+            <button class="mini-btn" id="pg-add-video">＋视频</button>
+            <button class="mini-btn" id="pg-add-ppt">＋PPT</button>
+            <button class="mini-btn" id="pg-add-pdf">＋PDF</button>
+            <button class="mini-btn" id="pg-add-blank" title="新建歌名片或歌词段空白页">＋空白页</button>
+            <button class="mini-btn" id="pg-add-songset" title="歌名 + 歌词空行分段，一次生成多页">＋歌曲页组</button>
+            <button class="mini-btn accent" id="pg-add-bible" title="查经：和合本快速定位并投屏">＋圣经</button>
+            <span class="toolbar-sep"></span>
+            <button class="mini-btn accent" id="pg-lobby-toggle" title="设置开场时间与扩展屏待机页">开场倒计时</button>
+            <button class="mini-btn" id="pg-lobby-push" title="把开场页推到扩展屏">推送到扩展屏</button>
+            <span class="toolbar-sep"></span>
+            <button type="button" class="mini-btn" id="pg-view-list" title="列表模式">列表</button>
+            <button type="button" class="mini-btn" id="pg-view-grid" title="缩略图模式">缩略图</button>
+            <span class="grow"></span>
+            <button class="mini-btn" id="pg-new" title="新建一场演出">＋新演出</button>
+            <button class="mini-btn" id="pg-rename">重命名</button>
+            <button class="mini-btn" id="pg-delete">删除</button>
+          </div>
+          <div class="panel-toolbar rename-row hidden" id="pg-rename-row">
+            <input type="text" id="pg-rename-input" class="rename-input" placeholder="演出名称" />
+            <button class="mini-btn" id="pg-rename-ok">确定</button>
+            <button class="mini-btn" id="pg-rename-cancel">取消</button>
+          </div>
+          <div class="pg-blank-panel hidden" id="pg-blank-panel">
+            <div class="pg-blank-grid">
+              <label>类型
+                <select id="pg-blank-kind">
+                  <option value="title">歌名片（第 1 页）</option>
+                  <option value="lyric">歌词段</option>
+                </select>
+              </label>
+              <label>强调色 <input type="color" id="pg-blank-accent" value="#e8c56a" /></label>
+              <label class="span2">主标题 / 歌名 <input type="text" id="pg-blank-title" placeholder="例如：太阳之子" maxlength="80" /></label>
+              <label class="span2" id="pg-blank-sub-wrap">副标题 / 作者 <input type="text" id="pg-blank-sub" placeholder="例如：敬拜团 · 原唱某某" maxlength="120" /></label>
+              <label class="span2 hidden" id="pg-blank-body-wrap">歌词正文（一段）
+                <textarea id="pg-blank-body" rows="4" placeholder="这一页显示的一段歌词，可换行"></textarea>
+              </label>
+              <label class="span2">背景预设
+                <select id="pg-blank-preset">
+                  <option value="auto" selected>强调色自动</option>
+                  <option value="church-dark">教会深色</option>
+                  <option value="clean-dark">简洁深底</option>
+                  <option value="blue-gold">蓝金氛围</option>
+                  <option value="soft-light">柔光浅底</option>
+                </select>
+              </label>
+              <label class="span2">背景图
+                <span class="pg-lobby-bgimg-row">
+                  <input type="text" id="pg-blank-bgimg" readonly placeholder="未选择（将用预设/自动渐变）" />
+                  <button type="button" class="mini-btn" id="pg-blank-bgimg-pick">选择图片</button>
+                  <button type="button" class="mini-btn" id="pg-blank-bgimg-clear">清除</button>
+                </span>
+              </label>
+            </div>
+            <div class="pg-blank-actions">
+              <span class="hint-inline" id="pg-blank-hint">画幅 2048×896 · 无背景图时自动生成底</span>
+              <button type="button" class="mini-btn" id="pg-blank-cancel">收起</button>
+              <button type="button" class="mini-btn primary" id="pg-blank-add">加入节目单</button>
+            </div>
+          </div>
+          <div class="pg-songset-panel hidden" id="pg-songset-panel">
+            <div class="pg-blank-grid">
+              <label class="span2">歌名 <input type="text" id="pg-songset-title" placeholder="例如：太阳之子" maxlength="80" /></label>
+              <label class="span2">副标题 / 作者 <input type="text" id="pg-songset-sub" placeholder="可选" maxlength="120" /></label>
+              <label class="span2">歌词（空行分段，每段一页）
+                <textarea id="pg-songset-lyrics" rows="6" placeholder="第一段歌词…&#10;&#10;第二段歌词…"></textarea>
+              </label>
+              <label>强调色 <input type="color" id="pg-songset-accent" value="#e8c56a" /></label>
+              <label>背景预设
+                <select id="pg-songset-preset">
+                  <option value="auto" selected>强调色自动</option>
+                  <option value="church-dark">教会深色</option>
+                  <option value="clean-dark">简洁深底</option>
+                  <option value="blue-gold">蓝金氛围</option>
+                  <option value="soft-light">柔光浅底</option>
+                </select>
+              </label>
+              <label class="span2">背景图（整组共用）
+                <span class="pg-lobby-bgimg-row">
+                  <input type="text" id="pg-songset-bgimg" readonly placeholder="未选择" />
+                  <button type="button" class="mini-btn" id="pg-songset-bgimg-pick">选择图片</button>
+                  <button type="button" class="mini-btn" id="pg-songset-bgimg-clear">清除</button>
+                </span>
+              </label>
+            </div>
+            <div class="pg-blank-actions">
+              <span class="hint-inline">将生成：1 张歌名片 + 若干歌词页</span>
+              <button type="button" class="mini-btn" id="pg-songset-cancel">收起</button>
+              <button type="button" class="mini-btn primary" id="pg-songset-add">生成并加入</button>
+            </div>
+          </div>
+          <div class="pg-bible-panel hidden" id="pg-bible-panel">
+            <div class="pg-bible-grid">
+              <label class="span2">快速定位（回车）
+                <span class="pg-lobby-bgimg-row">
+                  <input type="text" id="pg-bible-quick" placeholder="约3:16 · 约翰福音 3:16-18 · 诗23:1" />
+                  <button type="button" class="mini-btn primary" id="pg-bible-quick-go">定位</button>
+                </span>
+              </label>
+              <label>书卷
+                <select id="pg-bible-book"></select>
+              </label>
+              <label>章
+                <select id="pg-bible-chapter"></select>
+              </label>
+              <label>从节 <input type="number" id="pg-bible-from" min="1" value="1" /></label>
+              <label>到节 <input type="number" id="pg-bible-to" min="1" value="1" /></label>
+              <label>强调色 <input type="color" id="pg-bible-accent" value="#e8c56a" /></label>
+              <label class="span2">关键字搜索
+                <span class="pg-lobby-bgimg-row">
+                  <input type="text" id="pg-bible-kw" placeholder="例如：爱世人 · 十字架 · 信" />
+                  <button type="button" class="mini-btn" id="pg-bible-kw-go">搜索</button>
+                </span>
+              </label>
+              <div class="span2 pg-bible-hits" id="pg-bible-hits">
+                <div class="empty-tip">输入关键字后搜索，点击结果可定位</div>
+              </div>
+              <div class="span2 pg-bible-preview" id="pg-bible-preview">请选择书卷与章节</div>
+            </div>
+            <div class="pg-blank-actions">
+              <span class="hint-inline">和合本 · 一页显示不下自动拆成多页 · 画幅 2048×896</span>
+              <button type="button" class="mini-btn" id="pg-bible-cancel">收起</button>
+              <button type="button" class="mini-btn" id="pg-bible-add">加入节目单</button>
+              <button type="button" class="mini-btn primary" id="pg-bible-add-play">加入并投屏</button>
+            </div>
+          </div>
+          <div class="pg-lobby-panel hidden" id="pg-lobby-panel">
+            <div class="pg-lobby-grid">
+              <label>开始日期 <input type="date" id="pg-lobby-date" /></label>
+              <label>开始时间 <input type="time" id="pg-lobby-time" step="60" /></label>
+              <label class="span2">主标题 <input type="text" id="pg-lobby-title" placeholder="例如：安息日敬拜" maxlength="80" /></label>
+              <label class="span2">副标题 <input type="text" id="pg-lobby-sub" placeholder="例如：敬请入座 · 即将开始" maxlength="120" /></label>
+              <label class="span2">底部说明 <input type="text" id="pg-lobby-note" placeholder="例如：请将手机关静音" maxlength="160" /></label>
+              <label>眉题 <input type="text" id="pg-lobby-kicker" placeholder="STAGE" maxlength="40" /></label>
+              <label>强调色 <input type="color" id="pg-lobby-accent" value="#e8c56a" /></label>
+              <label class="span2">背景色/渐变（无背景图时作备用） <input type="text" id="pg-lobby-bg" placeholder="#0c0c12 或 radial-gradient(...)" /></label>
+              <label class="span2">背景图
+                <span class="pg-lobby-bgimg-row">
+                  <input type="text" id="pg-lobby-bgimg" readonly placeholder="未选择图片" />
+                  <button type="button" class="mini-btn" id="pg-lobby-bgimg-pick">选择图片</button>
+                  <button type="button" class="mini-btn" id="pg-lobby-bgimg-clear">清除</button>
+                </span>
+              </label>
+              <label class="span2 pg-lobby-check">
+                <input type="checkbox" id="pg-lobby-autostart" checked />
+                到点后自动播放节目单第一条
+              </label>
+            </div>
+            <div class="pg-lobby-actions">
+              <span class="pg-lobby-remain" id="pg-lobby-remain">未设置开始时间</span>
+              <button class="mini-btn" id="pg-lobby-save">保存文案</button>
+              <button class="mini-btn primary" id="pg-lobby-push2">推送到扩展屏</button>
+            </div>
+          </div>
+          <div id="pg-items" class="pg-items">
+            <div class="empty-tip big">先「混排导入」按顺序加入本场节目</div>
+          </div>
+          <div class="pg-zoom-bar" id="pg-zoom-bar">
+            <span class="pg-zoom-label">预览大小</span>
+            <button type="button" class="mini-btn pg-zoom-preset" data-zoom="180">密</button>
+            <button type="button" class="mini-btn pg-zoom-preset" data-zoom="260">中</button>
+            <button type="button" class="mini-btn pg-zoom-preset" data-zoom="340">大</button>
+            <input type="range" id="pg-zoom" min="140" max="420" step="4" value="260" title="像右侧输出预览一样放大缩小卡片" />
+            <span class="pg-zoom-val mono" id="pg-zoom-val">260</span>
+          </div>
+          <div class="hint">拖滑条缩放缩略图（与右侧预览同比例）· 悬停卡片可操作 · 单击即可播放</div>
+        </div>
+
+        <!-- 声压测量 -->
+        <div class="panel" data-module="spl" id="panel-spl">
+          <div class="spl-layout">
+            <div class="spl-main-col">
+              <div class="spl-kicker">实时声压级 · A / C / Z 同时显示</div>
+              <div class="spl-tri">
+                <div class="spl-card" data-w="A">
+                  <div class="spl-card-tag mono" id="spl-tag-a">LAF</div>
+                  <div class="spl-card-val mono" id="spl-a">--.-</div>
+                  <div class="spl-card-unit">dB SPL</div>
+                </div>
+                <div class="spl-card" data-w="C">
+                  <div class="spl-card-tag mono" id="spl-tag-c">LCF</div>
+                  <div class="spl-card-val mono" id="spl-c">--.-</div>
+                  <div class="spl-card-unit">dB SPL</div>
+                </div>
+                <div class="spl-card" data-w="Z">
+                  <div class="spl-card-tag mono" id="spl-tag-z">LZF</div>
+                  <div class="spl-card-val mono" id="spl-z">--.-</div>
+                  <div class="spl-card-unit">dB SPL</div>
+                </div>
+              </div>
+              <canvas id="spl-bar" width="720" height="18" aria-hidden="true"></canvas>
+              <div class="spl-meta">
+                <span>峰值 <b class="mono" id="spl-peak">--.-</b></span>
+                <span>Z dBFS <b class="mono" id="spl-dbfs">--.-</b></span>
+                <span id="spl-overload" class="spl-overload hidden">过载</span>
+              </div>
+
+              <div class="spl-curve-head">
+                <span class="spl-section-title" style="margin:0">实时频谱（RTA）</span>
+                <div class="spl-row">
+                  <button type="button" class="mini-btn" id="spl-snap-save" title="保存当前曲线快照">保存快照</button>
+                  <button type="button" class="mini-btn" id="spl-snap-clear" title="清空全部快照">清空</button>
+                </div>
+              </div>
+              <div class="spl-curve-wrap">
+                <canvas id="spl-curve" width="1200" height="480"></canvas>
+              </div>
+              <p class="spl-hint">对数横轴 20 Hz–20 kHz · 纵轴 dB SPL（已加校准偏移）。可用粉噪/现场声看相对频响；完整扫频平响后续再加。</p>
+            </div>
+
+            <div class="spl-side-col">
+              <div class="spl-ctrl-col">
+                <div class="spl-section-title">输入</div>
+                <label class="spl-field">设备
+                  <select id="spl-device"></select>
+                </label>
+                <label class="spl-field">通道
+                  <select id="spl-channel"><option value="0">1</option></select>
+                </label>
+                <div class="spl-row">
+                  <button type="button" class="mini-btn" id="spl-refresh">刷新设备</button>
+                  <button type="button" class="btn primary" id="spl-toggle">开始测量</button>
+                </div>
+
+                <div class="spl-section-title">时间响应</div>
+                <label class="spl-field">Fast / Slow
+                  <select id="spl-response">
+                    <option value="Fast">Fast 125ms</option>
+                    <option value="Slow">Slow 1s</option>
+                  </select>
+                </label>
+
+                <div class="spl-section-title">校准（94 dB · 按 Z）</div>
+                <label class="spl-field">偏移 calOffset
+                  <input type="number" id="spl-offset" class="mono" step="0.1" value="114" />
+                </label>
+                <div class="spl-row">
+                  <button type="button" class="mini-btn" id="spl-cal-94">设为 94 dB</button>
+                  <span class="spl-cal-tip">校准后勿动增益</span>
+                </div>
+                <div class="spl-status mono" id="spl-status">未测量</div>
+              </div>
+
+              <div class="spl-snap-col">
+                <div class="spl-section-title">曲线快照</div>
+                <div id="spl-snap-list" class="spl-snap-list"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 输出预览 -->
+      <aside id="preview">
+        <div class="preview-head">输出预览（实时）</div>
+        <div id="preview-wrap"><div id="preview-stage"></div></div>
+        <div class="preview-tips">
+          <div>演出快捷键（主控操作）</div>
+          <div>Enter 下一条节目 · G 播放当前</div>
+          <div>F 全屏 · Esc 关闭输出 · B 黑屏</div>
+          <div>←/→ 音频切歌 · PPT/PDF 翻页</div>
+          <div>空格 音乐暂停/播放</div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- 背景音乐叠播时漂浮条：随时暂停/关闭，不打断当前画面 -->
+    <div id="audio-float" class="audio-float hidden" aria-live="polite">
+      <span class="audio-float-icon" aria-hidden="true">♪</span>
+      <div class="audio-float-meta">
+        <div class="audio-float-title" id="audio-float-title">音乐播放中</div>
+        <div class="audio-float-sub" id="audio-float-sub">00:00 / 00:00</div>
+      </div>
+      <button type="button" class="mini-btn" id="audio-float-toggle" title="暂停/继续">⏸</button>
+      <button type="button" class="mini-btn danger" id="audio-float-stop" title="停止背景音乐">关闭</button>
+    </div>
+
+    <!-- AI 伴奏：下载 / 分离进度面板 -->
+    <div id="stem-progress" class="stem-progress hidden" aria-live="polite">
+      <div class="stem-progress-hd">
+        <div class="stem-progress-hd-text">
+          <span class="stem-progress-kicker" id="stem-progress-phase">AI 伴奏</span>
+          <span class="stem-progress-title" id="stem-progress-title">准备中</span>
+        </div>
+        <button type="button" class="stem-progress-close" id="stem-progress-hide" title="收起（任务继续）">收起</button>
+      </div>
+      <div class="stem-progress-song mono" id="stem-progress-song">—</div>
+      <div class="stem-progress-track" aria-hidden="true">
+        <div class="stem-progress-fill" id="stem-progress-fill"></div>
+      </div>
+      <div class="stem-progress-meta">
+        <span class="stem-progress-pct mono" id="stem-progress-pct">0%</span>
+        <span class="stem-progress-detail" id="stem-progress-detail">等待开始…</span>
+      </div>
+    </div>
+    <button type="button" id="stem-progress-chip" class="stem-progress-chip hidden" title="展开 AI 进度">
+      AI <span class="mono" id="stem-progress-chip-pct">0%</span>
+    </button>
+  </div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

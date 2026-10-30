@@ -1,0 +1,53 @@
+# StagePlayer 演出播放器
+
+一个软件搞定 **音频播放、视频播放、PPT 播放、PDF 播放** 的演出/晚会专用播放器。
+
+技术栈：**Tauri 2 + Rust 后端**，前端为原生 HTML/CSS/JS（无需 Node 构建步骤，pdf.js 已本地内置，完全离线可用）。
+
+## 功能
+
+| 模块 | 说明 |
+|------|------|
+| 🎵 音频 | 播放列表、上一首/下一首、进度/音量、列表循环/单曲循环、可推送歌曲标题卡到输出窗口 |
+| 🎬 视频 | 本地静音预览 + 一键推送到输出窗口播放，输出端进度/音量跟随主控 |
+| 📊 PPT | Rust 后端解析 `.pptx`（文本+图片+背景+布局），幻灯片缩略图网格，点击即输出，←/→ 翻页 |
+| 📄 PDF | pdf.js 渲染缩略图，点击页面输出高清图到输出窗口，←/→ 翻页 |
+| 🖥 输出窗口 | 独立无边框窗口，可拖到投影/副屏，F 全屏、B 黑屏、双击切换全屏 |
+| ⏱ 计时器 | 正计时（秒表）+ 倒计时，LED 风格大屏显示 |
+
+## 运行
+
+```powershell
+npm install       # 安装 Tauri CLI 与 pdfjs-dist
+npm run dev       # 开发运行
+npm run build     # 打包 NSIS 安装包
+```
+
+## 快捷键（主控窗口）
+
+- `←` / `→`：PPT / PDF 上下页（需先点击过某一页）
+- `空格`：音频播放/暂停
+- `F`：打开并全屏输出窗口
+- `B`：黑屏 / 恢复
+
+## 支持格式
+
+- 音频：mp3 / wav / ogg / flac / m4a / aac / wma / opus
+- 视频：mp4 / webm / mov（mkv、avi 依赖系统解码器，Windows 上部分格式可能不支持）
+- 演示：pptx（*.ppt 老格式请先另存为 pptx*）
+- 文档：pdf
+
+## 架构
+
+```
+src/                  前端（主控窗口 + 输出窗口）
+  index.html          主控界面（顶栏计时器/输出控制、侧栏列表、四模块面板、输出预览）
+  output.html         独立输出窗口（全屏播放画面）
+  js/output-core.js   输出渲染核心（主控预览与输出窗口共用）
+  js/slide-render.js  PPT 幻灯片 HTML 渲染器
+  js/{audio,video,ppt,pdf}.js   四大功能模块
+src-tauri/
+  src/pptx.rs         PPTX 解析（zip + roxmltree，提取文本/图片/背景/坐标，图片转 dataURL）
+  src/output.rs       输出窗口创建/全屏/关闭
+  通信方式            Tauri 事件 output:set（内容推送）、output:video（视频控制）
+```

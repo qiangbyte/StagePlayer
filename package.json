@@ -1,0 +1,17 @@
+{
+  "name": "stage-player",
+  "version": "0.1.0",
+  "description": "演出播放器：音频 / 视频 / PPT / PDF 一体化演出播放",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38"
+  }
+}
