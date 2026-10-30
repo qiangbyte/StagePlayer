@@ -266,9 +266,14 @@ async function main() {
   // 10. 黑屏推送
   const blackOk = await cdp.eval(`
     (async () => {
+      const preview = document.getElementById('preview-stage');
+      // 黑屏是切换键：前面步骤可能已处于黑屏，先恢复到非黑屏再测
+      if (preview?.classList.contains('is-black')) {
+        document.getElementById('btn-black').click();
+        await new Promise(r => setTimeout(r, 100));
+      }
       document.getElementById('btn-black').click();
       await new Promise(r => setTimeout(r, 100));
-      const preview = document.getElementById('preview-stage');
       return preview && preview.classList.contains('is-black');
     })()
   `, true);

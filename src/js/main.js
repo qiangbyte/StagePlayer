@@ -364,23 +364,13 @@ function initKeyboard() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  // TEMP-DIAG
-  const DIAG_LOG = 'E:\\my\\音乐播放器和视频播放器，还有ppt 播放pdf 导入播放器\\diag-log.txt';
-  const diagLog = (msg) => {
-    try {
-      invoke('append_file', { path: DIAG_LOG, dataB64: btoa(unescape(encodeURIComponent(`${Date.now()} ${msg}\n`))), create: false });
-    } catch { /* ignore */ }
-  };
   window.addEventListener('error', (e) => {
-    diagLog(`onerror: ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`);
     toast('错误：' + (e.message || e.error), 6000);
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e.reason;
-    diagLog(`unhandledrejection: ${r?.message || r} | ${r?.stack || ''}`);
     toast('错误：' + (r?.message || r), 6000);
   });
-  diagLog('boot start');
 
   initTimers();
   setPreviewEl($('preview-stage'));
@@ -388,33 +378,14 @@ window.addEventListener('DOMContentLoaded', () => {
   initOutputControls();
   initSettings();
   initKeyboard();
-  diagLog('init: core done');
   // 节目单先初始化，确保默认活动存在，供音频列表绑定
   initProgram();
-  diagLog('init: program done');
   initAudio();
-  diagLog('init: audio done');
   initVideo();
-  diagLog('init: video done');
   initPpt();
-  diagLog('init: ppt done');
   initPdf();
-  diagLog('init: pdf done');
   initSpl();
-  diagLog('init: spl done');
   initKaraoke();
-  diagLog('init: karaoke done');
   // 默认进入节目单：按一场演出的时间顺序走台
   switchModule('program');
-  diagLog('boot complete');
-  // TEMP-DIAG 内存采样：每3秒记录 JS 堆和图片数量，共100次
-  let n = 0;
-  const tmr = setInterval(() => {
-    n++;
-    const mem = performance.memory || {};
-    const imgs = document.querySelectorAll('img').length;
-    const canvases = document.querySelectorAll('canvas').length;
-    diagLog(`mem#${n} heap=${Math.round((mem.usedJSHeapSize || 0) / 1048576)}MB imgs=${imgs} canvas=${canvases}`);
-    if (n >= 100) clearInterval(tmr);
-  }, 3000);
 });

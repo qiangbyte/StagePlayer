@@ -1,4 +1,4 @@
-// TEMP-DIAG probe4: worker heap + all targets memory info
+// 诊断探针（需 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223） probe4: worker heap + all targets memory info
 const base = 'http://127.0.0.1:9223';
 const r = await fetch(base + '/json/list');
 const targets = await r.json();

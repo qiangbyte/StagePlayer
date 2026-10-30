@@ -19,6 +19,8 @@ let currentPage = -1;
 let showSeq = 0;
 /** path#page → dataUrl，节目单连翻时避免每页重渲 */
 const pageCache = new Map();
+/** path → 正在加载的 Promise，避免并发重复解析同一本 PDF（旧实例会泄漏） */
+const loading = new Map();
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,6 +30,24 @@ function docItems() {
 
 function visibleDocs() {
   return filterByFolder('pdf', docItems());
+}
+
+/** 释放单页渲染资源（cleanup 返回布尔值，非 Promise） */
+function releasePage(page) {
+  try { page.cleanup(); } catch { /* ignore */ }
+}
+
+/** 销毁 pdf.js 文档并清掉该路径的页缓存 */
+function destroyDoc(d) {
+  if (!d) return;
+  if (d.pdfDoc) {
+    d.pdfDoc.destroy().catch(() => {});
+    d.pdfDoc = null;
+  }
+  const prefix = `${d.path}#`;
+  for (const k of [...pageCache.keys()]) {
+    if (k.startsWith(prefix)) pageCache.delete(k);
+  }
 }
 
 function pageCacheKey(path, pageIndex) {
@@ -146,24 +166,6 @@ function thumbTargetWidth() {
   return getViewSize('pdf', 180);
 }
 
-async function renderThumbs(d) {
-  d.thumbs = [];
-  d.ratios = [];
-  const tw = thumbTargetWidth();
-  for (let n = 1; n <= d.numPages; n++) {
-    const page = await d.pdfDoc.getPage(n);
-    const base = page.getViewport({ scale: 1 });
-    d.ratios.push(base.width / base.height);
-    const vp = page.getViewport({ scale: tw / base.width });
-    const canvas = document.createElement('canvas');
-    canvas.width = vp.width;
-    canvas.height = vp.height;
-    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-    try { page.cleanup()?.catch(() => {}); } catch { /* ignore */ }
-    d.thumbs.push(canvas.toDataURL('image/jpeg', 0.8));
-  }
-}
-
 async function selectDoc(i) {
   if (i < 0 || i >= docs.length) return;
   currentDoc = i;
@@ -205,7 +207,7 @@ async function renderThumbsLazy(d) {
       canvas.width = vp.width;
       canvas.height = vp.height;
       await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-      try { page.cleanup()?.catch(() => {}); } catch { /* ignore */ }
+      releasePage(page);
       d.thumbs[n - 1] = canvas.toDataURL('image/jpeg', 0.8);
       if (docs[currentDoc] === d && currentModule() === 'pdf') {
         const cell = $('pdf-grid')?.querySelector(`.thumb-cell[data-i="${n - 1}"] img`);
@@ -251,7 +253,7 @@ async function renderPageDataUrl(d, pageIndex) {
   canvas.width = vp.width;
   canvas.height = vp.height;
   await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-  try { page.cleanup()?.catch(() => {}); } catch { /* ignore */ }
+  releasePage(page);
   const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
   rememberPage(d.path, pageIndex, dataUrl);
   return dataUrl;
@@ -325,13 +327,23 @@ function registerStub(path, name) {
   return docs.length - 1;
 }
 
-async function openPdf(path) {
+function openPdf(path) {
   const existing = docs.findIndex((d) => d.path === path);
-  if (existing >= 0 && docs[existing].pdfDoc) return existing;
+  if (existing >= 0 && docs[existing].pdfDoc) return Promise.resolve(existing);
+  let p = loading.get(path);
+  if (!p) {
+    p = loadPdf(path).finally(() => loading.delete(path));
+    loading.set(path, p);
+  }
+  return p;
+}
+
+async function loadPdf(path) {
   const resp = await fetch(convertFileSrc(path));
   if (!resp.ok) throw new Error('无法读取文件');
   const data = new Uint8Array(await resp.arrayBuffer());
   const pdfDoc = await pdfjsLib.getDocument({ data }).promise;
+  const existing = docs.findIndex((d) => d.path === path);
   const keepName = existing >= 0 ? docs[existing].name : defaultDocName(path);
   const entry = {
     name: keepName || defaultDocName(path),
@@ -419,7 +431,9 @@ export function initPdf() {
 
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'pdf') return;
+    docs.forEach(destroyDoc);
     docs = [];
+    pageCache.clear();
     currentDoc = -1;
     currentPage = -1;
     persistPaths();
@@ -488,7 +502,7 @@ export async function mountPdfPreview(container, path, pageIndex = 0) {
   canvas.height = vp.height;
   await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
   // 仅释放该页的渲染资源；不 cleanup 整本文档（会导致下一条节目整本重解析：内存抖动 + 并发竞态）
-  try { page.cleanup()?.catch(() => {}); } catch { /* ignore */ }
+  releasePage(page);
   container.innerHTML = '';
   canvas.className = 'pg-thumb-canvas';
   canvas.style.width = '100%';

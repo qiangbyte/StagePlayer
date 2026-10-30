@@ -14,8 +14,19 @@ const LS_KEY = 'sp.ppt.paths';
 let docs = [];          // [{ name, path, doc|null }] doc 惰性解析
 let currentDoc = -1;
 let currentSlide = -1;
+/** path → 正在解析的 Promise，节目单并发取缩略图时只解析一次 */
+const parsing = new Map();
 
 const $ = (id) => document.getElementById(id);
+
+function parseOnce(path) {
+  let p = parsing.get(path);
+  if (!p) {
+    p = invoke('parse_pptx', { path }).finally(() => parsing.delete(path));
+    parsing.set(path, p);
+  }
+  return p;
+}
 
 function docItems() {
   return docs.map((d) => ({ path: d.path, name: d.name }));
@@ -140,9 +151,11 @@ async function ensureDocLoaded(i) {
   if (i < 0 || i >= docs.length) return -1;
   if (docs[i].doc) return i;
   const path = docs[i].path;
-  const doc = await invoke('parse_pptx', { path });
-  docs[i] = { name: docs[i].name || defaultDocName(path), path, doc };
-  return i;
+  const doc = await parseOnce(path);
+  const j = docs.findIndex((d) => d.path === path);
+  if (j < 0) return -1; // 解析期间列表被清空
+  docs[j] = { name: docs[j].name || defaultDocName(path), path, doc };
+  return j;
 }
 
 async function selectDoc(i) {
@@ -219,13 +232,15 @@ function currentModule() {
 async function loadDoc(path, force = false) {
   const existing = docs.findIndex((d) => d.path === path);
   if (existing >= 0 && !force && docs[existing].doc) return existing;
-  const doc = await invoke('parse_pptx', { path });
-  const keepName = existing >= 0 ? docs[existing].name : defaultDocName(path);
+  const doc = await parseOnce(path);
+  const existingNow = docs.findIndex((d) => d.path === path);
+  if (existingNow >= 0 && docs[existingNow].doc && !force) return existingNow;
+  const keepName = existingNow >= 0 ? docs[existingNow].name : defaultDocName(path);
   const entry = { name: keepName || defaultDocName(path), path, doc };
-  if (existing >= 0) {
-    docs[existing] = entry;
+  if (existingNow >= 0) {
+    docs[existingNow] = entry;
     persistPaths();
-    return existing;
+    return existingNow;
   }
   docs.push(entry);
   persistPaths();

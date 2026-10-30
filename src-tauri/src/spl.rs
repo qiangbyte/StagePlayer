@@ -528,7 +528,7 @@ fn process_interleaved(data: &[f32], channels: usize, channel: usize, shared: &S
 }
 
 #[tauri::command]
-pub fn spl_list_inputs() -> Result<Vec<SplInputDevice>, String> {
+pub async fn spl_list_inputs() -> Result<Vec<SplInputDevice>, String> {
     let host = cpal::default_host();
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
     let mut out = Vec::new();

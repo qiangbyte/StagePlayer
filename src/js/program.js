@@ -2006,13 +2006,6 @@ function itemPageBadge(it) {
 }
 
 function renderItems(opts = {}) {
-  // TEMP-DIAG
-  try {
-    window.__diagN = window.__diagN || { r: 0, f: 0 };
-    window.__diagN.r++;
-    const stack = (new Error().stack || '').split('\n').slice(2, 5).map((s) => s.trim()).join(' <- ');
-    invoke('append_file', { path: 'E:\\my\\音乐播放器和视频播放器，还有ppt 播放pdf 导入播放器\\diag-log.txt', dataB64: btoa(unescape(encodeURIComponent(`renderItems #${window.__diagN.r} t=${Date.now()} ${stack}\n`))), create: false });
-  } catch { /* ignore */ }
   const ev = curEvent();
   const box = $('pg-items');
   if (!box) return;
@@ -2192,12 +2185,6 @@ function captureVideoThumb(path) {
 
 async function fillItemThumbs() {
   const token = ++thumbToken;
-  // TEMP-DIAG
-  try {
-    window.__diagN = window.__diagN || { r: 0, f: 0 };
-    window.__diagN.f++;
-    await invoke('append_file', { path: 'E:\\my\\音乐播放器和视频播放器，还有ppt 播放pdf 导入播放器\\diag-log.txt', dataB64: btoa(unescape(encodeURIComponent(`fillItemThumbs #${window.__diagN.f} t=${Date.now()}\n`))), create: false });
-  } catch { /* ignore */ }
   const box = $('pg-items');
   if (!box || viewMode !== 'grid') return;
   const thumbs = [...box.querySelectorAll('.pg-thumb')];

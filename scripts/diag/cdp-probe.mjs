@@ -1,4 +1,4 @@
-// TEMP-DIAG CDP probe (delete after use)
+// 诊断探针（需 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223） CDP probe (delete after use)
 const base = 'http://127.0.0.1:9223';
 async function waitPort() {
   for (let i = 0; i < 60; i++) {

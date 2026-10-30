@@ -1,0 +1,36 @@
+import WebSocket from 'ws';
+const [pdf, pptx] = process.argv.slice(2);
+const list = await (await fetch('http://127.0.0.1:9223/json/list')).json();
+const page = list.find((t) => t.type === 'page' && !t.url.includes('output'));
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+let id = 0; const pending = new Map(); const logs = [];
+ws.on('message', (d) => {
+  const m = JSON.parse(d);
+  if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); p(m); return; }
+  if (m.method === 'Log.entryAdded') logs.push(`[log:${m.params.entry.level}] ${m.params.entry.text}`);
+  if (m.method === 'Runtime.exceptionThrown') logs.push(`[exception] ${m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text}`);
+  if (m.method === 'Runtime.consoleAPICalled' && ['error','warning'].includes(m.params.type)) logs.push(`[console.${m.params.type}] ${m.params.args.map(a=>a.value??a.description).join(' ')}`);
+});
+await new Promise((r) => ws.on('open', r));
+const send = (method, params = {}) => new Promise((r) => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+const ev = async (expression) => { const m = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }); return m.result?.exceptionDetails ? 'EXC: ' + (m.result.exceptionDetails.exception?.description || m.result.exceptionDetails.text) : m.result?.result?.value; };
+await send('Runtime.enable'); await send('Log.enable'); await send('Page.enable');
+await send('Page.reload', { ignoreCache: true });
+await new Promise((r) => setTimeout(r, 4000));
+console.log('boot ok:', await ev("!!document.querySelector('#app') && !!window.__TAURI__"));
+console.log('active tab:', await ev("document.querySelector('.tab.active')?.dataset.module"));
+const P = JSON.stringify(pdf);
+console.log('pdf concurrent load:', await ev(`(async()=>{const m=await import('/js/pdf.js');const r=await Promise.all([m.getPageCount(${P}),m.getPageCount(${P}),m.getPageCount(${P})]);return JSON.stringify(r);})()`));
+console.log('pdf preview mount:', await ev(`(async()=>{const m=await import('/js/pdf.js');const d=document.createElement('div');document.body.appendChild(d);const ok=await Promise.all([m.mountPdfPreview(d,${P},0),m.mountPdfPreview(document.createElement('div'),${P},1)]);const c=d.querySelector('canvas');d.remove();return JSON.stringify({ok,w:c?.width});})()`));
+console.log('pdf play page 2:', await ev(`(async()=>{const m=await import('/js/pdf.js');await m.playByPath(${P},{page:1,stay:true});return 'ok';})()`));
+const X = JSON.stringify(pptx);
+console.log('pptx parse (async cmd):', await ev(`(async()=>{const t=performance.now();const d=await window.__TAURI__.core.invoke('parse_pptx',{path:${X}});return d.slides.length+' slides, '+Math.round(performance.now()-t)+'ms';})()`));
+console.log('pptx concurrent pages:', await ev(`(async()=>{const m=await import('/js/ppt.js');return JSON.stringify(await Promise.all([m.getPageCount(${X}),m.getPageCount(${X})]));})()`));
+console.log('append_file removed:', await ev(`window.__TAURI__.core.invoke('append_file',{path:'C:/x.txt',dataB64:'',create:true}).then(()=>'STILL WORKS',e=>'rejected: '+e)`));
+console.log('copy_file guarded:', await ev(`window.__TAURI__.core.invoke('copy_file',{src:${P},dst:'C:/Users/Public/evil.pdf'}).then(()=>'COPIED!',e=>'rejected: '+e)`));
+console.log('audio devices (async):', await ev(`window.__TAURI__.core.invoke('list_audio_output_devices').then(d=>'count='+d.length,e=>'err '+e)`));
+console.log('audio_state:', await ev(`window.__TAURI__.core.invoke('audio_state').then(d=>JSON.stringify(d),e=>'err '+e)`));
+console.log('toasts:', await ev(`[...document.querySelectorAll('.toast')].map(t=>t.textContent).join(' | ')`));
+await new Promise((r) => setTimeout(r, 1000));
+console.log('--- console/CSP problems ---'); console.log(logs.filter(l=>!/DevTools/.test(l)).join('\n') || '(none)');
+process.exit(0);

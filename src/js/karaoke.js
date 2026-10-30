@@ -31,20 +31,10 @@ function clearProg(delayMs = 0) {
   if (el) setTimeout(() => el.remove(), delayMs);
 }
 
-// ---------- 保存路径（Rust 命令优先，dialog 插件兜底） ----------
-async function pickSavePath(defName) {
-  try {
-    return await invoke('pick_save_path', { defaultName: defName, extensions: ['wav'] });
-  } catch (err) {
-    const d = window.__TAURI__?.dialog;
-    if (d?.save) {
-      return await d.save({
-        defaultPath: defName,
-        filters: [{ name: 'WAV 音频', extensions: ['wav'] }],
-      });
-    }
-    throw err;
-  }
+// ---------- 保存路径 ----------
+// 必须走 Rust 命令：后端只允许写入经保存对话框确认过的路径
+function pickSavePath(defName) {
+  return invoke('pick_save_path', { defaultName: defName, extensions: ['wav'] });
 }
 
 // ---------- 主流程 ----------

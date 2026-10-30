@@ -69,7 +69,7 @@ opt-level = 3
 opt-level = 3
 
 [profile.release]
-panic = "abort"
+# 保持 unwind：音频线程 panic 时可被守护循环捕获重启，演出中不整体闪退
 codegen-units = 1
 lto = true
 opt-level = 3

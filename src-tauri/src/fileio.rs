@@ -1,11 +1,39 @@
 use base64::Engine as _;
-use std::io::Write;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+/// 用户通过保存对话框亲自选过的路径；写文件类命令只允许写这些路径
+#[derive(Default)]
+pub struct ApprovedSavePaths(Mutex<HashSet<PathBuf>>);
+
+impl ApprovedSavePaths {
+    fn approve(&self, p: PathBuf) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(p);
+    }
+
+    /// 校验目标路径来自保存对话框，防止前端被注入后写任意文件
+    pub fn check(&self, p: &str) -> Result<(), String> {
+        let ok = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&PathBuf::from(p));
+        if ok {
+            Ok(())
+        } else {
+            Err("保存路径未经用户确认".into())
+        }
+    }
+}
 
 /// 保存文件对话框（返回所选路径，取消返回 None）
 #[tauri::command]
 pub async fn pick_save_path(
-    app: tauri::AppHandle,
+    app: AppHandle,
+    approved: State<'_, ApprovedSavePaths>,
     default_name: String,
     extensions: Vec<String>,
 ) -> Result<Option<String>, String> {
@@ -24,13 +52,34 @@ pub async fn pick_save_path(
         let _ = tx.send(f);
     });
     let picked = rx.recv().map_err(|e| e.to_string())?;
-    Ok(picked.map(|f| f.to_string()))
+    let picked = picked.map(|f| f.to_string());
+    if let Some(p) = &picked {
+        approved.approve(PathBuf::from(p));
+    }
+    Ok(picked)
 }
 
 /// 复制文件（用于导出 AI 分离缓存的伴奏）
+/// 仅允许：源在伴奏缓存目录内，目标是用户在保存对话框里选的路径
 #[tauri::command]
-pub async fn copy_file(src: String, dst: String) -> Result<u64, String> {
-    let n = std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+pub async fn copy_file(
+    app: AppHandle,
+    approved: State<'_, ApprovedSavePaths>,
+    src: String,
+    dst: String,
+) -> Result<u64, String> {
+    approved.check(&dst)?;
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("stem-instrumental");
+    let cache = std::fs::canonicalize(&cache).map_err(|e| e.to_string())?;
+    let src_c = std::fs::canonicalize(&src).map_err(|e| e.to_string())?;
+    if !src_c.starts_with(&cache) {
+        return Err("只能导出伴奏缓存文件".into());
+    }
+    let n = std::fs::copy(&src_c, &dst).map_err(|e| e.to_string())?;
     Ok(n)
 }
 
@@ -59,22 +108,4 @@ pub async fn make_image_thumb(path: String) -> Result<Option<String>, String> {
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-/// 分块追加写入文件（base64 数据块；create=true 时新建文件）
-#[tauri::command]
-pub async fn append_file(path: String, data_b64: String, create: bool) -> Result<(), String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_b64)
-        .map_err(|e| e.to_string())?;
-    let mut f = if create {
-        std::fs::File::create(&path).map_err(|e| e.to_string())?
-    } else {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?
-    };
-    f.write_all(&bytes).map_err(|e| e.to_string())?;
-    Ok(())
 }

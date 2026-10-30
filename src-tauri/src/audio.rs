@@ -283,8 +283,29 @@ pub struct AudioHandle {
 impl AudioHandle {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = channel();
-        std::thread::spawn(move || run_loop(rx, app));
+        std::thread::spawn(move || {
+            // 音频线程守护：解码/设备异常导致 panic 时重启循环，而不是让整个演出程序退出
+            loop {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_loop(&rx, &app)));
+                match r {
+                    Ok(()) => break, // 通道关闭，正常退出
+                    Err(_) => {
+                        let _ = app.emit("sp-audio-ended", ());
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        });
         AudioHandle { tx: Mutex::new(tx) }
+    }
+
+    /// 发送命令；锁中毒时仍取出 Sender（Sender 本身无可破坏的状态）
+    fn send(&self, cmd: AudioCmd) -> Result<(), String> {
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(cmd)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -351,7 +372,7 @@ fn open_positioned(
 }
 
 /// 音频专用线程：持有 OutputStream（非 Send/Sync，必须驻留单线程）
-fn run_loop(rx: std::sync::mpsc::Receiver<AudioCmd>, app: AppHandle) {
+fn run_loop(rx: &std::sync::mpsc::Receiver<AudioCmd>, app: &AppHandle) {
     let mut stream: Option<OutputStream> = None;
     let mut handle: Option<OutputStreamHandle> = None;
     let mut bound_device: Option<Option<usize>> = None;
@@ -381,7 +402,7 @@ fn run_loop(rx: std::sync::mpsc::Receiver<AudioCmd>, app: AppHandle) {
             rx.recv_timeout(Duration::from_millis(200)).ok()
         };
 
-        let cmd = match timeout(&rx) {
+        let cmd = match timeout(rx) {
             Some(c) => c,
             None => continue,
         };
@@ -562,7 +583,7 @@ fn run_loop(rx: std::sync::mpsc::Receiver<AudioCmd>, app: AppHandle) {
 
 /// 枚举系统音频输出设备（声卡）
 #[tauri::command]
-pub fn list_audio_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+pub async fn list_audio_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
     let default_name = host.default_output_device().and_then(|d| d.name().ok());
     let mut devices = Vec::new();
@@ -580,7 +601,7 @@ pub fn list_audio_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 /// 播放音频（可指定声卡；start_at 为起始秒数；vocal_cancel 为消人声/仅伴奏）
 #[tauri::command]
-pub fn audio_play(
+pub async fn audio_play(
     path: String,
     device_index: Option<usize>,
     start_at: Option<f64>,
@@ -588,79 +609,55 @@ pub fn audio_play(
     h: State<'_, AudioHandle>,
 ) -> Result<(), String> {
     let (reply_tx, reply_rx) = channel();
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Play {
+    h.send(AudioCmd::Play {
             path,
             device_index,
             start_at,
             vocal_cancel: vocal_cancel.unwrap_or(false),
             reply: reply_tx,
-        })
-        .map_err(|e| e.to_string())?;
+        })?;
     reply_rx.recv().map_err(|e| e.to_string())?
 }
 
 /// 运行时无缝切换消人声（不重开文件）
 #[tauri::command]
 pub fn audio_set_vocal_cancel(on: bool, h: State<'_, AudioHandle>) -> Result<(), String> {
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::SetVocalCancel(on))
-        .map_err(|e| e.to_string())
+    h.send(AudioCmd::SetVocalCancel(on))
 }
 
 #[tauri::command]
 pub fn audio_pause(h: State<'_, AudioHandle>) -> Result<(), String> {
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Pause)
-        .map_err(|e| e.to_string())
+    h.send(AudioCmd::Pause)
 }
 
 #[tauri::command]
 pub fn audio_resume(h: State<'_, AudioHandle>) -> Result<(), String> {
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Resume)
-        .map_err(|e| e.to_string())
+    h.send(AudioCmd::Resume)
 }
 
 #[tauri::command]
 pub fn audio_stop(h: State<'_, AudioHandle>) -> Result<(), String> {
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Stop)
-        .map_err(|e| e.to_string())
+    h.send(AudioCmd::Stop)
 }
 
 #[tauri::command]
 pub fn audio_set_volume(h: State<'_, AudioHandle>, v: f32) -> Result<(), String> {
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Volume(v))
-        .map_err(|e| e.to_string())
+    h.send(AudioCmd::Volume(v))
 }
 
 #[tauri::command]
-pub fn audio_seek(h: State<'_, AudioHandle>, t: f64) -> Result<(), String> {
+pub async fn audio_seek(h: State<'_, AudioHandle>, t: f64) -> Result<(), String> {
     let (reply_tx, reply_rx) = channel();
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::Seek {
+    h.send(AudioCmd::Seek {
             t,
             reply: reply_tx,
-        })
-        .map_err(|e| e.to_string())?;
+        })?;
     reply_rx.recv().map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub fn audio_state(h: State<'_, AudioHandle>) -> Result<AudioState, String> {
     let (reply_tx, reply_rx) = channel();
-    h.tx.lock()
-        .unwrap()
-        .send(AudioCmd::State { reply: reply_tx })
-        .map_err(|e| e.to_string())?;
+    h.send(AudioCmd::State { reply: reply_tx })?;
     reply_rx.recv().map_err(|e| e.to_string())
 }

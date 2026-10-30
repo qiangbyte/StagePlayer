@@ -13,7 +13,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(pptx::Cache::default())
+        .manage(fileio::ApprovedSavePaths::default())
         .manage(stem::StemLock(std::sync::atomic::AtomicBool::new(false)))
         .setup(|app| {
             app.manage(audio::AudioHandle::new(app.handle().clone()));
@@ -29,7 +29,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dialog::pick_files,
             fileio::pick_save_path,
-            fileio::append_file,
             fileio::copy_file,
             fileio::make_image_thumb,
             karaoke::vocal_cancel_export,

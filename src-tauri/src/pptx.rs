@@ -19,8 +19,6 @@ fn attr_r<'a>(n: Node<'a, '_>, local: &str) -> Option<&'a str> {
 }
 
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::State;
 use zip::ZipArchive;
 
 /// 文本框（坐标为相对幻灯片宽高的百分比 0-100）
@@ -66,12 +64,6 @@ pub struct PptxDoc {
     pub slide_width: f64,  // emu
     pub slide_height: f64, // emu
     pub slides: Vec<Slide>,
-}
-
-/// 缓存已解析的 PPT（按绝对路径）
-#[derive(Default)]
-pub struct Cache {
-    docs: Mutex<HashMap<String, PptxDoc>>,
 }
 
 fn ext_mime(ext: &str) -> &'static str {
@@ -507,14 +499,16 @@ fn background_from_xml(
     read_background(doc.root_element(), cx, cy, rels, media, theme)
 }
 
+/// 解析 pptx；放到阻塞线程池执行，避免大文件卡住主线程（窗口/输出无响应）
+/// 前端按路径缓存结果，后端不再常驻一份含 base64 图片的副本
 #[tauri::command]
-pub fn parse_pptx(path: String, cache: State<'_, Cache>) -> Result<PptxDoc, String> {
-    let canon = fs::canonicalize(&path).map_err(|e| e.to_string())?;
-    let key = canon.to_string_lossy().to_string();
+pub async fn parse_pptx(path: String) -> Result<PptxDoc, String> {
+    tauri::async_runtime::spawn_blocking(move || parse_pptx_blocking(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
 
-    // 不命中旧缓存：背景色/绿幕等解析会随版本更新，避免继续返回黑色底
-    cache.docs.lock().unwrap().remove(&key);
-
+fn parse_pptx_blocking(path: String) -> Result<PptxDoc, String> {
     let file = fs::File::open(&path).map_err(|e| e.to_string())?;
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
 
@@ -684,6 +678,5 @@ pub fn parse_pptx(path: String, cache: State<'_, Cache>) -> Result<PptxDoc, Stri
         slide_height: cy as f64,
         slides,
     };
-    cache.docs.lock().unwrap().insert(key, doc.clone());
     Ok(doc)
 }

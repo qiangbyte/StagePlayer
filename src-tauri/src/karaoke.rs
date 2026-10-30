@@ -4,15 +4,19 @@
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rodio::Source;
 use std::io::BufReader;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
+
+use crate::fileio::ApprovedSavePaths;
 
 #[tauri::command]
 pub async fn vocal_cancel_export(
     app: AppHandle,
+    approved: State<'_, ApprovedSavePaths>,
     path: String,
     save_path: String,
     duration: f64,
 ) -> Result<(), String> {
+    approved.check(&save_path)?;
     tauri::async_runtime::spawn_blocking(move || run_export(&app, &path, &save_path, duration))
         .await
         .map_err(|e| e.to_string())?

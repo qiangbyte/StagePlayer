@@ -4,7 +4,6 @@ description = "允许演出播放器全部自定义命令"
 commands.allow = [
   "pick_files",
   "pick_save_path",
-  "append_file",
   "copy_file",
   "make_image_thumb",
   "vocal_cancel_export",
