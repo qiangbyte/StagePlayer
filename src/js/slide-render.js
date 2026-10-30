@@ -1,6 +1,11 @@
 // PPT 幻灯片渲染器：把后端解析的 slide 数据渲染为 HTML
 // 坐标均为相对幻灯片宽高的百分比；字号 size 为占幻灯片高度的百分比（用 cqh 容器单位）
 
+import { convertFileSrc } from './util.js';
+
+/** 后端给的是缓存文件路径（转 asset URL）；落盘失败时仍是 data url */
+const imgSrc = (s) => (!s || s.startsWith('data:') ? s : convertFileSrc(s));
+
 const ALIGN_MAP = { l: 'left', ctr: 'center', r: 'right', just: 'justify', dist: 'justify' };
 
 /**
@@ -15,7 +20,7 @@ export function renderSlide(el, slide) {
   if (slide.background) {
     const bg = document.createElement('img');
     bg.className = 'slide-bg';
-    bg.src = slide.background;
+    bg.src = imgSrc(slide.background);
     bg.draggable = false;
     el.appendChild(bg);
   }
@@ -28,7 +33,7 @@ export function renderSlide(el, slide) {
     box.style.width = pic.w + '%';
     box.style.height = pic.h + '%';
     const img = document.createElement('img');
-    img.src = pic.src;
+    img.src = imgSrc(pic.src);
     img.draggable = false;
     box.appendChild(img);
     el.appendChild(box);

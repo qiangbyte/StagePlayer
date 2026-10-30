@@ -75,6 +75,26 @@ export function lsGet(key, fallback) {
   }
 }
 
+const lsMemo = new Map(); // key → { raw, val }
+
+/**
+ * 同 lsGet，但原始字符串未变时复用上次解析结果（定时器热路径用，避免反复 JSON.parse 整个节目单）
+ * 返回值是共享对象：调用方只读，需要修改请先拷贝
+ */
+export function lsGetCached(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const hit = lsMemo.get(key);
+    if (hit && hit.raw === raw) return hit.val;
+    const val = JSON.parse(raw);
+    lsMemo.set(key, { raw, val });
+    return val;
+  } catch {
+    return fallback;
+  }
+}
+
 /** @returns {boolean} 是否写入成功 */
 export function lsSet(key, val) {
   try {

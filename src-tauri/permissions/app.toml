@@ -23,6 +23,7 @@ commands.allow = [
   "audio_seek",
   "audio_state",
   "audio_set_vocal_cancel",
+  "audio_wave",
   "stem_get_instrumental",
   "stem_ensure_instrumental",
   "stem_job_status",

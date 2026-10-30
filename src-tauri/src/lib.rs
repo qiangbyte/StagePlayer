@@ -6,6 +6,7 @@ mod output;
 mod pptx;
 mod spl;
 mod stem;
+mod wave;
 
 use tauri::Manager;
 
@@ -48,6 +49,7 @@ pub fn run() {
             audio::audio_seek,
             audio::audio_state,
             audio::audio_set_vocal_cancel,
+            wave::audio_wave,
             stem::stem_get_instrumental,
             stem::stem_ensure_instrumental,
             stem::stem_job_status,

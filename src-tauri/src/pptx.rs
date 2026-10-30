@@ -18,7 +18,9 @@ fn attr_r<'a>(n: Node<'a, '_>, local: &str) -> Option<&'a str> {
     })
 }
 
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Manager};
 use zip::ZipArchive;
 
 /// 文本框（坐标为相对幻灯片宽高的百分比 0-100）
@@ -46,7 +48,7 @@ pub struct Picture {
     pub y: f64,
     pub w: f64,
     pub h: f64,
-    pub src: String, // data url
+    pub src: String, // 本地缓存文件路径（前端转 asset URL）；落盘失败时为 data url
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -87,6 +89,74 @@ fn read_zip_entry<R: Read + std::io::Seek>(
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     Some(buf)
+}
+
+/// 媒体缓存保留的文稿版本数（每个文稿+修改时间一份目录）
+const MEDIA_KEEP: usize = 30;
+
+/// 本文稿版本的媒体缓存目录：路径 + 修改时间 + 大小 决定，文稿改动后自动换新目录
+fn media_dir(cache_root: &Path, canon: &Path) -> Option<PathBuf> {
+    let meta = fs::metadata(canon).ok()?;
+    let mut h = Sha256::new();
+    h.update(canon.to_string_lossy().as_bytes());
+    if let Ok(t) = meta.modified() {
+        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+            h.update(d.as_secs().to_le_bytes());
+        }
+    }
+    h.update(meta.len().to_le_bytes());
+    let key = format!("{:x}", h.finalize());
+    let root = cache_root.join("pptx-media");
+    let dir = root.join(&key[..16]);
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir).ok()?;
+        prune_media(&root);
+    }
+    Some(dir)
+}
+
+/// 只保留最近 MEDIA_KEEP 个文稿的媒体目录
+fn prune_media(root: &Path) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (t, e.path())
+        })
+        .collect();
+    if dirs.len() <= MEDIA_KEEP {
+        return;
+    }
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in dirs.into_iter().skip(MEDIA_KEEP) {
+        let _ = fs::remove_dir_all(p);
+    }
+}
+
+/// 媒体落盘（同版本只写一次）并返回本地路径；
+/// 图片走 asset 协议：事件推送只带路径，浏览器可缓存解码结果，JS 堆不再常驻 base64
+fn media_src(dir: Option<&Path>, bytes: &[u8], name: &str) -> String {
+    if let Some(dir) = dir {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+            .collect();
+        let p = dir.join(&safe);
+        let ok = p.is_file() || {
+            // 先写临时文件再改名，避免中断留下半截图片被当成完整缓存
+            let tmp = dir.join(format!("{safe}.part"));
+            fs::write(&tmp, bytes).is_ok() && fs::rename(&tmp, &p).is_ok()
+        };
+        if ok {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    data_url(bytes, name)
 }
 
 fn data_url(bytes: &[u8], name: &str) -> String {
@@ -266,7 +336,7 @@ fn read_background(
     cx: i64,
     cy: i64,
     rels: &HashMap<String, String>,
-    media: &HashMap<String, Vec<u8>>,
+    media: &HashMap<String, String>,
     theme: &HashMap<String, String>,
 ) -> (Option<String>, Option<String>) {
     let mut background = None;
@@ -277,8 +347,8 @@ fn read_background(
             if let Some(rid) = attr_r(blip, "embed") {
                 if let Some(target) = rels.get(rid) {
                     let name = target.rsplit('/').next().unwrap_or("");
-                    if let Some(bytes) = media.get(name) {
-                        background = Some(data_url(bytes, name));
+                    if let Some(src) = media.get(name) {
+                        background = Some(src.clone());
                     }
                 }
             }
@@ -418,7 +488,7 @@ fn parse_picture(
     cx: i64,
     cy: i64,
     rels: &HashMap<String, String>,
-    media: &HashMap<String, Vec<u8>>,
+    media: &HashMap<String, String>,
 ) -> Option<Picture> {
     let sp_pr = pic.children().find(|n| n.tag_name().name() == "spPr")?;
     let xfrm = sp_pr.children().find(|n| n.tag_name().name() == "xfrm")?;
@@ -430,14 +500,8 @@ fn parse_picture(
     let rid = attr_r(blip, "embed")?;
     let target = rels.get(rid)?;
     let media_name = target.rsplit('/').next()?;
-    let bytes = media.get(media_name)?;
-    Some(Picture {
-        x,
-        y,
-        w,
-        h,
-        src: data_url(bytes, media_name),
-    })
+    let src = media.get(media_name)?.clone();
+    Some(Picture { x, y, w, h, src })
 }
 
 fn parse_slide_xml(
@@ -445,7 +509,7 @@ fn parse_slide_xml(
     cx: i64,
     cy: i64,
     rels: &HashMap<String, String>,
-    media: &HashMap<String, Vec<u8>>,
+    media: &HashMap<String, String>,
     theme: &HashMap<String, String>,
     fallback_bg: (Option<String>, Option<String>),
 ) -> Slide {
@@ -490,7 +554,7 @@ fn background_from_xml(
     cx: i64,
     cy: i64,
     rels: &HashMap<String, String>,
-    media: &HashMap<String, Vec<u8>>,
+    media: &HashMap<String, String>,
     theme: &HashMap<String, String>,
 ) -> (Option<String>, Option<String>) {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
@@ -502,13 +566,18 @@ fn background_from_xml(
 /// 解析 pptx；放到阻塞线程池执行，避免大文件卡住主线程（窗口/输出无响应）
 /// 前端按路径缓存结果，后端不再常驻一份含 base64 图片的副本
 #[tauri::command]
-pub async fn parse_pptx(path: String) -> Result<PptxDoc, String> {
-    tauri::async_runtime::spawn_blocking(move || parse_pptx_blocking(path))
+pub async fn parse_pptx(app: AppHandle, path: String) -> Result<PptxDoc, String> {
+    let cache_root = app.path().app_cache_dir().ok();
+    tauri::async_runtime::spawn_blocking(move || parse_pptx_blocking(path, cache_root))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn parse_pptx_blocking(path: String) -> Result<PptxDoc, String> {
+fn parse_pptx_blocking(path: String, cache_root: Option<PathBuf>) -> Result<PptxDoc, String> {
+    let dir = cache_root.and_then(|root| {
+        let canon = fs::canonicalize(&path).ok()?;
+        media_dir(&root, &canon)
+    });
     let file = fs::File::open(&path).map_err(|e| e.to_string())?;
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
 
@@ -577,14 +646,16 @@ fn parse_pptx_blocking(path: String) -> Result<PptxDoc, String> {
     }
 
     // 收集所有媒体
-    let mut media: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut media: HashMap<String, String> = HashMap::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
         if name.starts_with("ppt/media/") {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            media.insert(name.rsplit('/').next().unwrap_or(&name).to_string(), buf);
+            let short = name.rsplit('/').next().unwrap_or(&name).to_string();
+            let src = media_src(dir.as_deref(), &buf, &short);
+            media.insert(short, src);
         }
     }
 

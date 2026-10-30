@@ -1,6 +1,6 @@
 // 音频模块：波形 / 频谱 / LED 计时 + 活动目录绑定
 
-import { pickFiles, esc, fileName, lsGet, lsSet, invoke, listen, toast, AUDIO_EXT } from './util.js';
+import { pickFiles, esc, fileName, lsGet, lsGetCached, lsSet, invoke, listen, toast, AUDIO_EXT } from './util.js';
 import { pushToOutput, getCurrentOutput } from './output-main.js';
 import { loadLyricsFor, activeLyricIndex } from './lyrics.js';
 import {
@@ -53,6 +53,9 @@ const BANDS = 28;
 const FFT_N = 1024;
 let specData = new Float32Array(BANDS);
 let specPeak = new Float32Array(BANDS);
+// analyze() 每帧复用，避免 60fps 分配
+const fftSlice = new Float32Array(FFT_N);
+const bandRaw = new Float32Array(BANDS);
 let bandColors = [];
 let vuLevel = 0;
 let vuRmsDb = -120;
@@ -144,8 +147,8 @@ function fmtCs(sec) {
 }
 
 function currentEvent() {
-  const evs = lsGet('sp.program.events', []);
-  const cid = lsGet('sp.program.current', null);
+  const evs = lsGetCached('sp.program.events', []);
+  const cid = lsGetCached('sp.program.current', null);
   return evs.find((e) => e.id === cid) || evs[0] || null;
 }
 
@@ -935,6 +938,61 @@ function syncLyricsOutput() {
   pushToOutput({ ...cur, active }, pendingOutputSeq);
 }
 
+/** Rust 侧解码：返回 peaks + 低采样率单声道（二进制，见 src-tauri/src/wave.rs） */
+async function decodeWaveNative(path) {
+  const buf = await invoke('audio_wave', { path });
+  const dv = new DataView(buf);
+  const duration = dv.getFloat64(0, true);
+  const sampleRate = dv.getUint32(8, true);
+  const monoSr = dv.getUint32(12, true);
+  const nPeaks = dv.getUint32(16, true);
+  const nMono = dv.getUint32(20, true);
+  return {
+    duration,
+    sampleRate,
+    monoSr,
+    // 拷贝出来：peaks 进长期缓存，不能拖着整块 mono 缓冲区
+    peaks: new Float32Array(buf, 24, nPeaks).slice(),
+    mono: new Float32Array(buf, 24 + nPeaks * 4, nMono),
+  };
+}
+
+/** 回退：WebAudio 整首解码（内存占用大，仅原生不支持的格式使用） */
+async function decodeWaveWeb(path, token) {
+  const resp = await fetch(convertSrc(path));
+  if (token !== waveBuildToken) return null;
+  const buf = await resp.arrayBuffer();
+  if (token !== waveBuildToken) return null;
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => {});
+  const audio = await audioCtx.decodeAudioData(buf);
+  if (token !== waveBuildToken) return null;
+  const ch0 = audio.getChannelData(0);
+  const ch1 = audio.numberOfChannels > 1 ? audio.getChannelData(1) : null;
+
+  const n = 900;
+  const block = Math.max(1, Math.floor(ch0.length / n));
+  const peaks = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = 0;
+    const s = i * block;
+    for (let j = 0; j < block; j += 24) {
+      const v = Math.abs((ch0[s + j] + (ch1 ? ch1[s + j] : 0)) / (ch1 ? 2 : 1) || 0);
+      if (v > m) m = v;
+    }
+    peaks[i] = Math.min(1, m * 1.4);
+  }
+  const sr = audio.sampleRate;
+  const dec = Math.max(1, Math.floor(sr / 11025));
+  const outLen = Math.floor(ch0.length / dec);
+  const mono = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const s = i * dec;
+    mono[i] = ch1 ? (ch0[s] + ch1[s]) / 2 : ch0[s];
+  }
+  return { duration: audio.duration, sampleRate: sr, monoSr: Math.floor(sr / dec), peaks, mono };
+}
+
 async function buildWave(path, token = waveBuildToken) {
   if (waveCache.has(path)) {
     if (currentPath === path) applyWaveCache(path);
@@ -945,45 +1003,16 @@ async function buildWave(path, token = waveBuildToken) {
     if (!peaks) updateTech();
   }
   try {
-    const resp = await fetch(convertSrc(path));
-    if (token !== waveBuildToken) return;
-    const buf = await resp.arrayBuffer();
-    if (token !== waveBuildToken) return;
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => {});
-    const audio = await audioCtx.decodeAudioData(buf);
-    if (token !== waveBuildToken) return;
-    const ch0 = audio.getChannelData(0);
-    const ch1 = audio.numberOfChannels > 1 ? audio.getChannelData(1) : null;
-
-    const n = 900;
-    const block = Math.max(1, Math.floor(ch0.length / n));
-    const arr = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      let m = 0;
-      const s = i * block;
-      for (let j = 0; j < block; j += 24) {
-        const v = Math.abs((ch0[s + j] + (ch1 ? ch1[s + j] : 0)) / (ch1 ? 2 : 1) || 0);
-        if (v > m) m = v;
-      }
-      arr[i] = Math.min(1, m * 1.4);
-    }
-    const dur = audio.duration;
-    const sr = audio.sampleRate;
-
+    // 优先 Rust 原生解码（不占 WebView 内存）；不支持的格式回退到 WebAudio
+    const w = await decodeWaveNative(path).catch(() => null) || await decodeWaveWeb(path, token);
+    if (!w || token !== waveBuildToken) return;
+    const arr = w.peaks;
+    const dur = w.duration;
+    const sr = w.sampleRate;
     // 频谱 mono 只留给「当前曲」，不进长期缓存（防 WebView OOM）
-    const dec = Math.max(1, Math.floor(sr / 11025));
-    const outLen = Math.floor(ch0.length / dec);
-    let md = null;
-    let mdSr = 0;
-    if (token === waveBuildToken && currentPath === path) {
-      md = new Float32Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const s = i * dec;
-        md[i] = ch1 ? (ch0[s] + ch1[s]) / 2 : ch0[s];
-      }
-      mdSr = Math.floor(sr / dec);
-    }
+    const isCur = token === waveBuildToken && currentPath === path;
+    const md = isCur ? w.mono : null;
+    const mdSr = isCur ? w.monoSr : 0;
     // 缓存只存 peaks + 时长（约 4KB/首），不存整轨 PCM
     const pack = {
       peaks: arr,
@@ -1052,7 +1081,7 @@ function analyze() {
     return;
   }
   const start = Math.floor(pos * monoSr);
-  const slice = new Float32Array(FFT_N);
+  const slice = fftSlice;
   for (let i = 0; i < FFT_N; i++) slice[i] = mono[start + i] || 0;
   let sum = 0;
   let peak = 0;
@@ -1081,7 +1110,7 @@ function analyze() {
   const level = Math.max(0, (seg + 1) / M32_METER_DB.length);
   vuLevel = playing ? Math.max(level, vuLevel * 0.82) : vuLevel * 0.88;
 
-  const raw = new Float32Array(BANDS);
+  const raw = bandRaw;
   for (let b = 0; b < BANDS; b++) {
     const f = 50 * Math.pow(16000 / 50, b / (BANDS - 1));
     const mag = goertzel(slice, monoSr, f);
@@ -1112,8 +1141,10 @@ function drawSpectrum() {
   g.fillRect(0, 0, W, H);
   g.strokeStyle = '#101318';
   g.lineWidth = 1;
-  for (let x = 0; x < W; x += 32) { g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, H); g.stroke(); }
-  for (let y = 0; y < H; y += 32) { g.beginPath(); g.moveTo(0, y + .5); g.lineTo(W, y + .5); g.stroke(); }
+  g.beginPath();
+  for (let x = 0; x < W; x += 32) { g.moveTo(x + .5, 0); g.lineTo(x + .5, H); }
+  for (let y = 0; y < H; y += 32) { g.moveTo(0, y + .5); g.lineTo(W, y + .5); }
+  g.stroke();
 
   initBandColors();
   const gap = 3;
@@ -1500,9 +1531,12 @@ export function initAudio() {
 
   document.addEventListener('sp:program-changed', renderList);
 
+  let searchTimer = 0;
   $('audio-search')?.addEventListener('input', (e) => {
     audioSearch = e.target.value || '';
-    renderList();
+    // 连续输入只在停顿后重绘一次（曲库大时整表重建较重）
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderList, 120);
   });
   $('audio-dir-add')?.addEventListener('click', () => {
     const name = window.prompt('新建目录名称', '敬拜诗歌');
@@ -1582,14 +1616,26 @@ export function initAudio() {
     }
   });
 
+  // 暂停后画面约 1 秒即收敛为静止：之后状态不变就不再每帧重算重绘
+  let idleKey = '';
+  let idleFrames = 0;
   function animLoop() {
     const panel = document.getElementById('panel-audio');
     if (panel && panel.classList.contains('active')) {
       const mon = $('audio-monitor');
       if (!mon?.classList.contains('is-collapsed')) {
-        analyze();
-        drawSpectrum();
-        drawVU();
+        const box = $('audio-spec')?.parentElement;
+        const key = playing ? '' : `${pos}|${engineVol}|${!!mono}|${box?.clientWidth}x${box?.clientHeight}`;
+        if (playing || key !== idleKey) {
+          idleKey = key;
+          idleFrames = 0;
+        }
+        if (idleFrames < 90) {
+          idleFrames++;
+          analyze();
+          drawSpectrum();
+          drawVU();
+        }
       }
     }
     requestAnimationFrame(animLoop);
@@ -1597,8 +1643,11 @@ export function initAudio() {
   requestAnimationFrame(animLoop);
 
   let lastReportedPlaying = null;
+  let pollTick = 0;
   setInterval(async () => {
-    if (currentPath) {
+    pollTick++;
+    // 暂停时进度不走：每 500ms 同步一次即可，减少 IPC
+    if (currentPath && (playing || pollTick % 5 === 0)) {
       try {
         const st = await invoke('audio_state');
         if (st.exists && isEnginePath(st.path)) {

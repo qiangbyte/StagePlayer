@@ -1,6 +1,6 @@
 // 媒体库目录：音频/视频/PPT/PDF 共用「左目录 · 中列表」
 
-import { lsGet, lsSet, esc, fileName } from './util.js';
+import { lsGet, lsGetCached, lsSet, esc, fileName } from './util.js';
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
@@ -14,7 +14,7 @@ export { ALL as FOLDER_ALL, UNCAT as FOLDER_UNCAT };
 /** 显示名（不改磁盘）；优先自定义标签 */
 export function getDisplayName(path, fallback = '') {
   if (!path) return fallback || '';
-  const labels = lsGet(LABELS_KEY, {}) || {};
+  const labels = lsGetCached(LABELS_KEY, {}) || {};
   const n = labels[path];
   if (n != null && String(n).trim()) return String(n).trim();
   if (fallback) return fallback;

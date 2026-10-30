@@ -67,6 +67,17 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.symphonia-format-isomp4]
 opt-level = 3
+# 波形原生解码（wave.rs）开发态也要快
+[profile.dev.package.rodio]
+opt-level = 3
+[profile.dev.package.symphonia-bundle-flac]
+opt-level = 3
+[profile.dev.package.symphonia-codec-pcm]
+opt-level = 3
+[profile.dev.package.symphonia-codec-aac]
+opt-level = 3
+[profile.dev.package.symphonia-format-riff]
+opt-level = 3
 
 [profile.release]
 # 保持 unwind：音频线程 panic 时可被守护循环捕获重启，演出中不整体闪退
