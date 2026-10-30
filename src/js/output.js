@@ -81,7 +81,13 @@ window.addEventListener('DOMContentLoaded', async () => {
       // Esc：全屏时先退出全屏；非全屏则关闭窗口
       exitFsOrClose();
     }
-    if (e.key === 'f' || e.key === 'F') toggleFs();
+    if (e.key === 'f' || e.key === 'F') { toggleFs(); return; }
+    if (e.key === 'Escape' || e.ctrlKey || e.altKey || e.metaKey) return;
+    // 其余按键（上下换行、翻页、黑屏、段落跳转…）交给主控处理
+    if (e.key.length === 1 || /^(Arrow|Page|Home|End|Enter)/.test(e.key)) {
+      e.preventDefault();
+      emit('output:key', { key: e.key, shiftKey: e.shiftKey }).catch(() => {});
+    }
   });
 
   try {

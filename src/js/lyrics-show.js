@@ -496,6 +496,11 @@ export function initLyricsShow() {
   $('lshow-show-label')?.addEventListener('change', (e) => setStyle({ showLabel: e.target.checked }));
   $('lshow-show-title')?.addEventListener('change', (e) => setStyle({ showTitle: e.target.checked }));
 
+  // 改完设置立即交还焦点，键盘上下继续控制歌词
+  $('lshow-editor')?.addEventListener('change', (e) => {
+    if (e.target.matches('select, input[type=range], input[type=checkbox], input[type=color]')) e.target.blur();
+  });
+
   // 输出被别的内容替换后刷新「投屏中」状态
   document.addEventListener('sp:module-change', (e) => { if (e.detail === 'lyrics') { paintLines(true); renderMini(); } });
 

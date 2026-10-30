@@ -294,10 +294,33 @@ function navigatePages(delta) {
   return false;
 }
 
+/** 正在输入文字（文本框 / 多行编辑）；滑块、勾选框、下拉框不算 */
+function isTyping(el) {
+  if (!el) return false;
+  if (el.tagName === 'TEXTAREA' || el.isContentEditable) return true;
+  if (el.tagName !== 'INPUT') return false;
+  return ['text', 'search', 'number', 'email', 'url', 'password', 'tel', ''].includes(el.type || '');
+}
+
 function initKeyboard() {
+  // 输出窗口获得焦点时，按键转发到这里（全屏在同一块屏上时常见）
+  listen('output:key', (ev) => {
+    const k = ev.payload || {};
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: k.key, shiftKey: !!k.shiftKey, bubbles: true, cancelable: true }));
+  }).catch(() => {});
+
   document.addEventListener('keydown', (e) => {
-    const tag = document.activeElement?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+    const active = document.activeElement;
+    const tag = active?.tagName;
+    // 歌词模块：点过滑块 / 下拉框 / 按钮后焦点留在控件上，上下键仍要能换行
+    if (module === 'lyrics' && !isTyping(active) && active && active !== document.body
+      && ['INPUT', 'SELECT', 'BUTTON'].includes(tag)) {
+      active.blur();
+    }
+    const now = document.activeElement;
+    if (isTyping(now) || now?.tagName === 'SELECT') return;
+    // 其它模块保持原样：焦点在任何输入控件（如音量滑块）上时不处理快捷键
+    if (module !== 'lyrics' && now?.tagName === 'INPUT') return;
 
     // 歌词投屏：换行 / 段落跳转（B、F、Esc 等全局键不拦）
     if (module === 'lyrics' && lyricsHandleKey(e)) {
