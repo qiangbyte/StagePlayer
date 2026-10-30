@@ -1,10 +1,10 @@
 // 节目单 = 一场演出的时间轴（按顺序混排：音频/视频/图片/PPT页/PDF页，逐条播放）
 
 import {
-  pickFiles, esc, fileName, fileExt, lsGet, lsSet, toast, convertFileSrc, fmtTimeLong, listen,
-  lsApproxBytes, AUDIO_EXT, VIDEO_EXT, IMAGE_EXT, PPT_EXT, PDF_EXT, detectMediaType,
+  pickFiles, esc, fileName, fileExt, lsGet, lsSet, toast, convertFileSrc, listen, lsApproxBytes,
+  AUDIO_EXT, VIDEO_EXT, IMAGE_EXT, PPT_EXT, PDF_EXT, detectMediaType,
 } from './util.js';
-import { pushToOutput, getCurrentOutput, claimOutputSeq, isOutputFrozen } from './output-main.js';
+import { pushToOutput, claimOutputSeq, isOutputFrozen } from './output-main.js';
 import {
   playByPath as audioPlay,
   getAudioSnapshot,
@@ -25,6 +25,13 @@ import {
 import { bindBlankHost, hideBlankPanels, initBlankPanels } from './program-blank.js';
 import { bindBibleHost, initBiblePanel } from './program-bible.js';
 import { bindThumbsHost, cancelThumbs, fillItemThumbs } from './program-thumbs.js';
+import {
+  bindCueHost, editItemCue, syncCueCountdowns, tickCueAutoPlay,
+} from './program-cue.js';
+import {
+  bindLobbyHost, tickLobbyAutoStart, defaultLobby, ensureLobby, fillLobbyForm, readLobbyForm,
+  syncLobbyRemain, pushLobbyPage,
+} from './program-lobby.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
@@ -36,9 +43,6 @@ let currentId = lsGet(LS_CURRENT, null);
 let activeItemId = null;
 let activateSeq = 0; // 快速切条时只采纳最后一次
 let seekingAudio = false;
-let lobbyAutoArmed = false;
-let lobbyAutoKey = null;
-let cueFiring = false;
 const _savedView = lsGet(LS_VIEW, 'grid');
 let viewMode = _savedView === 'list' ? 'list' : 'grid';
 function initialCardZoom() {
@@ -49,45 +53,6 @@ function initialCardZoom() {
 let cardZoom = initialCardZoom();
 
 const $ = (id) => document.getElementById(id);
-
-function armLobbyAutoStart(ev, L) {
-  const startAt = lobbyStartAtMs(L);
-  if (!L?.autoStart || !startAt || !ev) {
-    lobbyAutoArmed = false;
-    lobbyAutoKey = null;
-    return;
-  }
-  lobbyAutoKey = `${ev.id}:${startAt}`;
-  lobbyAutoArmed = true;
-}
-
-function tickLobbyAutoStart() {
-  if (!lobbyAutoArmed || !lobbyAutoKey) return;
-  const ev = curEvent();
-  if (!ev) return;
-  const L = ensureLobby(ev);
-  if (!L.autoStart) {
-    lobbyAutoArmed = false;
-    return;
-  }
-  const startAt = lobbyStartAtMs(L);
-  if (`${ev.id}:${startAt}` !== lobbyAutoKey) return;
-  if (Date.now() < startAt) return;
-  // 仅在扩展屏仍显示开场页时自动开播（避免误触）
-  if (getCurrentOutput()?.kind !== 'lobby') {
-    lobbyAutoArmed = false;
-    return;
-  }
-  // 冻结时保留 armed，解冻后下一 tick 再开播（与定时 cue 一致）
-  if (isOutputFrozen()) return;
-  lobbyAutoArmed = false;
-  if (!ev.items?.length) {
-    toast('到点了，但节目单还是空的');
-    return;
-  }
-  toast('到点 · 自动播放第一条');
-  activate(ev.items[0]);
-}
 
 const TYPE_META = {
   audio: { icon: '♪', label: '音乐', color: '#3dd55f' },
@@ -100,40 +65,6 @@ const TYPE_META = {
 };
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-
-function pad2(n) {
-  return String(n).padStart(2, '0');
-}
-
-function todayStr() {
-  const d = new Date();
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
-function tomorrowStr() {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
-/** 节目开播时间点 → 毫秒时间戳 */
-function cueStartAtMs(item) {
-  if (!item?.cueTime) return 0;
-  const date = item.cueDate || todayStr();
-  const [y, m, d] = date.split('-').map(Number);
-  const parts = String(item.cueTime).split(':').map(Number);
-  if (!y || !m || !d) return 0;
-  return new Date(y, m - 1, d, parts[0] || 0, parts[1] || 0, parts[2] || 0, 0).getTime();
-}
-
-function fmtCueClock(sec) {
-  if (!isFinite(sec) || sec < 0) sec = 0;
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
-  return `${m}:${pad2(s)}`;
-}
 
 function initAudioFloat() {
   $('audio-float-toggle')?.addEventListener('click', () => {
@@ -174,40 +105,6 @@ function syncAudioFloat() {
     btn.textContent = snap.playing ? '⏸' : '▶';
     btn.title = snap.playing ? '暂停' : '继续';
   }
-}
-
-function defaultLobby(name) {
-  return {
-    date: todayStr(),
-    time: '09:30',
-    title: name || '本场演出',
-    subtitle: '敬请入座 · 即将开始',
-    note: '',
-    kicker: 'STAGE',
-    bg: 'radial-gradient(ellipse at 50% 28%, #2a1f3d 0%, #0c0c12 62%)',
-    bgImage: '',
-    accent: '#e8c56a',
-    autoStart: true,
-    countingText: '距离开始还有',
-    startedText: '演出开始',
-  };
-}
-
-function ensureLobby(ev) {
-  if (!ev) return defaultLobby('');
-  if (!ev.lobby) ev.lobby = defaultLobby(ev.name);
-  else ev.lobby = { ...defaultLobby(ev.name), ...ev.lobby };
-  return ev.lobby;
-}
-
-function lobbyStartAtMs(lobby) {
-  if (!lobby?.date || !lobby?.time) return 0;
-  const [y, m, d] = lobby.date.split('-').map(Number);
-  const parts = lobby.time.split(':').map(Number);
-  const hh = parts[0] || 0;
-  const mm = parts[1] || 0;
-  if (!y || !m || !d) return 0;
-  return new Date(y, m - 1, d, hh, mm, 0, 0).getTime();
 }
 
 function curEvent() {
@@ -311,6 +208,8 @@ export function initProgram() {
   bindBlankHost({ curEvent, renderItems, save, updateNowBar });
   bindBibleHost({ activate, curEvent, renderItems, save, updateNowBar });
   bindThumbsHost({ TYPE_META, curEvent, syncCueCountdowns, syncItemRemain, viewMode: () => viewMode });
+  bindCueHost({ activate, curEvent, renderItems, save });
+  bindLobbyHost({ activate, curEvent, save });
   if (!events.length) {
     events.push({ id: genId(), name: '本场演出', items: [] });
     currentId = events[0].id;
@@ -624,121 +523,6 @@ export function initProgram() {
   syncLobbyRemain();
 }
 
-function fillLobbyForm() {
-  const ev = curEvent();
-  if (!ev) return;
-  const L = ensureLobby(ev);
-  const set = (id, v) => { const el = $(id); if (el) el.value = v ?? ''; };
-  set('pg-lobby-date', L.date || todayStr());
-  set('pg-lobby-time', L.time || '09:30');
-  set('pg-lobby-title', L.title || '');
-  set('pg-lobby-sub', L.subtitle || '');
-  set('pg-lobby-note', L.note || '');
-  set('pg-lobby-kicker', L.kicker || '');
-  set('pg-lobby-accent', L.accent || '#e8c56a');
-  set('pg-lobby-bg', L.bg || '');
-  set('pg-lobby-bgimg', L.bgImage ? fileName(L.bgImage) : '');
-  const auto = $('pg-lobby-autostart');
-  if (auto) auto.checked = L.autoStart !== false;
-  syncLobbyRemain();
-}
-
-function readLobbyForm(doSave = false, refreshOutput = true) {
-  const ev = curEvent();
-  if (!ev) return null;
-  const L = ensureLobby(ev);
-  const val = (id) => $(id)?.value?.trim() ?? '';
-  L.date = val('pg-lobby-date') || todayStr();
-  L.time = val('pg-lobby-time') || '09:30';
-  L.title = val('pg-lobby-title') || ev.name || '本场演出';
-  L.subtitle = val('pg-lobby-sub');
-  L.note = val('pg-lobby-note');
-  L.kicker = val('pg-lobby-kicker');
-  L.accent = val('pg-lobby-accent') || '#e8c56a';
-  L.bg = val('pg-lobby-bg') || defaultLobby(ev.name).bg;
-  // bgImage 由选图按钮写入，此处保留
-  L.autoStart = !!$('pg-lobby-autostart')?.checked;
-  ev.lobby = L;
-  if (doSave) save();
-  syncLobbyRemain();
-  // 若扩展屏正显示开场页，同步刷新文案，并按最新时间重武装自动开播
-  if (refreshOutput && getCurrentOutput()?.kind === 'lobby') {
-    pushToOutput(lobbyPayload(L, ev.name));
-    armLobbyAutoStart(ev, L);
-  }
-  return L;
-}
-
-function syncLobbyRemain() {
-  const el = $('pg-lobby-remain');
-  if (!el) return;
-  const ev = curEvent();
-  if (!ev) {
-    el.textContent = '未选择演出';
-    return;
-  }
-  const L = ensureLobby(ev);
-  // 表单打开时优先用表单里的时间预览
-  const date = $('pg-lobby-date')?.value || L.date;
-  const time = $('pg-lobby-time')?.value || L.time;
-  const startAt = lobbyStartAtMs({ date, time });
-  if (!startAt) {
-    el.textContent = '请设置开始日期与时间';
-    return;
-  }
-  const remain = Math.floor((startAt - Date.now()) / 1000);
-  if (remain <= 0) {
-    el.textContent = `开始时间 ${date} ${time} · 已到点`;
-    el.classList.add('is-due');
-  } else {
-    el.textContent = `开始时间 ${date} ${time} · 倒计时 ${fmtTimeLong(remain)}`;
-    el.classList.remove('is-due');
-  }
-}
-
-function lobbyPayload(L, evName) {
-  const startAt = lobbyStartAtMs(L);
-  const startLabel = L.date && L.time ? `开始时间 ${L.date} ${L.time}` : '';
-  return {
-    kind: 'lobby',
-    startAt,
-    startLabel,
-    title: L.title || evName || '本场演出',
-    subtitle: L.subtitle || '',
-    note: L.note || '',
-    kicker: L.kicker || '',
-    bg: L.bg || defaultLobby('').bg,
-    bgImage: L.bgImage ? convertFileSrc(L.bgImage) : '',
-    accent: L.accent || '#e8c56a',
-    countingText: L.countingText || '距离开始还有',
-    startedText: L.startedText || '演出开始',
-  };
-}
-
-/** 推送开场倒计时页到扩展屏；openOutput=true 时自动打开输出窗 */
-export function pushLobbyPage(openOutput = true) {
-  const ev = curEvent();
-  if (!ev) {
-    toast('请先选择一场演出');
-    return false;
-  }
-  const L = readLobbyForm(true, false) || ensureLobby(ev);
-  if (!lobbyStartAtMs(L)) {
-    toast('请先设置开始日期和时间');
-    return false;
-  }
-  pushToOutput(lobbyPayload(L, ev.name));
-  armLobbyAutoStart(ev, L);
-  if (openOutput) {
-    document.dispatchEvent(new CustomEvent('sp:open-output', { detail: { fullscreen: true } }));
-  }
-  const tip = L.autoStart
-    ? (ev.items?.length ? '已推送开场页 · 到点将自动播第一条' : '已推送开场页 · 到点自动播需先添加节目')
-    : '已推送开场倒计时到扩展屏';
-  toast(tip);
-  return true;
-}
-
 function syncAudioBar(forceLabel = false) {
   const bar = $('pg-audio-bar');
   if (!bar) return;
@@ -953,139 +737,9 @@ function moveItemToIndex(from, to) {
   toast(`已移到第 ${to + 1} 位`);
 }
 
-/** 设定本条节目的开播时刻（到点自动播放 + 倒计时） */
-function editItemCue(item) {
-  if (!item) return;
-  const display = item.cueTime
-    ? (item.cueTime.length >= 8 && item.cueTime.endsWith(':00') ? item.cueTime.slice(0, 5) : item.cueTime)
-    : '';
-  const v = window.prompt(
-    '开播时间（今天 HH:mm，如 09:35）\n到点后自动播放本条；留空清除定时',
-    display,
-  );
-  if (v === null) return;
-  const t = v.trim();
-  if (!t) {
-    item.cueTime = '';
-    item.cueDate = '';
-    item.cueFired = false;
-    save({ soft: true });
-    renderItems({ soft: true });
-    toast('已清除开播定时');
-    return;
-  }
-  const m = t.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (!m) {
-    toast('格式应为 09:35 或 09:35:00');
-    return;
-  }
-  const hh = +m[1];
-  const mm = +m[2];
-  const ss = m[3] != null ? +m[3] : 0;
-  if (hh > 23 || mm > 59 || ss > 59) {
-    toast('时间无效');
-    return;
-  }
-  item.cueTime = `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`;
-  item.cueDate = todayStr();
-  item.cueFired = false;
-  let at = cueStartAtMs(item);
-  if (at <= Date.now()) {
-    item.cueDate = tomorrowStr();
-    at = cueStartAtMs(item);
-    toast(`该时刻已过，已排到明天 ${item.cueTime.slice(0, 5)} 开播`);
-  } else {
-    toast(`已设定 ${item.cueTime.slice(0, 5)} 开播，将自动倒计时`);
-  }
-  save({ soft: true });
-  renderItems({ soft: true });
-  syncCueCountdowns();
-}
-
 /** 节目单面板是否可见（列表上的倒计时等仅可见时刷新） */
 function programVisible() {
   return !!$('panel-program')?.classList.contains('active');
-}
-
-function syncCueCountdowns() {
-  const ev = curEvent();
-  const nodes = document.querySelectorAll('.pg-cue');
-  if (!nodes.length) return;
-  const byId = new Map((ev?.items || []).map((i) => [i.id, i]));
-  nodes.forEach((el) => {
-    const id = el.closest('.pg-item')?.dataset.id;
-    const item = byId.get(id);
-    if (!item?.cueTime) {
-      if (!el.classList.contains('hidden')) el.classList.add('hidden');
-      return;
-    }
-    el.classList.remove('hidden');
-    const at = cueStartAtMs(item);
-    const remain = Math.floor((at - Date.now()) / 1000);
-    const atEl = el.querySelector('.pg-cue-at');
-    const cdEl = el.querySelector('.pg-cue-cd');
-    const label = item.cueTime.slice(0, 5);
-    if (atEl && atEl.textContent !== `开播 ${label}`) atEl.textContent = `开播 ${label}`;
-    if (item.cueFired || remain <= 0) {
-      el.classList.remove('is-live', 'is-urgent');
-      el.classList.add('is-due');
-      const dueText = item.cueFired ? '已开播' : '到点';
-      if (cdEl && cdEl.textContent !== dueText) cdEl.textContent = dueText;
-      el.dataset.sec = '';
-      return;
-    }
-    el.classList.add('is-live');
-    el.classList.remove('is-due');
-    el.classList.toggle('is-urgent', remain <= 60);
-    // 仅秒数变化时写 DOM，避免 250ms 空转
-    if (cdEl && el.dataset.sec !== String(remain)) {
-      el.dataset.sec = String(remain);
-      cdEl.textContent = fmtCueClock(remain);
-    }
-  });
-}
-
-async function tickCueAutoPlay() {
-  if (cueFiring) return;
-  const ev = curEvent();
-  if (!ev?.items?.length) return;
-  const now = Date.now();
-  for (const it of ev.items) {
-    if (!it.cueTime || it.cueFired) continue;
-    if (it._cueRetryAt && now < it._cueRetryAt) continue;
-    const at = cueStartAtMs(it);
-    if (!at || now < at) continue;
-    // 冻结时不抢标「已开播」，解冻后重试，避免扩展屏没换页
-    if (isOutputFrozen()) {
-      it._cueRetryAt = now + 2000;
-      if (!it._cueFrozenTip) {
-        it._cueFrozenTip = true;
-        toast('输出已冻结：定时到点但扩展屏未换页，解冻后将自动重试', 5000);
-      }
-      continue;
-    }
-    cueFiring = true;
-    toast(`⏰ 定时开播：${it.name}`);
-    try {
-      const ok = await activate(it);
-      if (ok && !isOutputFrozen()) {
-        it.cueFired = true;
-        delete it._cueRetryAt;
-        delete it._cueFrozenTip;
-        save({ soft: true });
-        syncCueCountdowns();
-      } else if (ok && isOutputFrozen()) {
-        it._cueRetryAt = now + 2000;
-        toast('输出冻结中，扩展屏未更新，解冻后重试', 4000);
-      } else {
-        it._cueRetryAt = now + 3000;
-        toast(`定时开播失败，将稍后重试：${it.name}`, 4000);
-      }
-    } finally {
-      cueFiring = false;
-    }
-    break;
-  }
 }
 
 function initProgramDragDrop() {

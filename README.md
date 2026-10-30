@@ -55,6 +55,7 @@ src/                  前端（主控窗口 + 输出窗口）
   js/program.js       节目单主流程（走台/定时开播/大厅倒计时）
   js/program-store.js 节目数据规范化与存储；program-thumbs.js 网格缩略图
   js/program-blank.js 空白歌曲页面板；program-bible.js 圣经经文面板
+  js/program-lobby.js 大厅页（开场倒计时）；program-cue.js 定时开播
 src-tauri/
   src/pptx.rs         PPTX 解析（zip + roxmltree，提取文本/图片/背景/坐标，图片转 dataURL；后台线程执行）
   src/audio.rs        原生音频播放（rodio，可选声卡、消人声；音频线程异常自动重启）
