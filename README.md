@@ -51,12 +51,17 @@ src/                  前端（主控窗口 + 输出窗口）
   js/output-core.js   输出渲染核心（主控预览与输出窗口共用）
   js/slide-render.js  PPT 幻灯片 HTML 渲染器
   js/{audio,video,ppt,pdf}.js   四大功能模块
+  js/audio-meters.js  频谱 + VU 表；audio-wave.js 波形解码；audio-stem-ui.js AI 分离进度
+  js/program.js       节目单主流程（走台/定时开播/大厅倒计时）
+  js/program-store.js 节目数据规范化与存储；program-thumbs.js 网格缩略图
+  js/program-blank.js 空白歌曲页面板；program-bible.js 圣经经文面板
 src-tauri/
   src/pptx.rs         PPTX 解析（zip + roxmltree，提取文本/图片/背景/坐标，图片转 dataURL；后台线程执行）
   src/audio.rs        原生音频播放（rodio，可选声卡、消人声；音频线程异常自动重启）
   src/stem.rs         AI 人声分离与伴奏缓存
   src/spl.rs          声压计
-  src/fileio.rs       保存对话框 / 伴奏导出 / 图片缩略图（只允许写入用户在保存对话框中确认的路径）
+  src/fileio.rs       保存对话框 / 伴奏导出 / 图片与视频缩略图（视频用 Windows 系统缩略图；只允许写入用户在保存对话框中确认的路径）
+  src/wave.rs         波形与频谱数据的原生解码
   src/output.rs       输出窗口创建/全屏/关闭
   通信方式            Tauri 事件 output:set（内容推送）、output:video（视频控制）
 ```

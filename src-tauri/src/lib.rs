@@ -32,6 +32,7 @@ pub fn run() {
             fileio::pick_save_path,
             fileio::copy_file,
             fileio::make_image_thumb,
+            fileio::make_video_thumb,
             karaoke::vocal_cancel_export,
             pptx::parse_pptx,
             output::open_output_window,

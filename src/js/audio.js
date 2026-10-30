@@ -1,6 +1,13 @@
 // 音频模块：波形 / 频谱 / LED 计时 + 活动目录绑定
 
 import { pickFiles, esc, fileName, lsGet, lsGetCached, lsSet, invoke, listen, toast, AUDIO_EXT } from './util.js';
+import {
+  bindMetersHost, analyze, drawSpectrum, drawVU, resetMeters, resetClip, meterReadings,
+} from './audio-meters.js';
+import { decodeWaveNative, decodeWaveWeb } from './audio-wave.js';
+import {
+  initStemProgressUi, showStemProgressPanel, hideStemProgressPanel,
+} from './audio-stem-ui.js';
 import { pushToOutput, getCurrentOutput } from './output-main.js';
 import { loadLyricsFor, activeLyricIndex } from './lyrics.js';
 import {
@@ -37,7 +44,6 @@ let waveHover = null;
 /** 跳转后短暂锁住进度轮询，避免红线被旧 position 拉回去 */
 let seekGuardUntil = 0;
 let sampleRate = 0;
-let audioCtx = null;
 let pos = 0;
 let currentName = '';
 /** path → 波形缓存，避免每次点播放都整曲 decode */
@@ -49,20 +55,6 @@ let durProbeToken = 0;
 
 let mono = null;
 let monoSr = 0;
-const BANDS = 28;
-const FFT_N = 1024;
-let specData = new Float32Array(BANDS);
-let specPeak = new Float32Array(BANDS);
-// analyze() 每帧复用，避免 60fps 分配
-const fftSlice = new Float32Array(FFT_N);
-const bandRaw = new Float32Array(BANDS);
-let bandColors = [];
-let vuLevel = 0;
-let vuRmsDb = -120;
-let vuPeakDb = -120;
-let vuPeakHoldDb = -120;
-let vuPeakHoldAt = 0;
-let vuClip = false;
 
 const $ = (id) => document.getElementById(id);
 const convertSrc = (p) => window.__TAURI__.core.convertFileSrc(p);
@@ -265,103 +257,6 @@ async function switchPlaybackFile(filePath, at, wasPlaying) {
   paintSongActive();
 }
 
-function stemPhaseTitle(phase) {
-  return ({
-    start: '准备中',
-    download: '下载模型',
-    split: 'AI 分离',
-    write: '写出分轨',
-    mix: '合成伴奏',
-    done: '完成',
-    error: '失败',
-    busy: '进行中',
-  })[phase] || 'AI 伴奏';
-}
-
-let stemPanelCollapsed = false;
-let stemLastProgress = null;
-let stemHideTimer = null;
-
-function showStemProgressChip(pct) {
-  const chip = $('stem-progress-chip');
-  const chipPct = $('stem-progress-chip-pct');
-  if (!chip) return;
-  chip.classList.remove('hidden');
-  if (chipPct) chipPct.textContent = Math.round(pct) + '%';
-}
-
-function hideStemProgressChip() {
-  $('stem-progress-chip')?.classList.add('hidden');
-}
-
-function showStemProgressPanel(p = {}) {
-  const box = $('stem-progress');
-  if (!box) return;
-  stemLastProgress = p;
-  let pct = Math.max(0, Math.min(100, Number(p.percent) || 0));
-  if (p.phase === 'download' && p.bytesTotal > 0 && p.bytesDone != null) {
-    pct = Math.max(0, Math.min(100, (Number(p.bytesDone) / Number(p.bytesTotal)) * 100));
-  }
-
-  // 收起后只更新小条百分比，不强制弹回大面板
-  if (stemPanelCollapsed && p.phase !== 'error' && p.phase !== 'done') {
-    showStemProgressChip(pct);
-    return;
-  }
-
-  stemPanelCollapsed = false;
-  hideStemProgressChip();
-  if (stemHideTimer) {
-    clearTimeout(stemHideTimer);
-    stemHideTimer = null;
-  }
-  box.classList.remove('hidden', 'is-hiding');
-  box.classList.toggle('is-error', p.phase === 'error');
-  box.classList.toggle('is-done', p.phase === 'done');
-  const phaseEl = $('stem-progress-phase');
-  const titleEl = $('stem-progress-title');
-  const songEl = $('stem-progress-song');
-  const fill = $('stem-progress-fill');
-  const pctEl = $('stem-progress-pct');
-  const detail = $('stem-progress-detail');
-  if (phaseEl) {
-    phaseEl.textContent =
-      p.phase === 'download' ? '模型下载' :
-      p.phase === 'split' || p.phase === 'write' || p.phase === 'mix' ? '人声分离' :
-      'AI 伴奏';
-  }
-  if (titleEl) titleEl.textContent = stemPhaseTitle(p.phase);
-  const name = p.path ? (p.path.split(/[/\\]/).pop() || p.path) : '—';
-  if (songEl) songEl.textContent = name;
-  if (fill) fill.style.width = pct.toFixed(1) + '%';
-  if (pctEl) pctEl.textContent = Math.round(pct) + '%';
-  if (detail) detail.textContent = p.message || '';
-}
-
-function hideStemProgressPanel(delayMs = 0, { collapse = false } = {}) {
-  const box = $('stem-progress');
-  if (!box) return;
-  const finish = () => {
-    box.classList.add('hidden');
-    box.classList.remove('is-hiding');
-    if (collapse) {
-      stemPanelCollapsed = true;
-      const pct = Number(stemLastProgress?.percent) || 0;
-      showStemProgressChip(pct);
-    } else {
-      stemPanelCollapsed = false;
-      hideStemProgressChip();
-    }
-  };
-  const start = () => {
-    box.classList.add('is-hiding');
-    setTimeout(finish, 160);
-  };
-  if (stemHideTimer) clearTimeout(stemHideTimer);
-  if (delayMs > 0) stemHideTimer = setTimeout(start, delayMs);
-  else start();
-}
-
 async function toggleItemVocalCancel(path) {
   if (!path) return;
   const next = !getItemVocalCancel(path);
@@ -526,9 +421,10 @@ function syncMeterReadout() {
   const rmsEl = $('audio-rms-db');
   const peakEl = $('audio-peak-db');
   const clipEl = $('audio-clip');
-  if (rmsEl) rmsEl.textContent = fmtDb(vuRmsDb) + ' dB';
-  if (peakEl) peakEl.textContent = fmtDb(vuPeakHoldDb) + ' dB';
-  if (clipEl) clipEl.classList.toggle('hidden', !vuClip);
+  const m = meterReadings();
+  if (rmsEl) rmsEl.textContent = fmtDb(m.rmsDb) + ' dB';
+  if (peakEl) peakEl.textContent = fmtDb(m.peakHoldDb) + ' dB';
+  if (clipEl) clipEl.classList.toggle('hidden', !m.clip);
   syncVolReadout();
 }
 
@@ -781,9 +677,7 @@ function loadFile(path, autoplay = true, opts = {}) {
 
   currentPath = path;
   pos = 0;
-  vuLevel = 0;
-  specData = new Float32Array(BANDS);
-  specPeak = new Float32Array(BANDS);
+  resetMeters();
   currentName = resolveItemName(path);
   selectedSongPath = path;
   const titleEl = $('audio-title');
@@ -938,61 +832,6 @@ function syncLyricsOutput() {
   pushToOutput({ ...cur, active }, pendingOutputSeq);
 }
 
-/** Rust 侧解码：返回 peaks + 低采样率单声道（二进制，见 src-tauri/src/wave.rs） */
-async function decodeWaveNative(path) {
-  const buf = await invoke('audio_wave', { path });
-  const dv = new DataView(buf);
-  const duration = dv.getFloat64(0, true);
-  const sampleRate = dv.getUint32(8, true);
-  const monoSr = dv.getUint32(12, true);
-  const nPeaks = dv.getUint32(16, true);
-  const nMono = dv.getUint32(20, true);
-  return {
-    duration,
-    sampleRate,
-    monoSr,
-    // 拷贝出来：peaks 进长期缓存，不能拖着整块 mono 缓冲区
-    peaks: new Float32Array(buf, 24, nPeaks).slice(),
-    mono: new Float32Array(buf, 24 + nPeaks * 4, nMono),
-  };
-}
-
-/** 回退：WebAudio 整首解码（内存占用大，仅原生不支持的格式使用） */
-async function decodeWaveWeb(path, token) {
-  const resp = await fetch(convertSrc(path));
-  if (token !== waveBuildToken) return null;
-  const buf = await resp.arrayBuffer();
-  if (token !== waveBuildToken) return null;
-  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => {});
-  const audio = await audioCtx.decodeAudioData(buf);
-  if (token !== waveBuildToken) return null;
-  const ch0 = audio.getChannelData(0);
-  const ch1 = audio.numberOfChannels > 1 ? audio.getChannelData(1) : null;
-
-  const n = 900;
-  const block = Math.max(1, Math.floor(ch0.length / n));
-  const peaks = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    let m = 0;
-    const s = i * block;
-    for (let j = 0; j < block; j += 24) {
-      const v = Math.abs((ch0[s + j] + (ch1 ? ch1[s + j] : 0)) / (ch1 ? 2 : 1) || 0);
-      if (v > m) m = v;
-    }
-    peaks[i] = Math.min(1, m * 1.4);
-  }
-  const sr = audio.sampleRate;
-  const dec = Math.max(1, Math.floor(sr / 11025));
-  const outLen = Math.floor(ch0.length / dec);
-  const mono = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const s = i * dec;
-    mono[i] = ch1 ? (ch0[s] + ch1[s]) / 2 : ch0[s];
-  }
-  return { duration: audio.duration, sampleRate: sr, monoSr: Math.floor(sr / dec), peaks, mono };
-}
-
 async function buildWave(path, token = waveBuildToken) {
   if (waveCache.has(path)) {
     if (currentPath === path) applyWaveCache(path);
@@ -1004,7 +843,7 @@ async function buildWave(path, token = waveBuildToken) {
   }
   try {
     // 优先 Rust 原生解码（不占 WebView 内存）；不支持的格式回退到 WebAudio
-    const w = await decodeWaveNative(path).catch(() => null) || await decodeWaveWeb(path, token);
+    const w = await decodeWaveNative(path).catch(() => null) || await decodeWaveWeb(path, () => token !== waveBuildToken);
     if (!w || token !== waveBuildToken) return;
     const arr = w.peaks;
     const dur = w.duration;
@@ -1047,182 +886,6 @@ async function buildWave(path, token = waveBuildToken) {
       draw();
     }
   }
-}
-
-function goertzel(data, sr, freq) {
-  const N = data.length;
-  const k = Math.round((N * freq) / sr);
-  const w = (2 * Math.PI * k) / N;
-  const coeff = 2 * Math.cos(w);
-  let s1 = 0, s2 = 0;
-  for (let i = 0; i < N; i++) {
-    const s = data[i] + coeff * s1 - s2;
-    s2 = s1; s1 = s;
-  }
-  return Math.sqrt(Math.max(0, s1 * s1 + s2 * s2 - coeff * s1 * s2)) / (N / 2);
-}
-
-function initBandColors() {
-  if (bandColors.length) return;
-  for (let i = 0; i < BANDS; i++) {
-    const t = i / (BANDS - 1);
-    const hue = 195 - 195 * t;
-    bandColors.push(`hsl(${hue}, 90%, 55%)`);
-  }
-}
-
-function analyze() {
-  if (!mono || !monoSr) {
-    if (!playing) {
-      vuRmsDb = -120;
-      vuPeakDb = -120;
-      vuLevel *= 0.85;
-    }
-    return;
-  }
-  const start = Math.floor(pos * monoSr);
-  const slice = fftSlice;
-  for (let i = 0; i < FFT_N; i++) slice[i] = mono[start + i] || 0;
-  let sum = 0;
-  let peak = 0;
-  for (let i = 0; i < FFT_N; i++) {
-    const s = slice[i];
-    sum += s * s;
-    const a = Math.abs(s);
-    if (a > peak) peak = a;
-  }
-  const rms = Math.sqrt(sum / FFT_N);
-  // 文件样本 dBFS + 软件推子 ≈ 输出电平估计（控台参考）
-  const volLin = Math.max(1e-6, engineVol);
-  const rmsDb = 20 * Math.log10(rms * volLin + 1e-12);
-  const peakDb = 20 * Math.log10(peak * volLin + 1e-12);
-  vuRmsDb = rmsDb;
-  vuPeakDb = peakDb;
-  if (peakDb >= vuPeakHoldDb - 0.1) {
-    vuPeakHoldDb = peakDb;
-    vuPeakHoldAt = performance.now();
-  } else if (performance.now() - vuPeakHoldAt > 1200) {
-    vuPeakHoldDb = Math.max(peakDb, vuPeakHoldDb - 0.35);
-  }
-  vuClip = peakDb > -0.3;
-  // M32 段位映射（近 0dB 分辨率更高）
-  const seg = dbToM32Index(rmsDb);
-  const level = Math.max(0, (seg + 1) / M32_METER_DB.length);
-  vuLevel = playing ? Math.max(level, vuLevel * 0.82) : vuLevel * 0.88;
-
-  const raw = bandRaw;
-  for (let b = 0; b < BANDS; b++) {
-    const f = 50 * Math.pow(16000 / 50, b / (BANDS - 1));
-    const mag = goertzel(slice, monoSr, f);
-    const db = 20 * Math.log10(mag * volLin + 1e-9);
-    raw[b] = Math.max(0, Math.min(1, (db + 58) / 52));
-  }
-  for (let b = 0; b < BANDS; b++) {
-    const t = playing ? raw[b] : raw[b] * 0.55;
-    specData[b] = t > specData[b] ? t : specData[b] * 0.82 + t * 0.18;
-    specPeak[b] = Math.max(specData[b], specPeak[b] - 0.012);
-  }
-}
-
-function drawSpectrum() {
-  const cv = $('audio-spec');
-  if (!cv || !cv.parentElement) return;
-  const dpr = window.devicePixelRatio || 1;
-  const W = cv.parentElement.clientWidth;
-  const H = cv.parentElement.clientHeight;
-  if (W < 10 || H < 10) return;
-  if (cv.width !== Math.floor(W * dpr) || cv.height !== Math.floor(H * dpr)) {
-    cv.width = Math.floor(W * dpr);
-    cv.height = Math.floor(H * dpr);
-  }
-  const g = cv.getContext('2d');
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.fillStyle = '#050507';
-  g.fillRect(0, 0, W, H);
-  g.strokeStyle = '#101318';
-  g.lineWidth = 1;
-  g.beginPath();
-  for (let x = 0; x < W; x += 32) { g.moveTo(x + .5, 0); g.lineTo(x + .5, H); }
-  for (let y = 0; y < H; y += 32) { g.moveTo(0, y + .5); g.lineTo(W, y + .5); }
-  g.stroke();
-
-  initBandColors();
-  const gap = 3;
-  const bw = W / BANDS;
-  for (let b = 0; b < BANDS; b++) {
-    const h = Math.max(2, specData[b] * (H - 6));
-    const x = b * bw + gap / 2;
-    g.fillStyle = bandColors[b];
-    g.fillRect(x, H - h, bw - gap, h);
-    const py = H - Math.max(4, specPeak[b] * (H - 6));
-    g.fillStyle = '#e8e8e8';
-    g.fillRect(x, py - 2, bw - gap, 2);
-  }
-}
-
-/** M32/X32 主表风格刻度（dBFS）：低段疏、近 0 密；绿≤-18 / 黄≤-9 / 红＞-9 / CLIP≈0 */
-const M32_METER_DB = [
-  -60, -54, -48, -42, -36, -30, -27, -24, -21, -18,
-  -15, -12, -9, -6, -3, -2, -1, 0,
-];
-
-function m32SegColor(db, on) {
-  if (db >= -1) return on ? '#ff2a2a' : '#3a1212';
-  if (db >= -9) return on ? '#ff3b3b' : '#3a1414';
-  if (db >= -18) return on ? '#ffcc33' : '#3a3210';
-  return on ? '#3dd66a' : '#123a18';
-}
-
-function dbToM32Index(db) {
-  if (!Number.isFinite(db) || db < -60) return -1;
-  let lit = -1;
-  for (let i = 0; i < M32_METER_DB.length; i++) {
-    if (db >= M32_METER_DB[i]) lit = i;
-  }
-  return lit;
-}
-
-function drawVU() {
-  const cv = $('audio-vu');
-  if (!cv || !cv.parentElement) return;
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const wrap = cv.parentElement;
-  const cssW = Math.max(160, wrap.clientWidth || 220);
-  const cssH = 30;
-  const tw = Math.round(cssW * dpr);
-  const th = Math.round(cssH * dpr);
-  if (cv.width !== tw || cv.height !== th) {
-    cv.width = tw;
-    cv.height = th;
-  }
-  const g = cv.getContext('2d');
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const W = cssW;
-  const H = cssH;
-  g.fillStyle = '#07070a';
-  g.fillRect(0, 0, W, H);
-
-  const SEGS = M32_METER_DB.length;
-  const gap = 1.5;
-  const bw = (W - gap * (SEGS - 1)) / SEGS;
-  const rmsLit = dbToM32Index(vuRmsDb);
-  const peakLit = dbToM32Index(vuPeakHoldDb);
-  for (let i = 0; i < SEGS; i++) {
-    const db = M32_METER_DB[i];
-    const on = i <= rmsLit;
-    g.fillStyle = m32SegColor(db, on);
-    g.fillRect(i * (bw + gap), 4, bw, H - 12);
-  }
-  if (peakLit >= 0) {
-    const px = peakLit * (bw + gap) + bw / 2;
-    g.fillStyle = '#ffffff';
-    g.fillRect(px - 1, 2, 2, H - 8);
-  }
-  if (vuClip) {
-    g.fillStyle = '#ff3030';
-    g.fillRect(W - 10, 2, 8, H - 8);
-  }
-  syncMeterReadout();
 }
 
 function updateTech() {
@@ -1449,6 +1112,10 @@ function currentModule() {
 }
 
 export function initAudio() {
+  bindMetersHost({
+    meterState: () => ({ mono, monoSr, pos, playing, engineVol }),
+    syncMeterReadout,
+  });
   const meta = $('audio-meta');
   const list = $('audio-song-list') || $('audio-list');
   const cv = $('audio-wave');
@@ -1490,27 +1157,7 @@ export function initAudio() {
   });
   applyDockToggles();
 
-  $('stem-progress-hide')?.addEventListener('click', () => {
-    hideStemProgressPanel(0, { collapse: true });
-  });
-  $('stem-progress-chip')?.addEventListener('click', () => {
-    stemPanelCollapsed = false;
-    hideStemProgressChip();
-    if (stemLastProgress) showStemProgressPanel(stemLastProgress);
-  });
-  listen('sp-stem-progress', (e) => {
-    const p = e?.payload || e;
-    if (!p) return;
-    showStemProgressPanel(p);
-    if (p.phase === 'done') {
-      stemPanelCollapsed = false;
-      hideStemProgressPanel(1800);
-    }
-    if (p.phase === 'error') {
-      stemPanelCollapsed = false;
-      hideStemProgressChip();
-    }
-  });
+  initStemProgressUi();
 
   listen('sp-audio-ended', () => {
     playing = false;
@@ -1876,8 +1523,7 @@ export function initAudio() {
     toast('音量 100%（0 dB）');
   });
   $('audio-clip')?.addEventListener('click', () => {
-    vuClip = false;
-    vuPeakHoldDb = vuPeakDb;
+    resetClip();
     syncMeterReadout();
   });
 

@@ -95,17 +95,106 @@ pub async fn make_image_thumb(path: String) -> Result<Option<String>, String> {
             Some(img) => img,
             None => return Ok(None),
         };
-        let thumb = img.thumbnail(320, 320);
-        let mut buf = std::io::Cursor::new(Vec::new());
-        if thumb
-            .write_to(&mut buf, image::ImageFormat::Jpeg)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.get_ref());
-        Ok(Some(format!("data:image/jpeg;base64,{b64}")))
+        Ok(jpeg_data_url(&img.thumbnail(320, 320)))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn jpeg_data_url(img: &image::DynamicImage) -> Option<String> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    // JPEG 不支持透明通道，统一转 RGB
+    image::DynamicImage::ImageRgb8(img.to_rgb8())
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(buf.get_ref());
+    Some(format!("data:image/jpeg;base64,{b64}"))
+}
+
+/// 视频缩略图：取 Windows 资源管理器同款系统缩略图（不打包 ffmpeg，安装包不增大）
+/// 系统无该格式解码器时返回 None，前端回退到 <video> 截帧
+#[tauri::command]
+pub async fn make_video_thumb(path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(shell_thumb(&path).and_then(|img| jpeg_data_url(&img.thumbnail(320, 320))))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(windows))]
+fn shell_thumb(_path: &str) -> Option<image::DynamicImage> {
+    None
+}
+
+#[cfg(windows)]
+fn shell_thumb(path: &str) -> Option<image::DynamicImage> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+    use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_BIGGERSIZEOK,
+        SIIGBF_THUMBNAILONLY,
+    };
+    unsafe {
+        // 线程池线程可能已初始化过 COM（返回 S_FALSE / RPC_E_CHANGED_MODE 均可继续用）
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(&HSTRING::from(path), None::<&IBindCtx>).ok()?;
+        let flags = SIIGBF(SIIGBF_THUMBNAILONLY.0 | SIIGBF_BIGGERSIZEOK.0);
+        let hbm = factory.GetImage(SIZE { cx: 320, cy: 320 }, flags).ok()?;
+        let img = bitmap_to_image(hbm);
+        let _ = DeleteObject(HGDIOBJ(hbm.0));
+        img
+    }
+}
+
+#[cfg(windows)]
+unsafe fn bitmap_to_image(
+    hbm: windows::Win32::Graphics::Gdi::HBITMAP,
+) -> Option<image::DynamicImage> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    let mut bm = BITMAP::default();
+    let got = GetObjectW(
+        HGDIOBJ(hbm.0),
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bm as *mut BITMAP as *mut core::ffi::c_void),
+    );
+    if got == 0 || bm.bmWidth <= 0 || bm.bmHeight == 0 {
+        return None;
+    }
+    let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // 负值 = 自上而下行序
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bgra = vec![0u8; (w * h * 4) as usize];
+    let hdc = CreateCompatibleDC(None);
+    let lines = GetDIBits(
+        hdc,
+        hbm,
+        0,
+        h as u32,
+        Some(bgra.as_mut_ptr() as *mut core::ffi::c_void),
+        &mut bi,
+        DIB_RGB_COLORS,
+    );
+    let _ = DeleteDC(hdc);
+    if lines == 0 {
+        return None;
+    }
+    let rgb: Vec<u8> = bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+    image::RgbImage::from_raw(w as u32, h as u32, rgb).map(image::DynamicImage::ImageRgb8)
 }

@@ -2,7 +2,7 @@
 
 import {
   pickFiles, esc, fileName, fileExt, lsGet, lsSet, toast, convertFileSrc, fmtTimeLong, listen,
-  lsApproxBytes, AUDIO_EXT, VIDEO_EXT, IMAGE_EXT, PPT_EXT, PDF_EXT, detectMediaType, invoke,
+  lsApproxBytes, AUDIO_EXT, VIDEO_EXT, IMAGE_EXT, PPT_EXT, PDF_EXT, detectMediaType,
 } from './util.js';
 import { pushToOutput, getCurrentOutput, claimOutputSeq, isOutputFrozen } from './output-main.js';
 import {
@@ -15,114 +15,21 @@ import {
   stopAudio,
 } from './audio.js';
 import { playByPath as videoPlay } from './video.js';
-import { getPageCount as pptPages, playPage as pptPlayPage, mountSlidePreview } from './ppt.js';
-import { getPageCount as pdfPages, playPage as pdfPlayPage, mountPdfPreview } from './pdf.js';
+import { getPageCount as pptPages, playPage as pptPlayPage } from './ppt.js';
+import { getPageCount as pdfPages, playPage as pdfPlayPage } from './pdf.js';
+import { blankToOutputPayload } from './blank-page.js';
+import { bibleToOutputPayload } from './bible-page.js';
 import {
-  createBlankItem,
-  buildSongBlankSet,
-  blankToOutputPayload,
-  mountBlankPreview,
-} from './blank-page.js';
-import {
-  ensureBible, getBooks, getBook, chapterCount, verseCount,
-  parseReference, searchKeyword, getVerses, formatRefFull,
-} from './bible-data.js';
-import {
-  buildBibleItems, bibleToOutputPayload, mountBiblePreview,
-} from './bible-page.js';
+  LS_BODIES, bodyStore, normalizeItem, normalizeEvents, countItems,
+} from './program-store.js';
+import { bindBlankHost, hideBlankPanels, initBlankPanels } from './program-blank.js';
+import { bindBibleHost, initBiblePanel } from './program-bible.js';
+import { bindThumbsHost, cancelThumbs, fillItemThumbs } from './program-thumbs.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
 const LS_VIEW = 'sp.program.view';
 const LS_ZOOM = 'sp.program.zoom';
-/** 空白页大段歌词外置，避免撑爆 localStorage */
-const LS_BODIES = 'sp.program.bodies';
-
-function bodyStore() {
-  const m = lsGet(LS_BODIES, {});
-  return m && typeof m === 'object' ? m : {};
-}
-
-function hydrateBlankBody(it) {
-  if (!it || (it.type !== 'blank' && it.type !== 'bible')) return it;
-  if (it.body) return it;
-  const bodies = bodyStore();
-  const ref = it._bodyRef || it.id;
-  if (ref && bodies[ref]) it.body = bodies[ref];
-  return it;
-}
-
-function normalizeItem(it) {
-  if (!it || typeof it !== 'object') return null;
-  if (it.type === 'blank') {
-    const blankKind = it.blankKind === 'lyric' ? 'lyric' : 'title';
-    const title = (it.title || '').trim() || (blankKind === 'title' ? '歌曲名称' : '歌词');
-    const name = (it.name != null && String(it.name))
-      || (blankKind === 'lyric'
-        ? `${title} · 歌词${it.lyricIndex != null ? ` ${it.lyricIndex}` : ''}`
-        : `${title} · 歌名`);
-    const item = {
-      ...it,
-      type: 'blank',
-      blankKind,
-      title,
-      subtitle: it.subtitle || '',
-      body: it.body || '',
-      accent: it.accent || '#e8c56a',
-      bgPreset: it.bgPreset || 'auto',
-      bgImage: it.bgImage || '',
-      path: it.path || '',
-      name,
-      note: it.note || '',
-    };
-    return hydrateBlankBody(item);
-  }
-  if (it.type === 'bible') {
-    const ref = (it.ref || '').trim() || '圣经';
-    const item = {
-      ...it,
-      type: 'bible',
-      sn: +it.sn || 0,
-      bookName: it.bookName || '',
-      bookShort: it.bookShort || '',
-      chapter: +it.chapter || 1,
-      verseFrom: +it.verseFrom || 1,
-      verseTo: +it.verseTo || +it.verseFrom || 1,
-      rangeFrom: +it.rangeFrom || +it.verseFrom || 1,
-      rangeTo: +it.rangeTo || +it.verseTo || 1,
-      ref,
-      refFull: it.refFull || ref,
-      body: it.body || '',
-      accent: it.accent || '#e8c56a',
-      pageIndex: +it.pageIndex || 1,
-      pageTotal: +it.pageTotal || 1,
-      path: '',
-      name: (it.name != null && String(it.name)) || ref,
-      note: it.note || '',
-    };
-    return hydrateBlankBody(item);
-  }
-  const path = it.path || '';
-  const name = (it.name != null && String(it.name))
-    || (path ? fileName(path).replace(/\.[^.]+$/, '') : '')
-    || '未命名';
-  return { ...it, path, name, note: it.note || '' };
-}
-
-function normalizeEvents(list) {
-  if (!Array.isArray(list)) return [];
-  return list.map((ev) => {
-    if (!ev || typeof ev !== 'object') return null;
-    const items = Array.isArray(ev.items)
-      ? ev.items.map(normalizeItem).filter(Boolean)
-      : [];
-    return { ...ev, name: ev.name || '未命名演出', items };
-  }).filter(Boolean);
-}
-
-function countItems(list) {
-  return (Array.isArray(list) ? list : []).reduce((n, e) => n + (e.items?.length || 0), 0);
-}
 
 let events = normalizeEvents(lsGet(LS_EVENTS, []));
 let currentId = lsGet(LS_CURRENT, null);
@@ -140,10 +47,6 @@ function initialCardZoom() {
   return Math.min(420, Math.max(140, z));
 }
 let cardZoom = initialCardZoom();
-let thumbToken = 0;
-/** path#page → ImageBitmap / dataURL 缓存，切换视图不丢、不重复解析 */
-const thumbCache = new Map();
-const THUMB_CONCURRENCY = 2; // 2 路并发：兼顾速度与内存
 
 const $ = (id) => document.getElementById(id);
 
@@ -404,6 +307,10 @@ function fmtClock(sec) {
 }
 
 export function initProgram() {
+  // 拆出的子模块需要回调本模块
+  bindBlankHost({ curEvent, renderItems, save, updateNowBar });
+  bindBibleHost({ activate, curEvent, renderItems, save, updateNowBar });
+  bindThumbsHost({ TYPE_META, curEvent, syncCueCountdowns, syncItemRemain, viewMode: () => viewMode });
   if (!events.length) {
     events.push({ id: genId(), name: '本场演出', items: [] });
     currentId = events[0].id;
@@ -528,8 +435,10 @@ export function initProgram() {
   setInterval(() => {
     try {
       syncAudioBar();
-      syncItemRemain();
-      syncCueCountdowns();
+      if (programVisible()) {
+        syncItemRemain();
+        syncCueCountdowns();
+      }
       syncPlayGoBtn();
       syncAudioFloat();
       syncLobbyRemain();
@@ -1093,13 +1002,19 @@ function editItemCue(item) {
   syncCueCountdowns();
 }
 
+/** 节目单面板是否可见（列表上的倒计时等仅可见时刷新） */
+function programVisible() {
+  return !!$('panel-program')?.classList.contains('active');
+}
+
 function syncCueCountdowns() {
   const ev = curEvent();
   const nodes = document.querySelectorAll('.pg-cue');
   if (!nodes.length) return;
+  const byId = new Map((ev?.items || []).map((i) => [i.id, i]));
   nodes.forEach((el) => {
     const id = el.closest('.pg-item')?.dataset.id;
-    const item = ev?.items.find((i) => i.id === id);
+    const item = byId.get(id);
     if (!item?.cueTime) {
       if (!el.classList.contains('hidden')) el.classList.add('hidden');
       return;
@@ -1171,411 +1086,6 @@ async function tickCueAutoPlay() {
     }
     break;
   }
-}
-
-function hideBlankPanels() {
-  $('pg-blank-panel')?.classList.add('hidden');
-  $('pg-songset-panel')?.classList.add('hidden');
-  $('pg-bible-panel')?.classList.add('hidden');
-  $('pg-add-blank')?.classList.remove('active');
-  $('pg-add-songset')?.classList.remove('active');
-  $('pg-add-bible')?.classList.remove('active');
-}
-
-function hideLobbyPanel() {
-  $('pg-lobby-panel')?.classList.add('hidden');
-  $('pg-lobby-toggle')?.classList.remove('active');
-}
-
-function syncBlankKindFields() {
-  const kind = $('pg-blank-kind')?.value || 'title';
-  const isLyric = kind === 'lyric';
-  $('pg-blank-sub-wrap')?.classList.toggle('hidden', isLyric);
-  $('pg-blank-body-wrap')?.classList.toggle('hidden', !isLyric);
-}
-
-function readBlankForm() {
-  return {
-    blankKind: $('pg-blank-kind')?.value === 'lyric' ? 'lyric' : 'title',
-    title: ($('pg-blank-title')?.value || '').trim(),
-    subtitle: ($('pg-blank-sub')?.value || '').trim(),
-    body: ($('pg-blank-body')?.value || '').trim(),
-    accent: $('pg-blank-accent')?.value || '#e8c56a',
-    bgPreset: $('pg-blank-preset')?.value || 'auto',
-    bgImage: $('pg-blank-bgimg')?.dataset.path || '',
-  };
-}
-
-function addBlankFromForm() {
-  const ev = curEvent();
-  if (!ev) return;
-  const f = readBlankForm();
-  if (!f.title) {
-    toast('请填写主标题 / 歌名');
-    return;
-  }
-  if (f.blankKind === 'lyric' && !f.body) {
-    toast('请填写这一段歌词正文');
-    return;
-  }
-  const item = createBlankItem(f);
-  ev.items.push(item);
-  save();
-  renderItems();
-  updateNowBar();
-  toast(`已加入空白页：${item.name}`);
-}
-
-function addSongSetFromForm() {
-  const ev = curEvent();
-  if (!ev) return;
-  const title = ($('pg-songset-title')?.value || '').trim();
-  if (!title) {
-    toast('请填写歌名');
-    return;
-  }
-  const items = buildSongBlankSet({
-    title,
-    subtitle: ($('pg-songset-sub')?.value || '').trim(),
-    lyrics: $('pg-songset-lyrics')?.value || '',
-    accent: $('pg-songset-accent')?.value || '#e8c56a',
-    bgPreset: $('pg-songset-preset')?.value || 'auto',
-    bgImage: $('pg-songset-bgimg')?.dataset.path || '',
-  });
-  if (items.length <= 1) {
-    toast('未检测到歌词段落（请用空行分段）；已加入歌名片');
-  }
-  ev.items.push(...items);
-  save();
-  renderItems();
-  updateNowBar();
-  toast(`已加入 ${items.length} 页（歌名片 + 歌词）`);
-  $('pg-songset-panel')?.classList.add('hidden');
-  $('pg-add-songset')?.classList.remove('active');
-}
-
-async function pickBlankBg(inputId) {
-  const files = await pickFiles([{ name: '图片', extensions: IMAGE_EXT }], '选择空白页背景图');
-  if (!files.length) return;
-  const el = $(inputId);
-  if (!el) return;
-  el.dataset.path = files[0];
-  el.value = fileName(files[0]);
-}
-
-function clearBlankBg(inputId) {
-  const el = $(inputId);
-  if (!el) return;
-  el.dataset.path = '';
-  el.value = '';
-}
-
-function initBlankPanels() {
-  $('pg-add-blank')?.addEventListener('click', () => {
-    const panel = $('pg-blank-panel');
-    if (!panel) return;
-    const show = panel.classList.contains('hidden');
-    hideLobbyPanel();
-    hideBlankPanels();
-    panel.classList.toggle('hidden', !show);
-    $('pg-add-blank')?.classList.toggle('active', show);
-    if (show) syncBlankKindFields();
-  });
-  $('pg-add-songset')?.addEventListener('click', () => {
-    const panel = $('pg-songset-panel');
-    if (!panel) return;
-    const show = panel.classList.contains('hidden');
-    hideLobbyPanel();
-    hideBlankPanels();
-    panel.classList.toggle('hidden', !show);
-    $('pg-add-songset')?.classList.toggle('active', show);
-  });
-  $('pg-blank-kind')?.addEventListener('change', syncBlankKindFields);
-  $('pg-blank-cancel')?.addEventListener('click', () => {
-    $('pg-blank-panel')?.classList.add('hidden');
-    $('pg-add-blank')?.classList.remove('active');
-  });
-  $('pg-blank-add')?.addEventListener('click', () => addBlankFromForm());
-  $('pg-blank-bgimg-pick')?.addEventListener('click', () => pickBlankBg('pg-blank-bgimg'));
-  $('pg-blank-bgimg-clear')?.addEventListener('click', () => clearBlankBg('pg-blank-bgimg'));
-  $('pg-songset-cancel')?.addEventListener('click', () => {
-    $('pg-songset-panel')?.classList.add('hidden');
-    $('pg-add-songset')?.classList.remove('active');
-  });
-  $('pg-songset-add')?.addEventListener('click', () => addSongSetFromForm());
-  $('pg-songset-bgimg-pick')?.addEventListener('click', () => pickBlankBg('pg-songset-bgimg'));
-  $('pg-songset-bgimg-clear')?.addEventListener('click', () => clearBlankBg('pg-songset-bgimg'));
-  syncBlankKindFields();
-}
-
-function biblePreviewEl() {
-  return $('pg-bible-preview');
-}
-
-function setBiblePreviewText(htmlOrText, isHtml = false) {
-  const el = biblePreviewEl();
-  if (!el) return;
-  if (isHtml) el.innerHTML = htmlOrText;
-  else el.textContent = htmlOrText;
-}
-
-async function fillBibleBookSelect() {
-  const sel = $('pg-bible-book');
-  if (!sel || sel.dataset.ready === '1') return;
-  try {
-    await ensureBible();
-  } catch (err) {
-    toast('圣经数据加载失败：' + err, 6000);
-    return;
-  }
-  const books = getBooks();
-  const ot = books.filter((b) => !b.nt);
-  const nt = books.filter((b) => b.nt);
-  sel.innerHTML = '';
-  const gOt = document.createElement('optgroup');
-  gOt.label = '旧约';
-  for (const b of ot) {
-    const o = document.createElement('option');
-    o.value = String(b.sn);
-    o.textContent = `${b.short} ${b.name}`;
-    gOt.appendChild(o);
-  }
-  const gNt = document.createElement('optgroup');
-  gNt.label = '新约';
-  for (const b of nt) {
-    const o = document.createElement('option');
-    o.value = String(b.sn);
-    o.textContent = `${b.short} ${b.name}`;
-    gNt.appendChild(o);
-  }
-  sel.appendChild(gOt);
-  sel.appendChild(gNt);
-  sel.dataset.ready = '1';
-  // 默认约翰福音
-  sel.value = '43';
-  syncBibleChapterOptions();
-}
-
-function syncBibleChapterOptions() {
-  const sn = +($('pg-bible-book')?.value || 0);
-  const chSel = $('pg-bible-chapter');
-  const vsFrom = $('pg-bible-from');
-  const vsTo = $('pg-bible-to');
-  if (!chSel || !sn) return;
-  const n = chapterCount(sn) || 1;
-  const cur = +chSel.value || 1;
-  chSel.innerHTML = '';
-  for (let i = 1; i <= n; i++) {
-    const o = document.createElement('option');
-    o.value = String(i);
-    o.textContent = String(i);
-    chSel.appendChild(o);
-  }
-  chSel.value = String(Math.min(Math.max(1, cur), n));
-  syncBibleVerseOptions();
-  if (vsFrom) vsFrom.value = '1';
-  if (vsTo) vsTo.value = '1';
-  refreshBibleRangePreview();
-}
-
-function syncBibleVerseOptions() {
-  const sn = +($('pg-bible-book')?.value || 0);
-  const ch = +($('pg-bible-chapter')?.value || 1);
-  const max = verseCount(sn, ch) || 1;
-  for (const id of ['pg-bible-from', 'pg-bible-to']) {
-    const el = $(id);
-    if (!el) continue;
-    el.max = String(max);
-    el.min = '1';
-    if (+el.value > max) el.value = String(max);
-    if (+el.value < 1) el.value = '1';
-  }
-}
-
-function readBibleRange() {
-  const sn = +($('pg-bible-book')?.value || 0);
-  const chapter = +($('pg-bible-chapter')?.value || 1);
-  let from = +($('pg-bible-from')?.value || 1);
-  let to = +($('pg-bible-to')?.value || from);
-  if (!sn) return null;
-  if (to < from) [from, to] = [to, from];
-  return { sn, chapter, from, to };
-}
-
-function refreshBibleRangePreview() {
-  const range = readBibleRange();
-  if (!range) {
-    setBiblePreviewText('请选择书卷与章节');
-    return;
-  }
-  const book = getBook(range.sn);
-  const verses = getVerses(range.sn, range.chapter, range.from, range.to);
-  if (!verses.length) {
-    setBiblePreviewText('该范围没有经文');
-    return;
-  }
-  const head = formatRefFull(book, range.chapter, range.from, range.to);
-  const body = verses.map((v) => `${v.n} ${v.text}`).join('\n');
-  setBiblePreviewText(`${head}\n\n${body}`);
-}
-
-async function applyBibleQuickRef() {
-  const input = $('pg-bible-quick');
-  const raw = input?.value?.trim() || '';
-  if (!raw) {
-    toast('请输入经文，如：约3:16 或 约翰福音 3:16-18');
-    return false;
-  }
-  try {
-    await ensureBible();
-    await fillBibleBookSelect();
-  } catch (err) {
-    toast('圣经数据加载失败：' + err);
-    return false;
-  }
-  const hit = parseReference(raw);
-  if (!hit) {
-    toast('无法识别经文引用，请用「约3:16」或「约翰福音 3:16-18」');
-    return false;
-  }
-  const bookSel = $('pg-bible-book');
-  if (bookSel) bookSel.value = String(hit.book.sn);
-  syncBibleChapterOptions();
-  const chSel = $('pg-bible-chapter');
-  if (chSel) chSel.value = String(hit.chapter);
-  syncBibleVerseOptions();
-  const max = verseCount(hit.book.sn, hit.chapter) || 1;
-  const from = Math.min(hit.from, max);
-  const to = Math.min(hit.to, max);
-  if ($('pg-bible-from')) $('pg-bible-from').value = String(from);
-  if ($('pg-bible-to')) $('pg-bible-to').value = String(to);
-  refreshBibleRangePreview();
-  toast(`已定位：${formatRefFull(hit.book, hit.chapter, from, to)}`);
-  return true;
-}
-
-async function runBibleKeywordSearch() {
-  const q = $('pg-bible-kw')?.value?.trim() || '';
-  const box = $('pg-bible-hits');
-  if (!box) return;
-  if (!q) {
-    box.innerHTML = '<div class="empty-tip">输入关键字后搜索，点击结果可定位</div>';
-    return;
-  }
-  try {
-    await ensureBible();
-  } catch (err) {
-    toast('圣经数据加载失败：' + err);
-    return;
-  }
-  const hits = searchKeyword(q, 36);
-  if (!hits.length) {
-    box.innerHTML = '<div class="empty-tip">没有匹配经文</div>';
-    return;
-  }
-  box.innerHTML = hits.map((h) => `
-    <button type="button" class="pg-bible-hit" data-sn="${h.sn}" data-ch="${h.chapter}" data-vs="${h.verse}">
-      <span class="pg-bible-hit-ref">${esc(h.short)}${h.chapter}:${h.verse}</span>
-      <span class="pg-bible-hit-text">${esc(h.text)}</span>
-    </button>`).join('');
-}
-
-async function addBibleToProgram({ play = false } = {}) {
-  const ev = curEvent();
-  if (!ev) {
-    toast('请先新建一场演出');
-    return;
-  }
-  const range = readBibleRange();
-  if (!range) {
-    toast('请选择书卷章节');
-    return;
-  }
-  try {
-    await ensureBible();
-    const accent = $('pg-bible-accent')?.value || '#e8c56a';
-    const items = await buildBibleItems({ ...range, accent });
-    ev.items.push(...items);
-    save();
-    renderItems({ soft: false });
-    updateNowBar();
-    toast(`已加入 ${items.length} 页：${items[0]?.refFull || items[0]?.ref}`);
-    if (play && items[0]) await activate(items[0]);
-    // 保持面板打开，方便继续查
-  } catch (err) {
-    toast('加入失败：' + err, 5000);
-  }
-}
-
-function initBiblePanel() {
-  $('pg-add-bible')?.addEventListener('click', async () => {
-    const panel = $('pg-bible-panel');
-    if (!panel) return;
-    const show = panel.classList.contains('hidden');
-    hideLobbyPanel();
-    hideBlankPanels();
-    panel.classList.toggle('hidden', !show);
-    $('pg-add-bible')?.classList.toggle('active', show);
-    if (show) {
-      toast('正在加载和合本…', 1200);
-      await fillBibleBookSelect();
-      refreshBibleRangePreview();
-      $('pg-bible-quick')?.focus();
-    }
-  });
-  $('pg-bible-cancel')?.addEventListener('click', () => {
-    $('pg-bible-panel')?.classList.add('hidden');
-    $('pg-add-bible')?.classList.remove('active');
-  });
-  $('pg-bible-book')?.addEventListener('change', () => syncBibleChapterOptions());
-  $('pg-bible-chapter')?.addEventListener('change', () => {
-    syncBibleVerseOptions();
-    if ($('pg-bible-from')) $('pg-bible-from').value = '1';
-    if ($('pg-bible-to')) $('pg-bible-to').value = '1';
-    refreshBibleRangePreview();
-  });
-  $('pg-bible-from')?.addEventListener('change', () => {
-    syncBibleVerseOptions();
-    const from = +($('pg-bible-from')?.value || 1);
-    const toEl = $('pg-bible-to');
-    if (toEl && +toEl.value < from) toEl.value = String(from);
-    refreshBibleRangePreview();
-  });
-  $('pg-bible-to')?.addEventListener('change', () => {
-    syncBibleVerseOptions();
-    refreshBibleRangePreview();
-  });
-  $('pg-bible-quick-go')?.addEventListener('click', () => applyBibleQuickRef());
-  $('pg-bible-quick')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      applyBibleQuickRef();
-    }
-  });
-  $('pg-bible-kw-go')?.addEventListener('click', () => runBibleKeywordSearch());
-  $('pg-bible-kw')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      runBibleKeywordSearch();
-    }
-  });
-  $('pg-bible-hits')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('.pg-bible-hit');
-    if (!btn) return;
-    const sn = +btn.dataset.sn;
-    const ch = +btn.dataset.ch;
-    const vs = +btn.dataset.vs;
-    const bookSel = $('pg-bible-book');
-    if (bookSel) bookSel.value = String(sn);
-    syncBibleChapterOptions();
-    if ($('pg-bible-chapter')) $('pg-bible-chapter').value = String(ch);
-    syncBibleVerseOptions();
-    if ($('pg-bible-from')) $('pg-bible-from').value = String(vs);
-    if ($('pg-bible-to')) $('pg-bible-to').value = String(vs);
-    refreshBibleRangePreview();
-  });
-  $('pg-bible-add')?.addEventListener('click', () => addBibleToProgram({ play: false }));
-  $('pg-bible-add-play')?.addEventListener('click', () => addBibleToProgram({ play: true }));
 }
 
 function initProgramDragDrop() {
@@ -1772,6 +1282,7 @@ function syncItemRemain() {
     const id = row?.dataset.id;
     const isActiveAudio = item?.type === 'audio' && id === item.id && snap.path === item.path && snap.duration > 0;
     if (!isActiveAudio) {
+      if (el.classList.contains('hidden') && !el.dataset.sec) return;
       el.classList.add('hidden');
       el.classList.remove('is-live', 'is-urgent', 'is-paused');
       el.dataset.sec = '';
@@ -1890,7 +1401,7 @@ function setViewMode(mode) {
     return;
   }
   // 先取消进行中的缩略图任务，避免旧任务写穿新 DOM
-  thumbToken += 1;
+  cancelThumbs();
   viewMode = mode;
   lsSet(LS_VIEW, mode);
   syncViewToggle();
@@ -2005,6 +1516,84 @@ function itemPageBadge(it) {
   return fileExt(it.path);
 }
 
+/**
+ * 单条节目的 HTML。序号/状态（active、done）与剩余时间由 patchRow / syncItemRemain 补，
+ * 因此 itemRowHtml(it, 0, '') 可作为「内容签名」：签名不变的行直接复用 DOM（连同缩略图）
+ */
+function itemRowHtml(it, i, state, isGrid) {
+  const meta = TYPE_META[it.type] || { icon: '▪', label: '', color: '#888' };
+  const pageBadge = itemPageBadge(it);
+  const noteText = (it.note || '').trim();
+  const noteCls = noteText ? 'pg-note has-text' : 'pg-note is-empty';
+  const noteShow = noteText || '无备注';
+  const displayName = String(it.name ?? fileName(it.path || '') ?? '未命名');
+  const remainSlot = it.type === 'audio'
+    ? `<span class="pg-remain hidden" title="剩余播放时间"></span>`
+    : '';
+  const cueSlot = `<span class="pg-cue ${it.cueTime ? '' : 'hidden'}" title="开播倒计时">
+      <span class="pg-cue-at"></span>
+      <span class="pg-cue-cd"></span>
+    </span>`;
+
+  if (isGrid) {
+    const shortName = displayName.length > 28 ? `${displayName.slice(0, 26)}…` : displayName;
+    // 倒计时/定时放在标题区，避免被缩略图悬停条挡住
+    return `
+    <div class="pg-item card ${state}" data-id="${it.id}" title="${esc(displayName)}${noteText ? ' · ' + esc(noteText) : ''}">
+      <div class="pg-thumb" data-thumb-for="${it.id}">
+        <span class="pg-thumb-ph">${meta.icon || '▪'}</span>
+        <span class="pg-corner-num" title="双击改顺序">${i + 1}</span>
+        <span class="pg-corner-tag" style="color:${meta.color}">${meta.label}${pageBadge ? ' · ' + esc(pageBadge) : ''}</span>
+        <div class="pg-hover-bar">
+          <button type="button" data-op="play" class="primary" title="播放">▶ 播放</button>
+          <button type="button" data-op="cue" title="定时开播">定时</button>
+          <button type="button" data-op="note" title="备注">备注</button>
+          <button type="button" data-op="up" title="上移">↑</button>
+          <button type="button" data-op="down" title="下移">↓</button>
+          <button type="button" data-op="del" class="danger" title="删除">删除</button>
+        </div>
+      </div>
+      <div class="pg-caption">
+        <div class="pg-caption-row">
+          <span class="pg-name">${esc(shortName)}</span>
+          ${remainSlot}
+          ${cueSlot}
+        </div>
+        <span class="${noteCls}" title="${esc(noteShow)}">${esc(noteShow)}</span>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="pg-item ${state}" data-id="${it.id}">
+    <span class="pg-num" title="双击改顺序">${i + 1}</span>
+    <span class="pg-type-badge" style="background:${meta.color}22;color:${meta.color};border-color:${meta.color}55">${meta.label}</span>
+    <div class="pg-main">
+      <span class="pg-name" title="${esc(it.path)}">${esc(displayName)}</span>
+      <span class="${noteCls}">${esc(noteShow || '无备注')}</span>
+    </div>
+    ${cueSlot}
+    ${remainSlot}
+    <span class="pg-page mono">${esc(pageBadge)}</span>
+    <div class="pg-toolbar inline">
+      <button type="button" data-op="play" title="播放">▶</button>
+      <button type="button" data-op="cue" title="设定开播时间">⏱</button>
+      <button type="button" data-op="note" title="编辑备注">备</button>
+      <button type="button" data-op="up" title="上移">↑</button>
+      <button type="button" data-op="down" title="下移">↓</button>
+      <button type="button" data-op="del" class="danger" title="移除">✕</button>
+    </div>
+  </div>`;
+}
+
+/** 只改序号与 active/done 状态（复用行在重排后调用） */
+function patchRowPosition(row, it, i, aidx) {
+  row.classList.toggle('active', it.id === activeItemId);
+  row.classList.toggle('done', aidx >= 0 && i < aidx);
+  const numEl = row.querySelector('.pg-corner-num, .pg-num');
+  if (numEl && numEl.textContent !== String(i + 1)) numEl.textContent = String(i + 1);
+}
+
 function renderItems(opts = {}) {
   const ev = curEvent();
   const box = $('pg-items');
@@ -2015,7 +1604,7 @@ function renderItems(opts = {}) {
   applyCardZoom();
   syncViewToggle();
   if (!ev || !items.length) {
-    thumbToken++;
+    cancelThumbs();
     box.innerHTML = `<div class="empty-tip big">
       按演出时间顺序添加节目<br/>
       <span style="font-size:13px;opacity:.8">混排导入 · 或直接把音乐/图片/视频/PPT/PDF 拖进这里</span>
@@ -2028,72 +1617,22 @@ function renderItems(opts = {}) {
   const aidx = activeIndex();
   const isGrid = viewMode === 'grid';
   try {
-    box.innerHTML = items.map((it, i) => {
-      const meta = TYPE_META[it.type] || { icon: '▪', label: '', color: '#888' };
+    // 按 id 复用内容未变的行：增删/排序时不再整表重建，已出的缩略图保留
+    const existing = new Map();
+    box.querySelectorAll(':scope > .pg-item').forEach((r) => existing.set(r.dataset.id, r));
+    const tpl = document.createElement('template');
+    const nodes = items.map((it, i) => {
+      const sig = itemRowHtml(it, 0, '', isGrid);
+      const old = existing.get(it.id);
+      if (old && old.dataset.sig === sig) return old;
       const state = it.id === activeItemId ? 'active' : (aidx >= 0 && i < aidx ? 'done' : '');
-      const pageBadge = itemPageBadge(it);
-      const noteText = (it.note || '').trim();
-      const noteCls = noteText ? 'pg-note has-text' : 'pg-note is-empty';
-      const noteShow = noteText || '无备注';
-      const displayName = String(it.name ?? fileName(it.path || '') ?? '未命名');
-      const remainSlot = it.type === 'audio'
-        ? `<span class="pg-remain ${it.id === activeItemId ? '' : 'hidden'}" title="剩余播放时间"></span>`
-        : '';
-      const cueSlot = `<span class="pg-cue ${it.cueTime ? '' : 'hidden'}" title="开播倒计时">
-          <span class="pg-cue-at"></span>
-          <span class="pg-cue-cd"></span>
-        </span>`;
-
-      if (isGrid) {
-        const shortName = displayName.length > 28 ? `${displayName.slice(0, 26)}…` : displayName;
-        // 倒计时/定时放在标题区，避免被缩略图悬停条挡住
-        return `
-        <div class="pg-item card ${state}" data-id="${it.id}" title="${esc(displayName)}${noteText ? ' · ' + esc(noteText) : ''}">
-          <div class="pg-thumb" data-thumb-for="${it.id}">
-            <span class="pg-thumb-ph">${meta.icon || '▪'}</span>
-            <span class="pg-corner-num" title="双击改顺序">${i + 1}</span>
-            <span class="pg-corner-tag" style="color:${meta.color}">${meta.label}${pageBadge ? ' · ' + esc(pageBadge) : ''}</span>
-            <div class="pg-hover-bar">
-              <button type="button" data-op="play" class="primary" title="播放">▶ 播放</button>
-              <button type="button" data-op="cue" title="定时开播">定时</button>
-              <button type="button" data-op="note" title="备注">备注</button>
-              <button type="button" data-op="up" title="上移">↑</button>
-              <button type="button" data-op="down" title="下移">↓</button>
-              <button type="button" data-op="del" class="danger" title="删除">删除</button>
-            </div>
-          </div>
-          <div class="pg-caption">
-            <div class="pg-caption-row">
-              <span class="pg-name">${esc(shortName)}</span>
-              ${remainSlot}
-              ${cueSlot}
-            </div>
-            <span class="${noteCls}" title="${esc(noteShow)}">${esc(noteShow)}</span>
-          </div>
-        </div>`;
-      }
-
-      return `
-      <div class="pg-item ${state}" data-id="${it.id}">
-        <span class="pg-num" title="双击改顺序">${i + 1}</span>
-        <span class="pg-type-badge" style="background:${meta.color}22;color:${meta.color};border-color:${meta.color}55">${meta.label}</span>
-        <div class="pg-main">
-          <span class="pg-name" title="${esc(it.path)}">${esc(displayName)}</span>
-          <span class="${noteCls}">${esc(noteShow || '无备注')}</span>
-        </div>
-        ${cueSlot}
-        ${remainSlot}
-        <span class="pg-page mono">${esc(pageBadge)}</span>
-        <div class="pg-toolbar inline">
-          <button type="button" data-op="play" title="播放">▶</button>
-          <button type="button" data-op="cue" title="设定开播时间">⏱</button>
-          <button type="button" data-op="note" title="编辑备注">备</button>
-          <button type="button" data-op="up" title="上移">↑</button>
-          <button type="button" data-op="down" title="下移">↓</button>
-          <button type="button" data-op="del" class="danger" title="移除">✕</button>
-        </div>
-      </div>`;
-    }).join('');
+      tpl.innerHTML = itemRowHtml(it, i, state, isGrid).trim();
+      const node = tpl.content.firstElementChild;
+      node.dataset.sig = sig;
+      return node;
+    });
+    box.replaceChildren(...nodes);
+    items.forEach((it, i) => patchRowPosition(nodes[i], it, i, aidx));
   } catch (err) {
     console.error('renderItems failed', err);
     toast(`列表渲染异常：${err}`, 5000);
@@ -2110,281 +1649,4 @@ function renderItems(opts = {}) {
   syncCueCountdowns();
   syncPlayGoBtn();
   if (isGrid && viewMode === 'grid') fillItemThumbs();
-}
-
-function thumbCacheKey(item) {
-  if (item.type === 'blank') {
-    return [
-      'blank', item.id, item.blankKind, item.title, item.subtitle,
-      (item.body || '').slice(0, 48), item.accent, item.bgPreset, item.bgImage || '',
-    ].join('|');
-  }
-  if (item.type === 'bible') {
-    return [
-      'bible', item.id, item.ref, (item.body || '').slice(0, 48), item.accent,
-      item.pageIndex, item.pageTotal,
-    ].join('|');
-  }
-  return `${item.type}|${item.path}|${item.page ?? 0}`;
-}
-
-function rememberThumb(key, value) {
-  thumbCache.set(key, value);
-  while (thumbCache.size > 64) {
-    thumbCache.delete(thumbCache.keys().next().value);
-  }
-}
-
-function captureVideoThumb(path) {
-  const key = `video|${path}|0`;
-  if (thumbCache.has(key)) return Promise.resolve(thumbCache.get(key));
-  return new Promise((resolve) => {
-    const v = document.createElement('video');
-    v.muted = true;
-    v.playsInline = true;
-    v.preload = 'auto';
-    v.src = convertFileSrc(path);
-    let settled = false;
-    const finish = (url) => {
-      if (settled) return;
-      settled = true;
-      try { v.removeAttribute('src'); v.load(); } catch { /* ignore */ }
-      v.remove();
-      resolve(url || null);
-    };
-    const timer = setTimeout(() => finish(null), 4000);
-    v.addEventListener('seeked', () => {
-      try {
-        const w = 320;
-        const h = 180;
-        const c = document.createElement('canvas');
-        c.width = w;
-        c.height = h;
-        c.getContext('2d').drawImage(v, 0, 0, w, h);
-        const url = c.toDataURL('image/jpeg', 0.72);
-        rememberThumb(key, url);
-        clearTimeout(timer);
-        finish(url);
-      } catch {
-        clearTimeout(timer);
-        finish(null);
-      }
-    }, { once: true });
-    v.addEventListener('loadeddata', () => {
-      try { v.currentTime = Math.min(0.25, (v.duration || 1) * 0.05); } catch {
-        clearTimeout(timer);
-        finish(null);
-      }
-    }, { once: true });
-    v.addEventListener('error', () => {
-      clearTimeout(timer);
-      finish(null);
-    }, { once: true });
-  });
-}
-
-async function fillItemThumbs() {
-  const token = ++thumbToken;
-  const box = $('pg-items');
-  if (!box || viewMode !== 'grid') return;
-  const thumbs = [...box.querySelectorAll('.pg-thumb')];
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < thumbs.length) {
-      if (token !== thumbToken || viewMode !== 'grid') return;
-      const el = thumbs[cursor++];
-      const row = el.closest('.pg-item');
-      const id = row?.dataset.id;
-      const item = curEvent()?.items.find((i) => i.id === id);
-      if (!item) continue;
-      try {
-        await mountItemThumb(el, item, token);
-      } catch {
-        if (token !== thumbToken) return;
-        restoreThumbFallback(el, item);
-      }
-      // 让出主线程，切换列表时不卡死
-      await new Promise((r) => requestAnimationFrame(() => r()));
-    }
-  };
-  const n = Math.min(THUMB_CONCURRENCY, thumbs.length || 1);
-  await Promise.all(Array.from({ length: n }, () => worker()));
-  if (token === thumbToken) {
-    syncItemRemain();
-    syncCueCountdowns();
-  }
-}
-
-function restoreThumbFallback(el, item) {
-  const keep = [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
-  el.innerHTML = `<span class="pg-thumb-ph">${TYPE_META[item.type]?.icon || '▪'}</span>`;
-  for (const node of keep) el.appendChild(node);
-}
-
-/** 填充预览时保留角标与悬停操作条 */
-function preserveThumbChrome(el, fillFn) {
-  const keep = [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
-  fillFn();
-  for (const node of keep) el.appendChild(node);
-}
-
-function captureThumbChrome(el) {
-  return [...el.querySelectorAll('.pg-corner-num, .pg-corner-tag, .pg-hover-bar, .pg-remain, .pg-cue')];
-}
-
-function applyThumbChrome(el, keep) {
-  for (const node of keep) el.appendChild(node);
-}
-
-function putThumbImage(el, url, alt = '') {
-  preserveThumbChrome(el, () => {
-    el.innerHTML = '';
-    const img = document.createElement('img');
-    img.className = 'pg-thumb-img';
-    img.src = url;
-    img.draggable = false;
-    img.alt = alt;
-    el.appendChild(img);
-  });
-}
-
-async function captureImageThumb(path) {
-  const key = `image|${path}|0`;
-  if (thumbCache.has(key)) return thumbCache.get(key);
-  try {
-    // 由 Rust 原生生成小图 dataURL，避免渲染进程解码原图 OOM
-    const url = await invoke('make_image_thumb', { path });
-    if (url) rememberThumb(key, url);
-    return url || null;
-  } catch {
-    return null;
-  }
-}
-
-async function mountItemThumb(el, item, token = thumbToken) {
-  if (!el || !item || token !== thumbToken) return;
-  const key = thumbCacheKey(item);
-  if (el.dataset.thumbKey === key && el.querySelector('.pg-thumb-img, .slide-canvas, .pg-blank-thumb, .pg-bible-thumb, .pg-thumb-audio')) {
-    return;
-  }
-
-  if (item.type === 'image') {
-    let url = thumbCache.get(key);
-    if (!url) url = await captureImageThumb(item.path);
-    if (token !== thumbToken || viewMode !== 'grid') return;
-    if (url) {
-      putThumbImage(el, url, item.name || '');
-      el.dataset.thumbKey = key;
-      return;
-    }
-    restoreThumbFallback(el, item);
-    return;
-  }
-  if (item.type === 'video') {
-    let url = thumbCache.get(key);
-    if (!url) url = await captureVideoThumb(item.path);
-    if (token !== thumbToken || viewMode !== 'grid') return;
-    if (url) {
-      putThumbImage(el, url, item.name || '');
-      el.dataset.thumbKey = key;
-      return;
-    }
-    restoreThumbFallback(el, item);
-    return;
-  }
-  if (item.type === 'blank') {
-    const cached = thumbCache.get(key);
-    if (cached?.nodeType === 1) {
-      preserveThumbChrome(el, () => {
-        el.innerHTML = '';
-        el.appendChild(cached.cloneNode(true));
-      });
-      el.dataset.thumbKey = key;
-      return;
-    }
-    mountBlankPreview(el, item);
-    const stage = el.querySelector('.pg-blank-thumb');
-    if (stage) rememberThumb(key, stage.cloneNode(true));
-    el.dataset.thumbKey = key;
-    return;
-  }
-  if (item.type === 'bible') {
-    const cached = thumbCache.get(key);
-    if (cached?.nodeType === 1) {
-      preserveThumbChrome(el, () => {
-        el.innerHTML = '';
-        el.appendChild(cached.cloneNode(true));
-      });
-      el.dataset.thumbKey = key;
-      return;
-    }
-    mountBiblePreview(el, item);
-    const stage = el.querySelector('.pg-bible-thumb');
-    if (stage) rememberThumb(key, stage.cloneNode(true));
-    el.dataset.thumbKey = key;
-    return;
-  }
-  // PPT：缓存克隆的 slide-canvas，避免每次重解析/重渲
-  if (item.type === 'ppt') {
-    const cached = thumbCache.get(key);
-    if (cached?.nodeType === 1) {
-      preserveThumbChrome(el, () => {
-        el.innerHTML = '';
-        const node = cached.cloneNode(true);
-        node.style.width = '100%';
-        node.style.height = '100%';
-        node.style.aspectRatio = 'auto';
-        el.appendChild(node);
-      });
-      el.dataset.thumbKey = key;
-      return;
-    }
-    const ok = await mountSlidePreview(el, item.path, item.page ?? 0);
-    if (token !== thumbToken || viewMode !== 'grid') return;
-    const canvas = el.querySelector('.slide-canvas');
-    if (!ok || !canvas) {
-      restoreThumbFallback(el, item);
-      return;
-    }
-    rememberThumb(key, canvas.cloneNode(true));
-    el.dataset.thumbKey = key;
-    return;
-  }
-  if (item.type === 'pdf') {
-    let url = thumbCache.get(key);
-    if (!url) {
-      const holder = document.createElement('div');
-      holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:320px;height:180px;overflow:hidden;pointer-events:none';
-      document.body.appendChild(holder);
-      try {
-        await mountPdfPreview(holder, item.path, item.page ?? 0);
-        if (token !== thumbToken) return;
-        const canvas = holder.querySelector('canvas');
-        if (canvas) {
-          url = canvas.toDataURL('image/jpeg', 0.72);
-          rememberThumb(key, url);
-        }
-      } finally {
-        holder.remove();
-      }
-    }
-    if (token !== thumbToken || viewMode !== 'grid') return;
-    if (url) {
-      putThumbImage(el, url, item.name || '');
-      el.dataset.thumbKey = key;
-      return;
-    }
-    const keep = captureThumbChrome(el);
-    await mountPdfPreview(el, item.path, item.page ?? 0);
-    if (token !== thumbToken) return;
-    applyThumbChrome(el, keep);
-    el.dataset.thumbKey = key;
-    return;
-  }
-  // audio / fallback
-  const meta = TYPE_META[item.type] || { icon: '♪', label: '音乐', color: '#3dd55f' };
-  preserveThumbChrome(el, () => {
-    el.innerHTML = `<div class="pg-thumb-audio" style="--c:${meta.color}"><span>${meta.icon}</span><em>${esc(meta.label)}</em></div>`;
-  });
-  el.dataset.thumbKey = key;
 }

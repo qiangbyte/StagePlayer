@@ -6,6 +6,7 @@ commands.allow = [
   "pick_save_path",
   "copy_file",
   "make_image_thumb",
+  "make_video_thumb",
   "vocal_cancel_export",
   "parse_pptx",
   "open_output_window",

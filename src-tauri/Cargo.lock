@@ -4613,6 +4613,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "windows 0.62.2",
  "zip",
 ]
 
