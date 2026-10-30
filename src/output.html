@@ -8,11 +8,17 @@
 <body class="output-body">
   <div id="output-stage"></div>
   <div id="output-freeze-badge">❄ 已冻结</div>
+  <!-- 右上角热区：鼠标移到这里才出现，观众平时看不到 -->
+  <div id="output-hot"></div>
   <div id="output-ctrls">
-    <button id="oc-full">⛶ 全屏 / 还原</button>
-    <button id="oc-close">✕ 关闭</button>
+    <button id="oc-full" type="button" data-tip="全屏（F）" aria-label="全屏 / 还原">
+      <svg class="ic-enter" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      <svg class="ic-exit" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+    </button>
+    <button id="oc-close" type="button" data-tip="关闭（Esc）" aria-label="关闭输出">
+      <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
   </div>
-  <div id="output-tip">移动鼠标显示关闭按钮 · F 全屏 · Esc 退出全屏/关闭</div>
   <script type="module" src="js/output.js"></script>
 </body>
 </html>

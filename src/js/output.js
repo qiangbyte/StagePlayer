@@ -41,23 +41,33 @@ window.addEventListener('DOMContentLoaded', async () => {
   try { await emit('output:ready', {}); } catch { /* ignore */ }
   setTimeout(() => { emit('output:ready', {}).catch(() => {}); }, 300);
 
+  // 控制按钮默认隐藏：只有鼠标进入右上角热区才出现，离开约 0.8 秒后收起；
+  // 鼠标在画面其它地方移动不打扰观众。指针静止 2 秒自动隐藏
   const ctrls = document.getElementById('output-ctrls');
+  const hot = document.getElementById('output-hot');
   const showCtrls = () => {
+    clearTimeout(ctrlTimer);
     ctrls.classList.add('show');
+  };
+  const hideCtrlsSoon = () => {
     clearTimeout(ctrlTimer);
     ctrlTimer = setTimeout(() => {
-      // 鼠标仍在控制条上时不隐藏
-      if (!ctrls.matches(':hover')) ctrls.classList.remove('show');
-    }, 2800);
+      if (!ctrls.matches(':hover') && !hot.matches(':hover')) ctrls.classList.remove('show');
+    }, 800);
   };
-  document.addEventListener('mousemove', showCtrls);
-  ctrls.addEventListener('mouseenter', () => {
-    clearTimeout(ctrlTimer);
-    ctrls.classList.add('show');
-  });
-  ctrls.addEventListener('mouseleave', () => {
-    clearTimeout(ctrlTimer);
-    ctrlTimer = setTimeout(() => ctrls.classList.remove('show'), 800);
+  hot.addEventListener('mouseenter', showCtrls);
+  hot.addEventListener('mouseleave', hideCtrlsSoon);
+  ctrls.addEventListener('mouseenter', showCtrls);
+  ctrls.addEventListener('mouseleave', hideCtrlsSoon);
+  document.documentElement.addEventListener('mouseleave', hideCtrlsSoon);
+
+  let cursorTimer = 0;
+  document.addEventListener('mousemove', () => {
+    document.body.classList.remove('hide-cursor');
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => {
+      if (!ctrls.classList.contains('show')) document.body.classList.add('hide-cursor');
+    }, 2000);
   });
 
   document.getElementById('oc-full').addEventListener('click', (e) => {
@@ -93,11 +103,20 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     const win = window.__TAURI__.window.getCurrentWindow();
     isFs = await win.isFullscreen();
+    syncFsIcon();
+    win.onResized(() => {
+      win.isFullscreen().then((v) => { isFs = v; syncFsIcon(); }).catch(() => {});
+    }).catch(() => {});
   } catch { /* ignore */ }
-
-  // 启动时短暂显示一次控制条，方便用户发现关闭按钮
-  showCtrls();
 });
+
+/** 全屏时显示「还原」图标，窗口模式显示「全屏」图标 */
+function syncFsIcon() {
+  const btn = document.getElementById('oc-full');
+  if (!btn) return;
+  btn.classList.toggle('is-fs', !!isFs);
+  btn.dataset.tip = isFs ? '还原窗口（F）' : '全屏（F）';
+}
 
 async function currentWin() {
   return window.__TAURI__.window.getCurrentWindow();
@@ -109,6 +128,7 @@ async function toggleFs() {
     const cur = await win.isFullscreen();
     await win.setFullscreen(!cur);
     isFs = !cur;
+    syncFsIcon();
   } catch {
     try {
       await invoke('set_output_fullscreen', { fullscreen: !isFs });

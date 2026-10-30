@@ -1838,10 +1838,6 @@ button { font-family: inherit; cursor: pointer; }
 /* ============ 输出窗口 ============ */
 .output-body { background: #000; }
 #output-stage { position: fixed; inset: 0; }
-#output-tip {
-  position: fixed; right: 12px; bottom: 8px; color: #333;
-  font-size: 12px; pointer-events: none;
-}
 
 /* 输出窗口冻结徽标 */
 #output-freeze-badge {
@@ -1851,22 +1847,37 @@ button { font-family: inherit; cursor: pointer; }
 }
 #output-freeze-badge.show { opacity: 1; }
 
-/* 输出窗口悬停控制条 */
+/* 输出窗口控制：右上角热区触发的小圆钮，平时完全隐藏 */
+#output-hot { position: fixed; top: 0; right: 0; width: 180px; height: 90px; z-index: 99; }
 #output-ctrls {
-  position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
-  z-index: 100; display: flex; gap: 8px;
-  opacity: 0; transition: opacity .25s; pointer-events: none;
-  padding: 6px; border-radius: 10px;
-  background: rgba(0, 0, 0, 0.35);
+  position: fixed; top: 14px; right: 14px; z-index: 100;
+  display: flex; gap: 8px; padding: 5px;
+  border-radius: 999px; background: rgba(12, 12, 16, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  opacity: 0; transform: translateY(-6px) scale(.96); pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
 }
-#output-ctrls.show { opacity: 1; pointer-events: auto; }
+#output-ctrls.show { opacity: 1; transform: none; pointer-events: auto; }
 #output-ctrls button {
-  background: rgba(30, 30, 36, 0.92); color: #ddd;
-  border: 1px solid rgba(255, 255, 255, 0.22); border-radius: 6px;
-  padding: 8px 16px; font-size: 13px; cursor: pointer;
+  position: relative; width: 34px; height: 34px; border-radius: 50%; padding: 0;
+  display: grid; place-items: center; cursor: pointer;
+  background: rgba(255, 255, 255, 0.08); border: 0; color: rgba(255, 255, 255, 0.82);
+  transition: background .15s, color .15s;
 }
-#output-ctrls button:hover { background: rgba(58, 111, 232, 0.95); color: #fff; }
-#output-ctrls #oc-close:hover { background: rgba(200, 60, 60, 0.95); border-color: #c83c3c; }
+#output-ctrls svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+#output-ctrls button:hover { background: rgba(255, 255, 255, 0.20); color: #fff; }
+#output-ctrls #oc-close:hover { background: rgba(220, 60, 70, 0.9); }
+#oc-full .ic-exit, #oc-full.is-fs .ic-enter { display: none; }
+#oc-full.is-fs .ic-exit { display: block; }
+/* 悬停时在按钮下方显示文字说明 */
+#output-ctrls button::after {
+  content: attr(data-tip); position: absolute; top: calc(100% + 8px); right: 0;
+  white-space: nowrap; font-size: 12px; color: #fff; padding: 3px 8px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.7); opacity: 0; pointer-events: none; transition: opacity .15s;
+}
+#output-ctrls button:hover::after { opacity: 1; }
+.output-body.hide-cursor, .output-body.hide-cursor * { cursor: none; }
 
 /* 设置弹层：置顶复选 */
 .pop-check { margin: 4px 0 2px; }
