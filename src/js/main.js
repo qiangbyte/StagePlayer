@@ -8,6 +8,7 @@ import { initPdf, pdfNavigate } from './pdf.js';
 import { initProgram, programGo, programStep, programActiveType } from './program.js';
 import { initSpl } from './spl.js';
 import { initKaraoke } from './karaoke.js';
+import { initLyricsShow, lyricsHandleKey, lyricsProgramKey } from './lyrics-show.js';
 import {
   setPreviewEl, getCurrentOutput, pushFitMode, toggleBlack, setOutputFrozen, isOutputFrozen,
   resyncOutput,
@@ -22,6 +23,7 @@ const MODULES = {
   ppt: { listTitle: '目录 · 文稿', importEv: 'sp:import-ppt' },
   pdf: { listTitle: '目录 · 文档', importEv: 'sp:import-pdf' },
   program: { listTitle: '本场演出' },
+  lyrics: { listTitle: '歌词库', importEv: 'sp:import-lyrics', noClear: true },
   spl: { listTitle: '声压测量' },
 };
 
@@ -31,6 +33,7 @@ const SIDEBAR_MAP = {
   ppt: 'ppt-docs-wrap',
   pdf: 'pdf-docs-wrap',
   program: 'program-events-wrap',
+  lyrics: 'lyrics-list-wrap',
 };
 
 let module = 'audio';
@@ -45,7 +48,7 @@ function switchModule(m) {
   if (wrap) wrap.style.display = 'flex';
   const showIO = !!MODULES[m].importEv;
   $('btn-import').style.display = showIO ? '' : 'none';
-  $('btn-clear').style.display = showIO ? '' : 'none';
+  $('btn-clear').style.display = showIO && !MODULES[m].noClear ? '' : 'none';
   $('list-title').textContent = MODULES[m].listTitle;
   document.dispatchEvent(new CustomEvent('sp:module-change', { detail: m }));
 }
@@ -276,7 +279,7 @@ function navigatePages(delta) {
   if (module === 'program') {
     // 节目单走台：含音乐在内，方向键与 Enter 一样翻条
     const t = programActiveType();
-    if (t === 'audio' || t === 'ppt' || t === 'pdf' || t === 'bible' || t === 'blank' || t === 'image' || t === 'video') {
+    if (t === 'audio' || t === 'ppt' || t === 'pdf' || t === 'bible' || t === 'blank' || t === 'image' || t === 'video' || t === 'lyrics') {
       return programStep(delta);
     }
     const kind = getCurrentOutput().kind;
@@ -295,6 +298,17 @@ function initKeyboard() {
   document.addEventListener('keydown', (e) => {
     const tag = document.activeElement?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+
+    // 歌词投屏：换行 / 段落跳转（B、F、Esc 等全局键不拦）
+    if (module === 'lyrics' && lyricsHandleKey(e)) {
+      e.preventDefault();
+      return;
+    }
+    // 节目单当前条是歌词：↑/↓ 换行、C/V/Q… 跳段落
+    if (module === 'program' && programActiveType() === 'lyrics' && lyricsProgramKey(e)) {
+      e.preventDefault();
+      return;
+    }
 
     // 演出节目单：Enter = 下一条；G = 播放当前；Shift+Enter = 上一条
     if (module === 'program') {
@@ -386,6 +400,7 @@ function boot() {
   initPdf();
   initSpl();
   initKaraoke();
+  initLyricsShow();
   // 默认进入节目单：按一场演出的时间顺序走台
   switchModule('program');
 }

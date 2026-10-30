@@ -18,6 +18,7 @@
 
       <nav class="tabs">
         <button class="tab active" data-module="program">节目单</button>
+        <button class="tab" data-module="lyrics">歌词</button>
         <button class="tab" data-module="audio">音频</button>
         <button class="tab" data-module="video">视频</button>
         <button class="tab" data-module="ppt">PPT</button>
@@ -134,6 +135,13 @@
           </div>
         </div>
         <div id="program-events-wrap" class="file-list-wrap" style="display:none"><div id="program-events" class="file-list"></div></div>
+        <div id="lyrics-list-wrap" class="file-list-wrap lyrics-list-wrap" style="display:none">
+          <div class="lyrics-list-head">
+            <input type="search" id="lyrics-search" class="rename-input" placeholder="搜索歌名 / 歌词" />
+            <button type="button" class="mini-btn accent" id="lyrics-new" title="新建一首歌词">＋新歌</button>
+          </div>
+          <div id="lyrics-songs" class="file-list"></div>
+        </div>
       </aside>
 
       <!-- 主区域 -->
@@ -397,6 +405,85 @@
               <div id="pdf-grid" class="thumb-grid compact-grid">
                 <div class="empty-tip">导入 PDF 后在此浏览页面</div>
               </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 歌词投屏：逐行控制 + 段落快速跳转 -->
+        <div class="panel" data-module="lyrics" id="panel-lyrics">
+          <div class="lshow-layout">
+            <div class="lshow-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">歌词投屏 <span id="lshow-live" class="lshow-live">● 投屏中</span></span>
+                  <input type="text" id="lshow-title" class="lshow-title-input" placeholder="歌名" />
+                </div>
+                <button type="button" class="mini-btn accent" id="lshow-push" title="把当前行投到大屏（Enter）">投屏</button>
+                <button type="button" class="mini-btn" id="lshow-to-program" title="加入当前节目单">加入节目单</button>
+                <button type="button" class="mini-btn danger" id="lshow-del">删除</button>
+              </div>
+              <div class="lshow-secs" id="lshow-secs"></div>
+              <div class="lshow-keys hint-inline">↑↓ / 空格 换行 · C 副歌 · V 主歌 · Q 桥段 · P 预副歌 · E 尾声 · 1–9 第几段 · Home 回开头 · B 黑屏</div>
+              <div class="lshow-lines" id="lshow-lines"></div>
+            </div>
+            <div class="lshow-side" id="lshow-editor">
+              <div class="lshow-mini out-stage" id="lshow-mini"></div>
+              <details class="lshow-box" open>
+                <summary>歌词</summary>
+                <textarea id="lshow-text" class="lshow-text" spellcheck="false" placeholder="粘贴歌词，用方括号标段落：
+[主歌1]
+奇异恩典 何等甘甜
+[副歌]
+……
+[桥段]
+……
+也支持 Chorus: / V1 / 【副歌】；不标记时按空行分段，重复出现的段落自动认作副歌。按 Esc 退出编辑。"></textarea>
+              </details>
+              <details class="lshow-box" open>
+                <summary>背景</summary>
+                <div class="lshow-form">
+                  <label>类型
+                    <select id="lshow-bg-mode">
+                      <option value="gradient">渐变</option>
+                      <option value="image">图片</option>
+                      <option value="video">视频（循环静音）</option>
+                    </select>
+                  </label>
+                  <div class="lshow-swatches" id="lshow-swatches"></div>
+                  <div class="lshow-row2">
+                    <label>主色 <input type="color" id="lshow-bg-color" value="#c8902e" /></label>
+                    <button type="button" class="mini-btn" id="lshow-bg-random" title="随机生成一组渐变">随机配色</button>
+                  </div>
+                  <div class="lshow-row2">
+                    <button type="button" class="mini-btn" id="lshow-bg-pick">选择图片 / 视频</button>
+                    <button type="button" class="mini-btn" id="lshow-bg-from-img" title="按背景图片的主色生成渐变">从图片取色</button>
+                  </div>
+                  <span class="lshow-file mono" id="lshow-bg-file"></span>
+                  <label class="lshow-check"><input type="checkbox" id="lshow-bg-anim" checked /> 渐变流动</label>
+                  <label>流动周期（秒，越小越快）<input type="range" id="lshow-bg-speed" min="6" max="60" step="2" value="24" /></label>
+                  <label>图片 / 视频压暗 <input type="range" id="lshow-bg-dim" min="0" max="0.85" step="0.05" value="0.45" /></label>
+                </div>
+              </details>
+              <details class="lshow-box" open>
+                <summary>显示</summary>
+                <div class="lshow-form">
+                  <label>方式
+                    <select id="lshow-view">
+                      <option value="scroll">滚动（当前行居中）</option>
+                      <option value="stanza">整段显示</option>
+                    </select>
+                  </label>
+                  <label>每次
+                    <select id="lshow-step">
+                      <option value="1">一行</option>
+                      <option value="2">两行</option>
+                    </select>
+                  </label>
+                  <label>字号 <input type="range" id="lshow-scale" min="0.6" max="1.6" step="0.05" value="1" /></label>
+                  <label class="lshow-check"><input type="checkbox" id="lshow-show-label" checked /> 显示段落名（主歌 / 副歌）</label>
+                  <label class="lshow-check"><input type="checkbox" id="lshow-show-title" /> 显示歌名</label>
+                </div>
+              </details>
             </div>
           </div>
         </div>

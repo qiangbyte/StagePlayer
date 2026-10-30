@@ -33,6 +33,7 @@ import {
   syncLobbyRemain, pushLobbyPage,
 } from './program-lobby.js';
 import { exportEvent, importEvent } from './program-io.js';
+import { playLyricsItem } from './lyrics-show.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
@@ -63,6 +64,7 @@ const TYPE_META = {
   pdf: { icon: 'PDF', label: 'PDF', color: '#c45cff' },
   blank: { icon: '页', label: '空白页', color: '#e8c56a' },
   bible: { icon: '经', label: '圣经', color: '#c9a227' },
+  lyrics: { icon: '词', label: '歌词', color: '#ff8fb1' },
 };
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -883,6 +885,8 @@ async function activate(item) {
       if (!pushToOutput(blankToOutputPayload(item), seq)) return false;
     } else if (item.type === 'bible') {
       if (!pushToOutput(bibleToOutputPayload(item), seq)) return false;
+    } else if (item.type === 'lyrics') {
+      if (!playLyricsItem(item, seq)) return false;
     } else if (item.type === 'ppt') {
       await pptPlayPage(item.path, item.page ?? 0, stay);
     } else if (item.type === 'pdf') {
@@ -1180,6 +1184,7 @@ function itemPageBadge(it) {
   if (it.type === 'blank') {
     return it.blankKind === 'lyric' ? `歌词${it.lyricIndex != null ? it.lyricIndex : ''}` : '歌名';
   }
+  if (it.type === 'lyrics') return '↑↓ 换行 · C 副歌';
   if (it.type === 'bible') {
     if (it.pageTotal > 1) return `${it.pageIndex || 1}/${it.pageTotal}`;
     return it.ref || '经文';

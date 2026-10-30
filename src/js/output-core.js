@@ -4,6 +4,7 @@ import { renderSlide, makeSlideCanvas } from './slide-render.js';
 import { convertFileSrc, fmtTimeLong, invoke } from './util.js';
 import { renderBlankInto } from './blank-page.js';
 import { renderBibleInto, updateBibleDom } from './bible-page.js';
+import { renderLyricShowInto, updateLyricShowInPlace } from './lyrics-show-render.js';
 
 export const OUTPUT_EVENT = 'output:set';
 export const VIDEO_CTRL_EVENT = 'output:video';
@@ -250,8 +251,17 @@ export function renderOutput(stage, payload, opts = {}) {
     return;
   }
 
+  if (kind === 'lyricshow' && prev === 'lyricshow' && updateLyricShowInPlace(stage, payload)) {
+    setKind(stage, 'lyricshow');
+    return;
+  }
+
   // 全量重建
   stopActiveVideo();
+  // 歌词背景视频：先释放解码器再移除
+  stage.querySelectorAll('video.lshow-media').forEach((v) => {
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch { /* ignore */ }
+  });
   stage.innerHTML = '';
   stage.classList.add('out-stage');
   stage.classList.remove('is-black', 'is-idle', 'is-lobby', 'is-blank', 'is-bible');
@@ -259,6 +269,12 @@ export function renderOutput(stage, payload, opts = {}) {
   if (kind === 'black') {
     stage.classList.add('is-black');
     setKind(stage, 'black');
+    return;
+  }
+
+  if (kind === 'lyricshow') {
+    renderLyricShowInto(stage, payload, opts);
+    setKind(stage, 'lyricshow');
     return;
   }
 

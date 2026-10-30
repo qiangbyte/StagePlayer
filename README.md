@@ -18,6 +18,7 @@
 | 📖 圣经投屏 | 内置和合本，经文大字投屏，一页装不下自动分页 |
 | 🎤 伴奏 | 「仅伴奏」实时消人声；AI 人声分离（HTDemucs ONNX，需模型，见 `src-tauri/resources/models/README.txt`）；伴奏导出 WAV |
 | 📝 歌词 | 自动读取同目录同名 `.lrc` / `.txt` |
+| 🎶 歌词投屏 | 独立歌词库：粘贴歌词用 `[主歌1]` `[副歌]` `[桥段]` 标段落（不标则按空行分段、重复段落自动认作副歌）；大屏当前行居中滚动、上下渐隐，或整段显示；一键跳副歌；背景可选流动渐变（6 套配色 / 自选主色 / 随机）、图片（可从图片取色）、循环视频；可加入节目单 |
 | 🔊 声压 | 实时 A/C/Z 计权声压级、Fast/Slow、RTA 频谱、曲线快照 |
 | 💾 数据 | 节目单与设置自动保存到 `%APPDATA%\com.stageplayer.app\store.json`，每 10 分钟轮转备份到 `backups/`（保留 20 份）；节目单面板「导出 / 导入」可把单场演出存为 `.json`，换电脑时会提示本机缺失的媒体 |
 
@@ -35,6 +36,7 @@ npm run build     # 打包 NSIS 安装包
 - `空格`：音频播放/暂停
 - `F`：打开并全屏输出窗口
 - `B`：黑屏 / 恢复
+- 歌词投屏：`↑` `↓` / `空格` 换行，`C` 副歌（连按轮换）、`V` 主歌、`Q` 桥段、`P` 预副歌、`E` 尾声，`1`–`9` 第几段，`Home` 回开头，`Enter` 投屏；节目单里当前条是歌词时 `↑` `↓` 与字母键同样可用（`←` `→` / `Enter` 仍是走台）
 
 ## 支持格式
 
@@ -67,6 +69,7 @@ src/                  前端（主控窗口 + 输出窗口）
   js/program-blank.js 空白歌曲页面板；program-bible.js 圣经经文面板
   js/program-lobby.js 大厅页（开场倒计时）；program-cue.js 定时开播
   js/program-io.js    单场演出导出 / 导入
+  js/lyrics-show.js   歌词投屏（歌词库、逐行控制、段落跳转）；lyrics-show-render.js 段落解析 + 扩展屏渲染
   js/boot.js          入口：先恢复存档再加载 main.js；store-sync.js 负责 localStorage ⇄ store.json
 src-tauri/
   src/pptx.rs         PPTX 解析（zip + roxmltree，提取文本/图片/背景/坐标，图片转 dataURL；后台线程执行）
