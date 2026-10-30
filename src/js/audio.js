@@ -8,7 +8,7 @@ import { decodeWaveNative, decodeWaveWeb } from './audio-wave.js';
 import {
   initStemProgressUi, showStemProgressPanel, hideStemProgressPanel,
 } from './audio-stem-ui.js';
-import { pushToOutput, getCurrentOutput } from './output-main.js';
+import { pushToOutput, clearOutput, getCurrentOutput, currentOutputSeq } from './output-main.js';
 import { loadLyricsFor, activeLyricIndex } from './lyrics.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
@@ -674,6 +674,8 @@ function loadFile(path, autoplay = true, opts = {}) {
   const skipList = opts.skipList ?? stay;
   // stay（节目单叠播）默认不推音频卡，避免盖掉 PPT/经文画面
   const pushOutput = opts.pushOutput ?? (!stay && !!$('audio-auto-push')?.checked);
+  // 按下播放那一刻的输出世代：出声要等 IPC，期间按了黑屏/切走则标题卡不再推送
+  const outSeq = pendingOutputSeq ?? currentOutputSeq();
 
   currentPath = path;
   pos = 0;
@@ -700,7 +702,7 @@ function loadFile(path, autoplay = true, opts = {}) {
     // 把播放结果返回给节目单 activate，避免 cue 误标「已开播」
     return playP
       .then(() => {
-        if (pushOutput) pushCard().catch(() => {});
+        if (pushOutput) pushCard(outSeq).catch(() => {});
         paintSongActive();
       })
       .catch((err) => {
@@ -790,9 +792,11 @@ function songTitleParts() {
 }
 
 /** 推送扩展屏：有同名 .lrc/.txt 则滚歌词，否则标题卡 */
-async function pushCard() {
+async function pushCard(seqAtPlay) {
   if (!currentPath) return;
   const { title, sub } = songTitleParts();
+  // 找歌词要等文件读取：先记下当前世代，期间若手动黑屏/切走则不再推送
+  const seq = seqAtPlay ?? pendingOutputSeq ?? currentOutputSeq();
   try {
     const pack = await loadLyricsFor(currentPath, convertSrc);
     if (pack?.lines?.length) {
@@ -807,7 +811,7 @@ async function pushCard() {
         timed: !!pack.timed,
         active,
         path: currentPath,
-      }, pendingOutputSeq);
+      }, seq);
       return;
     }
   } catch {
@@ -818,7 +822,7 @@ async function pushCard() {
     title,
     sub,
     path: currentPath,
-  }, pendingOutputSeq);
+  }, seq);
 }
 
 function syncLyricsOutput() {
@@ -1584,7 +1588,7 @@ export function initAudio() {
     $('audio-title').textContent = '未选择音频';
     updatePlayBtn();
     renderList();
-    pushToOutput({ kind: 'clear' });
+    clearOutput();
   });
 
   window.addEventListener('resize', () => { draw(); drawSpectrum(); drawVU(); });

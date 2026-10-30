@@ -83,6 +83,48 @@ pub async fn copy_file(
     Ok(n)
 }
 
+/// 写文本文件（导出节目单）：目标必须是保存对话框里选的路径
+#[tauri::command]
+pub async fn write_text_file(
+    approved: State<'_, ApprovedSavePaths>,
+    path: String,
+    text: String,
+) -> Result<(), String> {
+    approved.check(&path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入失败: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 读节目单导出文件（只允许 .json，最大 50MB）
+#[tauri::command]
+pub async fn read_show_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+            return Err("只能导入 .json 节目单文件".into());
+        }
+        let len = std::fs::metadata(p).map_err(|e| e.to_string())?.len();
+        if len > 50 * 1024 * 1024 {
+            return Err("文件过大".into());
+        }
+        std::fs::read_to_string(p).map_err(|e| format!("读取失败: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 返回其中实际存在的文件（保持原顺序）；用于找歌词、检查导入节目单的媒体是否在本机
+#[tauri::command]
+pub async fn existing_files(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).is_file())
+        .collect()
+}
+
 /// 原生生成图片缩略图（最长边 320px 的 JPEG dataURL）
 /// 在 Rust 侧解码，避免 WebView 渲染进程解码高清原图导致 OOM；失败返回 None
 #[tauri::command]

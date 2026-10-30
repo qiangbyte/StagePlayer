@@ -1,6 +1,9 @@
 // 输出窗口入口
 
-import { OUTPUT_EVENT, VIDEO_CTRL_EVENT, renderOutput, controlVideo, applyFitMode } from './output-core.js';
+import {
+  OUTPUT_EVENT, VIDEO_CTRL_EVENT, VIDEO_TIME_EVENT, renderOutput, controlVideo, applyFitMode,
+  reportVideoTime,
+} from './output-core.js';
 import { listen, emit, invoke, lsGet } from './util.js';
 
 const stage = () => document.getElementById('output-stage');
@@ -18,6 +21,9 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (frozen) return;
     renderOutput(stage(), e.payload);
     applyFitMode(stage(), lsGet('sp.output.fit', 'contain'));
+    if (e.payload?.kind === 'video') {
+      reportVideoTime(stage(), e.payload.path, (rep) => emit(VIDEO_TIME_EVENT, rep).catch(() => {}));
+    }
   });
   await listen('output:config', (e) => {
     if (e.payload?.fitMode) applyFitMode(stage(), e.payload.fitMode);

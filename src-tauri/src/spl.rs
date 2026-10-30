@@ -233,7 +233,8 @@ fn emit_loop(app: AppHandle, shared: Arc<SharedMeter>) {
         if !shared.running.load(Ordering::Relaxed) {
             continue;
         }
-        let _ = app.emit("spl:tick", make_tick(&shared));
+        // 只发主控窗口：输出窗口用不到，每秒 15 次广播是白白序列化
+        let _ = app.emit_to("main", "spl:tick", make_tick(&shared));
     }
 }
 

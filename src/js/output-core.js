@@ -1,12 +1,14 @@
 // 输出内容核心：渲染任意输出载荷（主控预览 & 输出窗口共用）
 
 import { renderSlide, makeSlideCanvas } from './slide-render.js';
-import { convertFileSrc, fmtTimeLong } from './util.js';
+import { convertFileSrc, fmtTimeLong, invoke } from './util.js';
 import { renderBlankInto } from './blank-page.js';
 import { renderBibleInto, updateBibleDom } from './bible-page.js';
 
 export const OUTPUT_EVENT = 'output:set';
 export const VIDEO_CTRL_EVENT = 'output:video';
+/** 输出窗口 → 主控：视频实际播放进度（以观众看到的为准） */
+export const VIDEO_TIME_EVENT = 'output:video-time';
 
 let activeVideo = null;
 let lobbyTimer = null;
@@ -346,6 +348,25 @@ export function renderOutput(stage, payload, opts = {}) {
     return;
   }
 
+  if (kind === 'video' && opts.videoPoster) {
+    // 主控预览不再自己解码一份视频：显示缩略图 + 输出窗口回报的进度
+    const ph = document.createElement('div');
+    ph.className = 'out-video-poster';
+    const img = document.createElement('img');
+    img.className = 'out-fit';
+    img.draggable = false;
+    const badge = document.createElement('span');
+    badge.className = 'out-video-time';
+    badge.textContent = '▶ 输出中';
+    ph.append(img, badge);
+    stage.appendChild(ph);
+    setKind(stage, 'video');
+    invoke('make_video_thumb', { path: payload.path })
+      .then((url) => { if (url) img.src = url; })
+      .catch(() => {});
+    return;
+  }
+
   if (kind === 'video') {
     const v = document.createElement('video');
     v.className = 'out-fit';
@@ -416,6 +437,30 @@ export function applyFitMode(stage, mode) {
 }
 
 /** 输出端视频控制 */
+/** 更新主控预览上的视频进度角标（rep 来自 VIDEO_TIME_EVENT） */
+export function paintVideoTime(stage, rep) {
+  const badge = stage?.querySelector('.out-video-time');
+  if (!badge || !rep) return;
+  const state = rep.ended ? '■ 已播完' : rep.paused ? '⏸ 已暂停' : '▶ 输出中';
+  badge.textContent = `${state} ${fmtTimeLong(rep.t)} / ${fmtTimeLong(rep.d)}`;
+}
+
+/** 输出窗口：把当前视频的实际进度回报给主控（timeupdate 约 4 次/秒） */
+export function reportVideoTime(stage, path, send) {
+  const v = stage?.querySelector('video');
+  if (!v) return;
+  const report = () => send({
+    path,
+    t: v.currentTime || 0,
+    d: Number.isFinite(v.duration) ? v.duration : 0,
+    paused: v.paused,
+    ended: v.ended,
+  });
+  for (const ev of ['loadedmetadata', 'timeupdate', 'play', 'pause', 'ended', 'seeked']) {
+    v.addEventListener(ev, report);
+  }
+}
+
 export function controlVideo(action, value) {
   if (!activeVideo && action !== 'stop') return;
   switch (action) {

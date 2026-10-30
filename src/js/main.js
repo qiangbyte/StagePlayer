@@ -9,8 +9,8 @@ import { initProgram, programGo, programStep, programActiveType } from './progra
 import { initSpl } from './spl.js';
 import { initKaraoke } from './karaoke.js';
 import {
-  setPreviewEl, pushToOutput, getCurrentOutput, pushFitMode,
-  setOutputFrozen, isOutputFrozen, resyncOutput,
+  setPreviewEl, getCurrentOutput, pushFitMode, toggleBlack, setOutputFrozen, isOutputFrozen,
+  resyncOutput,
 } from './output-main.js';
 import { invoke, listen, lsGet, lsSet, toast } from './util.js';
 
@@ -250,7 +250,7 @@ function initOutputControls() {
   });
   btnClose.addEventListener('click', () => closeOutputFromMain());
   $('btn-black').addEventListener('click', () => {
-    pushToOutput(getCurrentOutput().kind === 'black' ? { kind: 'clear' } : { kind: 'black' });
+    toggleBlack();
   });
   const btnFreeze = $('btn-freeze');
   btnFreeze.addEventListener('click', () => {
@@ -342,7 +342,7 @@ function initKeyboard() {
         break;
       case 'b':
       case 'B':
-        pushToOutput(getCurrentOutput().kind === 'black' ? { kind: 'clear' } : { kind: 'black' });
+        toggleBlack();
         break;
       case 'Escape':
         // 礼拜中易误触：二次确认后再关扩展屏
@@ -363,7 +363,7 @@ function initKeyboard() {
   });
 }
 
-window.addEventListener('DOMContentLoaded', () => {
+function boot() {
   window.addEventListener('error', (e) => {
     toast('错误：' + (e.message || e.error), 6000);
   });
@@ -388,4 +388,8 @@ window.addEventListener('DOMContentLoaded', () => {
   initKaraoke();
   // 默认进入节目单：按一场演出的时间顺序走台
   switchModule('program');
-});
+}
+
+// 由 boot.js 在数据恢复后动态加载，此时 DOM 通常已就绪
+if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', boot);
+else boot();

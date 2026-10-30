@@ -1,5 +1,7 @@
 // 歌词：同目录同名 .lrc / .txt 解析与当前行定位
 
+import { invoke } from './util.js';
+
 /** @type {Map<string, { timed: boolean, lines: { t: number, text: string }[], title?: string, artist?: string }|null>} */
 const cache = new Map();
 
@@ -10,6 +12,23 @@ function stripExt(p) {
 function candidatesFor(audioPath) {
   const base = stripExt(audioPath);
   return [`${base}.lrc`, `${base}.LRC`, `${base}.txt`, `${base}.TXT`];
+}
+
+/** 先由后端一次判断哪些候选存在，避免逐个请求 404（Windows 不分大小写，去重） */
+async function existingCandidates(audioPath) {
+  const all = candidatesFor(audioPath);
+  try {
+    const found = await invoke('existing_files', { paths: all });
+    const seen = new Set();
+    return found.filter((p) => {
+      const k = p.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  } catch {
+    return all;
+  }
 }
 
 /** 解析 LRC；返回 null 表示不是有效 LRC */
@@ -71,7 +90,7 @@ export async function loadLyricsFor(audioPath, convertSrc) {
   if (!audioPath) return null;
   if (cache.has(audioPath)) return cache.get(audioPath);
 
-  for (const p of candidatesFor(audioPath)) {
+  for (const p of await existingCandidates(audioPath)) {
     try {
       const resp = await fetch(convertSrc(p));
       if (!resp.ok) continue;

@@ -1,7 +1,9 @@
 // 视频播放模块：目录 + 卡片网格 + 紧凑预览
 
 import { pickFiles, esc, fileName, lsGet, lsSet, fmtTime, fmtTimeLong, toast, VIDEO_EXT } from './util.js';
-import { pushToOutput, sendVideoControl, getCurrentOutput } from './output-main.js';
+import {
+  pushToOutput, clearOutput, sendVideoControl, getCurrentOutput, getOutputVideoReport,
+} from './output-main.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
   assignPath, listFolders, getSelectedFolder, FOLDER_UNCAT,
@@ -226,6 +228,37 @@ function loadInPreview(i, autoplay = false) {
   preview.addEventListener('loadedmetadata', onMeta, { once: true });
 }
 
+/** 程序内部的 play/pause（对时、面板隐藏）不转发给输出窗口 */
+let silentUntil = 0;
+/** 用户刚操作过时，输出窗口的回报可能还是旧状态，短时间内不据此对时 */
+let userCtlAt = 0;
+const DRIFT_MAX = 0.4;
+
+function silently(fn) {
+  silentUntil = performance.now() + 400;
+  fn();
+}
+function isSilent() { return performance.now() < silentUntil; }
+function panelVisible() { return !!$('panel-video')?.classList.contains('active'); }
+function outputIsMine() {
+  const out = getCurrentOutput();
+  return out.kind === 'video' && current >= 0 && out.path === videos[current];
+}
+
+/** 视频面板预览跟随输出窗口（输出窗口是观众看到的，以它为准） */
+function followOutput(rep, preview) {
+  if (!rep || !preview || !outputIsMine() || !panelVisible()) return;
+  if (performance.now() - userCtlAt < 800) return;
+  const elapsed = rep.paused ? 0 : (performance.now() - rep.at) / 1000;
+  const target = rep.t + elapsed;
+  if (preview.readyState >= 1 && Math.abs(preview.currentTime - target) > DRIFT_MAX) {
+    try { preview.currentTime = target; } catch { /* ignore */ }
+  }
+  const outPlaying = !rep.paused && !rep.ended;
+  if (outPlaying && preview.paused) silently(() => preview.play().catch(() => {}));
+  else if (!outPlaying && !preview.paused) silently(() => preview.pause());
+}
+
 function pushCurrent(outputSeq) {
   if (current < 0) return false;
   const preview = $('video-preview');
@@ -245,7 +278,9 @@ function pushCurrent(outputSeq) {
   }
   if (preview) {
     preview.muted = true;
-    preview.play().catch(() => {});
+    // 面板不可见时不解码预览，切回面板时再按输出进度对时
+    if (panelVisible()) silently(() => preview.play().catch(() => {}));
+    else silently(() => preview.pause());
   }
   updatePlayBtn();
   paintVideoActive();
@@ -365,16 +400,38 @@ export function initVideo() {
 
   preview.addEventListener('play', () => {
     updatePlayBtn();
+    if (isSilent()) return;
+    userCtlAt = performance.now();
     if (getCurrentOutput().kind === 'video') sendVideoControl('play');
   });
   preview.addEventListener('pause', () => {
     updatePlayBtn();
+    if (isSilent()) return;
+    userCtlAt = performance.now();
     if (getCurrentOutput().kind === 'video' && !preview.ended) sendVideoControl('pause');
   });
   preview.addEventListener('ended', () => {
     updatePlayBtn();
+    if (isSilent()) return;
     if (getCurrentOutput().kind === 'video') sendVideoControl('pause');
   });
+
+  document.addEventListener('sp:output-video-time', (e) => followOutput(e.detail, preview));
+  const panel = $('panel-video');
+  if (panel) {
+    let wasVisible = panelVisible();
+    new MutationObserver(() => {
+      const vis = panelVisible();
+      if (vis === wasVisible) return;
+      wasVisible = vis;
+      if (!outputIsMine()) return;
+      if (!vis) {
+        if (!preview.paused) silently(() => preview.pause());
+      } else {
+        followOutput(getOutputVideoReport(), preview);
+      }
+    }).observe(panel, { attributes: true, attributeFilter: ['class'] });
+  }
 
   btnPlay.addEventListener('click', () => {
     if (current < 0 && videos.length) return loadInPreview(0, true);
@@ -386,7 +443,7 @@ export function initVideo() {
   btnStop.addEventListener('click', () => {
     preview.pause();
     sendVideoControl('stop');
-    pushToOutput({ kind: 'clear' });
+    clearOutput();
     updatePlayBtn();
   });
 
@@ -400,6 +457,7 @@ export function initVideo() {
     const r = bar.getBoundingClientRect();
     const t = ((e.clientX - r.left) / r.width) * preview.duration;
     preview.currentTime = t;
+    userCtlAt = performance.now();
     if (getCurrentOutput().kind === 'video') sendVideoControl('seek', t);
   });
 
@@ -423,7 +481,7 @@ export function initVideo() {
     setPreviewTitle(null);
     fillVideoNote(null);
     sendVideoControl('stop');
-    pushToOutput({ kind: 'clear' });
+    clearOutput();
     timeEl.textContent = '00:00 / 00:00';
     fill.style.width = '0%';
     updatePlayBtn();

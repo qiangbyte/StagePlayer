@@ -2,7 +2,7 @@
 
 import * as pdfjsLib from '../lib/pdfjs/pdf.min.mjs';
 import { pickFiles, esc, fileName, convertFileSrc, lsGet, lsSet, toast } from './util.js';
-import { pushToOutput } from './output-main.js';
+import { pushToOutput, clearOutput, currentOutputSeq } from './output-main.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
   assignPath, listFolders, getSelectedFolder, FOLDER_ALL, FOLDER_UNCAT,
@@ -265,6 +265,8 @@ async function showPage(i, opts = {}) {
   const d = docs[currentDoc];
   if (!d?.pdfDoc || i < 0 || i >= d.numPages) return false;
   const seq = ++showSeq;
+  // 渲染需要时间：记下当前输出世代，期间手动黑屏则不再推送
+  const outSeq = opts.outputSeq ?? currentOutputSeq();
   try {
     const dataUrl = await renderPageDataUrl(d, i);
     if (seq !== showSeq) return false; // 已被更快的下一条取代
@@ -275,7 +277,7 @@ async function showPage(i, opts = {}) {
     } else if (currentModule() === 'pdf' && d.thumbs?.length) {
       highlightPdfPage(i);
     }
-    const ok = pushToOutput({ kind: 'pdf', dataUrl, index: i, total: d.numPages }, opts.outputSeq);
+    const ok = pushToOutput({ kind: 'pdf', dataUrl, index: i, total: d.numPages }, outSeq);
     if (ok === false) return false;
     // 预热相邻页，连按 Enter 更顺
     const warm = [i + 1, i - 1].filter((p) => p >= 0 && p < d.numPages && !pageCache.has(pageCacheKey(d.path, p)));
@@ -437,7 +439,7 @@ export function initPdf() {
     currentDoc = -1;
     currentPage = -1;
     persistPaths();
-    pushToOutput({ kind: 'clear' });
+    clearOutput();
     renderDocs();
     $('pdf-grid').innerHTML = '<div class="empty-tip big">导入 PDF 文件开始播放</div>';
     $('pdf-info').textContent = '';

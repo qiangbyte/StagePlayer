@@ -32,6 +32,7 @@ import {
   bindLobbyHost, tickLobbyAutoStart, defaultLobby, ensureLobby, fillLobbyForm, readLobbyForm,
   syncLobbyRemain, pushLobbyPage,
 } from './program-lobby.js';
+import { exportEvent, importEvent } from './program-io.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
@@ -275,6 +276,22 @@ export function initProgram() {
     syncAudioBar();
     fillLobbyForm();
     startRename();
+  });
+
+  $('pg-export')?.addEventListener('click', () => exportEvent(curEvent()));
+  $('pg-import')?.addEventListener('click', async () => {
+    const ev = await importEvent(genId);
+    if (!ev) return;
+    if (!ev.lobby) ev.lobby = defaultLobby(ev.name);
+    events.push(ev);
+    currentId = ev.id;
+    activeItemId = null;
+    save();
+    renderEvents();
+    renderItems();
+    updateNowBar();
+    syncAudioBar();
+    fillLobbyForm();
   });
 
   $('pg-add-mixed')?.addEventListener('click', () => addMixed());

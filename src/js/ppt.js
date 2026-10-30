@@ -1,7 +1,7 @@
 // PPT 播放模块：解析 pptx → 幻灯片网格 → 输出同步
 
 import { pickFiles, esc, fileName, invoke, lsGet, lsSet, toast } from './util.js';
-import { pushToOutput } from './output-main.js';
+import { pushToOutput, clearOutput } from './output-main.js';
 import { renderSlide, makeSlideCanvas } from './slide-render.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
@@ -333,7 +333,7 @@ export function initPpt() {
     currentDoc = -1;
     currentSlide = -1;
     persistPaths();
-    pushToOutput({ kind: 'clear' });
+    clearOutput();
     renderDocs();
     renderGrid();
   });

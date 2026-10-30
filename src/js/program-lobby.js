@@ -1,7 +1,7 @@
 // 节目单 · 大厅页：开场前倒计时画面、表单、到点自动开演
 
 import { fileName, toast, convertFileSrc, fmtTimeLong } from './util.js';
-import { pushToOutput, getCurrentOutput, isOutputFrozen } from './output-main.js';
+import { pushToOutput, claimOutputSeq, getCurrentOutput, isOutputFrozen } from './output-main.js';
 import { todayStr } from './program-cue.js';
 
 const $ = (id) => document.getElementById(id);
@@ -192,7 +192,7 @@ export function pushLobbyPage(openOutput = true) {
     toast('请先设置开始日期和时间');
     return false;
   }
-  pushToOutput(lobbyPayload(L, ev.name));
+  pushToOutput(lobbyPayload(L, ev.name), claimOutputSeq());
   armLobbyAutoStart(ev, L);
   if (openOutput) {
     document.dispatchEvent(new CustomEvent('sp:open-output', { detail: { fullscreen: true } }));

@@ -438,6 +438,8 @@
             <button class="mini-btn" id="pg-new" title="新建一场演出">＋新演出</button>
             <button class="mini-btn" id="pg-rename">重命名</button>
             <button class="mini-btn" id="pg-delete">删除</button>
+            <button class="mini-btn" id="pg-export" title="把当前演出导出为 .json 文件（备份 / 换电脑）">导出</button>
+            <button class="mini-btn" id="pg-import" title="从 .json 文件导入为一场新演出">导入</button>
           </div>
           <div class="panel-toolbar rename-row hidden" id="pg-rename-row">
             <input type="text" id="pg-rename-input" class="rename-input" placeholder="演出名称" />
@@ -720,6 +722,6 @@
       AI <span class="mono" id="stem-progress-chip-pct">0%</span>
     </button>
   </div>
-  <script type="module" src="js/main.js"></script>
+  <script type="module" src="js/boot.js"></script>
 </body>
 </html>

@@ -95,10 +95,15 @@ export function lsGetCached(key, fallback) {
   }
 }
 
+let lsWriteHook = null;
+/** 主窗口挂上：每次 lsSet 后通知落盘（见 store-sync.js） */
+export function setLsWriteHook(fn) { lsWriteHook = fn; }
+
 /** @returns {boolean} 是否写入成功 */
 export function lsSet(key, val) {
   try {
     localStorage.setItem(key, JSON.stringify(val));
+    lsWriteHook?.(key);
     return true;
   } catch (err) {
     const name = err?.name || '';

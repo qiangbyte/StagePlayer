@@ -1,13 +1,31 @@
 // 输出推送 + 主控预览
 
-import { OUTPUT_EVENT, renderOutput, applyFitMode } from './output-core.js';
-import { emit, lsGet } from './util.js';
+import {
+  OUTPUT_EVENT, VIDEO_TIME_EVENT, renderOutput, applyFitMode, paintVideoTime,
+} from './output-core.js';
+import { emit, listen, lsGet } from './util.js';
 
 let previewEl = null;
 let current = { kind: 'clear' };
 let frozen = false;
 /** 快速切条时只采纳最新一次输出 */
 let outputSeq = 0;
+/** 输出窗口最近一次回报的视频进度 { path, t, d, paused, ended, at } */
+let lastVideoReport = null;
+
+listen(VIDEO_TIME_EVENT, (e) => {
+  const rep = e.payload;
+  if (!rep || current.kind !== 'video' || rep.path !== current.path) return;
+  lastVideoReport = { ...rep, at: performance.now() };
+  paintVideoTime(previewEl, rep);
+  document.dispatchEvent(new CustomEvent('sp:output-video-time', { detail: lastVideoReport }));
+}).catch(() => {});
+
+/** 输出窗口正在放的视频进度（无回报 / 已换内容时为 null） */
+export function getOutputVideoReport() {
+  if (!lastVideoReport || current.kind !== 'video' || lastVideoReport.path !== current.path) return null;
+  return lastVideoReport;
+}
 
 export function fitMode() {
   return lsGet('sp.output.fit', 'contain');
@@ -44,9 +62,23 @@ export function currentOutputSeq() {
   return outputSeq;
 }
 
+/**
+ * 手动黑屏 / 恢复。先声明新世代：仍在路上的异步推送（如找完歌词才到的标题卡）会被丢弃，
+ * 否则刚按下的黑屏会被晚到的画面顶掉
+ */
+export function toggleBlack() {
+  const seq = claimOutputSeq();
+  return pushToOutput(current.kind === 'black' ? { kind: 'clear' } : { kind: 'black' }, seq);
+}
+
+/** 手动清屏（同样作废在途的异步推送） */
+export function clearOutput() {
+  return pushToOutput({ kind: 'clear' }, claimOutputSeq());
+}
+
 export function renderCurrent() {
   if (previewEl) {
-    renderOutput(previewEl, current, { muted: true });
+    renderOutput(previewEl, current, { muted: true, videoPoster: true });
     applyFitMode(previewEl, fitMode());
   }
 }

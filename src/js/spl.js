@@ -231,6 +231,8 @@ function renderSnapList() {
 
 function applyTick(t) {
   lastTick = t;
+  // 面板隐藏时只记最新数据（快照/对比仍可用），不重绘
+  if (!$('panel-spl')?.classList.contains('active')) return;
   const letter = respLetter(t.response);
   $('spl-a').textContent = fmt(t.splA);
   $('spl-c').textContent = fmt(t.splC);

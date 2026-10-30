@@ -6,12 +6,21 @@ mod output;
 mod pptx;
 mod spl;
 mod stem;
+mod store;
 mod wave;
 
 use tauri::Manager;
 
 pub fn run() {
     tauri::Builder::default()
+        // 必须最先注册：第二个实例在这里就退出，并把主窗口唤到前台
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(fileio::ApprovedSavePaths::default())
@@ -33,6 +42,13 @@ pub fn run() {
             fileio::copy_file,
             fileio::make_image_thumb,
             fileio::make_video_thumb,
+            fileio::existing_files,
+            fileio::write_text_file,
+            fileio::read_show_file,
+            store::store_load,
+            store::store_save,
+            store::store_backup,
+            store::store_dir,
             karaoke::vocal_cancel_export,
             pptx::parse_pptx,
             output::open_output_window,
