@@ -71,3 +71,5 @@ src-tauri/
 
 - 冒烟测试：设置 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后 `npm run dev`，再运行 `node scripts/cdp-smoke.mjs`
 - 内存/状态探针：`scripts/diag/`
+- 正式版测速：以同样的环境变量直接运行 `src-tauri/target/release/stage-player.exe`，再 `node scripts/diag/bench-release.mjs <音频> <视频> [pptx]`
+- 注意：开发版（`127.0.0.1:1430`）与正式版（`tauri.localhost`）页面来源不同，节目单等本地数据**互不共享**

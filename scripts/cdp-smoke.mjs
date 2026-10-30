@@ -106,7 +106,9 @@ function makeWav(filePath, seconds = 1, freq = 440) {
 
 async function main() {
   const pages = await getJson(`http://127.0.0.1:${PORT}/json`);
-  const page = pages.find((p) => p.title.includes('StagePlayer') || p.url.includes('tauri'));
+  // 正式版输出窗口也是 tauri.localhost，必须排除 output.html，否则会连到输出窗口
+  const page = pages.find((p) => p.title.includes('StagePlayer'))
+    || pages.find((p) => p.url.includes('tauri') && !p.url.includes('output.html'));
   if (!page) throw new Error('未找到主窗口 page: ' + JSON.stringify(pages));
   log(true, '连接 WebView2', page.title);
 
