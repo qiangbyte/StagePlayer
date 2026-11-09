@@ -4861,7 +4861,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "stem-splitter-core",
- "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

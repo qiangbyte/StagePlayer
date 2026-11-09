@@ -14,8 +14,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use strsim::jaro_winkler;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+#[cfg(test)]
+#[path = "lyric_follow_replay.rs"]
+mod replay_tests;
 
 const TARGET_SR: u32 = 16_000;
 const MODEL_DIR_NAME: &str = "streaming-paraformer-zh-en";
@@ -70,15 +73,6 @@ pub struct LyricLineIn {
   pub is_title: bool,
 }
 
-#[derive(Clone, Debug)]
-struct LyricLine {
-  song_id: u32,
-  is_title: bool,
-  raw_head: String,
-  head_pinyin: String,
-  tail_pinyin: String,
-  text: String,
-}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,61 +124,148 @@ fn emit(ev: FollowEvent) {
   }
 }
 
-fn to_clean_pinyin(text: &str) -> String {
+// ───────────────────────── 跟词引擎 ─────────────────────────
+//
+// 思路：把歌词和识别结果都拆成「一个字一个拼音音节」，用局部对齐（Smith-Waterman）
+// 找出主领「最新唱到的那个字」落在哪一行、第几个字：
+//   - 当前行唱过一半 → 预告下一句（armed，输出屏亮出下一句）
+//   - 当前行唱到 ~75%，或唱过 65% 后换气 / 断句 → 提前翻到下一句
+//   - 已经唱进后面的行（翻慢了）→ 直接追上
+//   - 只往后看几行，不往回跳：重复的副歌不会被前面同样的句子抢走
+//   - 一直有人声却对不上 → 按字数估时长往下推进（跟丢兜底），对上后自动接回
+
+/// 一个字的拼音，拆成声母 / 韵母，便于模糊比较
+#[derive(Clone, Debug, PartialEq)]
+struct Syl {
+  ini: &'static str,
+  fin: String,
+}
+
+const INITIALS: &[&str] = &[
+  "zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x", "r", "z",
+  "c", "s", "y", "w",
+];
+
+fn split_syl(py: &str) -> Syl {
+  for ini in INITIALS {
+    if let Some(rest) = py.strip_prefix(ini) {
+      if !rest.is_empty() {
+        return Syl { ini, fin: rest.to_string() };
+      }
+    }
+  }
+  Syl { ini: "", fin: py.to_string() }
+}
+
+/// 平翘舌、n/l、f/h 不分；前后鼻音不分；o/uo 不分（唱歌和方言口音常见）
+fn loose_ini(i: &str) -> &str {
+  match i {
+    "zh" => "z",
+    "ch" => "c",
+    "sh" => "s",
+    "l" => "n",
+    "f" => "h",
+    "y" | "w" => "",
+    other => other,
+  }
+}
+
+fn loose_fin(f: &str) -> String {
+  let f = f.strip_suffix('g').filter(|s| s.ends_with('n')).unwrap_or(f);
+  match f {
+    "uo" => "o".into(),
+    "ue" | "ve" | "üe" => "ue".into(),
+    other => other.to_string(),
+  }
+}
+
+/// 0..1：两个字读音有多像
+fn syl_sim(a: &Syl, b: &Syl) -> f32 {
+  if a == b {
+    return 1.0;
+  }
+  let fin_eq = loose_fin(&a.fin) == loose_fin(&b.fin);
+  if fin_eq && loose_ini(a.ini) == loose_ini(b.ini) {
+    0.85
+  } else if fin_eq {
+    0.5
+  } else if a.ini == b.ini && !a.ini.is_empty() {
+    0.3
+  } else {
+    0.0
+  }
+}
+
+/// 文本 → 音节序列（只取汉字；英文、标点、空格忽略）
+fn to_syls(text: &str) -> Vec<Syl> {
   text
     .chars()
     .filter_map(|c| c.to_pinyin())
-    .map(|p| p.plain().to_string())
-    .collect::<Vec<_>>()
-    .join("")
+    .map(|p| split_syl(p.plain()))
+    .collect()
 }
 
-fn take_tail(s: &str, max_len: usize) -> String {
-  let chars: Vec<char> = s.chars().collect();
-  if chars.len() <= max_len {
-    s.to_string()
-  } else {
-    chars[chars.len() - max_len..].iter().collect()
-  }
-}
-
-fn head_pinyin_of(text: &str) -> String {
-  let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
-  let n = chars.len().min(6);
-  to_clean_pinyin(&chars[..n].iter().collect::<String>())
-}
-
-fn tail_pinyin_of(text: &str) -> String {
-  // 用整句后半 / 前 8 字作「未唱先翻」锚点
-  let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
-  if chars.is_empty() {
-    return String::new();
-  }
-  let start = chars.len().saturating_sub(8).max(chars.len() / 2);
-  to_clean_pinyin(&chars[start..].iter().collect::<String>())
+#[derive(Clone, Debug)]
+struct LyricLine {
+  song_id: u32,
+  is_title: bool,
+  syls: Vec<Syl>,
+  text: String,
 }
 
 fn build_lines(raw: &[LyricLineIn]) -> Vec<LyricLine> {
   raw
     .iter()
-    .enumerate()
-    .map(|(_i, l)| LyricLine {
+    .map(|l| LyricLine {
       song_id: l.song_id,
       is_title: l.is_title,
-      raw_head: l.text.chars().take(12).collect(),
-      head_pinyin: head_pinyin_of(&l.text),
-      tail_pinyin: tail_pinyin_of(&l.text),
+      syls: if l.is_title { Vec::new() } else { to_syls(&l.text) },
       text: l.text.clone(),
     })
     .collect()
+}
+
+/// 只用识别结果最后这么多个字去对齐（更早的是已经翻过去的句子）
+const SPOKEN_TAIL: usize = 16;
+/// 往后最多看几行
+const LOOKAHEAD: usize = 3;
+/// 对齐分数门槛：约等于 3 个字读音完全一致
+const MIN_SCORE: f32 = 2.4;
+/// 跳过一行以上（唱漏 / 跳段）要求更高的分数，避免误跳
+const SKIP_SCORE: f32 = 4.0;
+/// 唱过这个比例：输出屏预告下一句
+const PREVIEW_AT: f32 = 0.5;
+/// 唱过这个比例：直接翻到下一句（提前量）
+const FLIP_AT: f32 = 0.75;
+/// 唱过这个比例后遇到换气 / 断句：翻到下一句
+const BREATH_FLIP_AT: f32 = 0.65;
+/// 换气判定：低于该电平持续一段时间
+const BREATH_DB: f32 = -42.0;
+const BREATH_MS: f32 = 250.0;
+/// 有人声的判定电平（跟丢兜底只在有人声时计时，间奏不会乱翻）
+const VOICE_DB: f32 = -40.0;
+
+struct Align {
+  line: usize,
+  /// 该行已唱到第几个字（含），从 0 开始
+  pos: usize,
+  score: f32,
 }
 
 struct FlipperEngine {
   lines: Vec<LyricLine>,
   curr: usize,
   armed: Option<usize>,
-  armed_at: Instant,
-  last_jump: Instant,
+  /// 当前行已唱比例 0..1
+  progress: f32,
+  /// 最近一次对上之后累计的人声时长（毫秒），用于跟丢兜底
+  voiced_ms: f32,
+  /// 当前连续低电平时长（毫秒），用于判定换气
+  quiet_ms: f32,
+  /// 开唱后至少对上过一次：之前（前奏、讲话）不做跟丢兜底
+  heard: bool,
+  /// 当前行是跟丢兜底推过来的（猜的）：允许被识别结果纠正回上一行
+  guessed: bool,
 }
 
 impl FlipperEngine {
@@ -194,89 +275,128 @@ impl FlipperEngine {
       lines,
       curr,
       armed: None,
-      armed_at: Instant::now(),
-      last_jump: Instant::now() - Duration::from_secs(10),
+      progress: 0.0,
+      voiced_ms: 0.0,
+      quiet_ms: 0.0,
+      heard: false,
+      guessed: false,
     }
   }
 
+  fn next_index(&self) -> Option<usize> {
+    let cur_song = self.lines.get(self.curr)?.song_id;
+    (self.curr + 1..self.lines.len())
+      .find(|&i| !self.lines[i].is_title)
+      .filter(|&i| self.lines[i].song_id == cur_song)
+  }
+
+  /// 把识别结果末尾对齐到「上一行（只作上下文）+ 当前行 + 后面几行」
+  fn align(&self, spoken: &[Syl]) -> Option<Align> {
+    let cur_song = self.lines.get(self.curr)?.song_id;
+    let from = if self.curr > 0 && self.lines[self.curr - 1].song_id == cur_song {
+      self.curr - 1
+    } else {
+      self.curr
+    };
+    // 目标串：(行号, 行内位置, 音节)
+    let mut target: Vec<(usize, usize, &Syl)> = Vec::new();
+    let mut shown = 0;
+    for li in from..self.lines.len() {
+      let l = &self.lines[li];
+      if l.song_id != cur_song {
+        break;
+      }
+      if li > self.curr {
+        shown += 1;
+        if shown > LOOKAHEAD {
+          break;
+        }
+      }
+      for (k, s) in l.syls.iter().enumerate() {
+        target.push((li, k, s));
+      }
+    }
+    if target.is_empty() || spoken.is_empty() {
+      return None;
+    }
+    const GAP: f32 = 0.7;
+    let n = spoken.len();
+    let m = target.len();
+    let mut prev = vec![0f32; m + 1];
+    let mut cur = vec![0f32; m + 1];
+    for i in 1..=n {
+      cur[0] = 0.0;
+      for j in 1..=m {
+        let sub = 2.0 * syl_sim(&spoken[i - 1], target[j - 1].2) - 1.0;
+        cur[j] = (prev[j - 1] + sub)
+          .max(prev[j] - GAP)
+          .max(cur[j - 1] - GAP)
+          .max(0.0);
+      }
+      std::mem::swap(&mut prev, &mut cur);
+    }
+    // prev 现在是最后一个识别字所在行：找对齐终点。分数相同取靠前的（重复句不往后乱跳）
+    let mut best_j = 0;
+    let mut best = 0f32;
+    for j in 1..=m {
+      if prev[j] > best + 1e-4 {
+        best = prev[j];
+        best_j = j;
+      }
+    }
+    if best_j == 0 {
+      return None;
+    }
+    let (line, pos, _) = target[best_j - 1];
+    Some(Align { line, pos, score: best })
+  }
+
   fn on_asr_partial(&mut self, spoken: &str) {
-    if self.last_jump.elapsed() < Duration::from_millis(2200) {
-      return;
-    }
-    let spoken_py = to_clean_pinyin(spoken);
-    if spoken_py.chars().count() < 4 {
-      return;
-    }
-    let Some(curr) = self.lines.get(self.curr) else {
+    let Some(curr_line) = self.lines.get(self.curr) else {
       return;
     };
 
-    // A. 口令
-    if spoken.contains("从头") || spoken.contains("主歌") || spoken.contains("第一段") {
-      if let Some(pos) = self
-        .lines
-        .iter()
-        .position(|l| l.song_id == curr.song_id && !l.is_title)
-      {
+    // 主领口令：跳回本曲开头
+    if spoken.contains("从头") || spoken.contains("第一段") {
+      let song = curr_line.song_id;
+      if let Some(pos) = self.lines.iter().position(|l| l.song_id == song && !l.is_title) {
         if pos != self.curr {
           self.jump_to(pos, "主领口令：跳回本曲开头");
           return;
         }
       }
     }
-    if spoken.contains("副歌") || spoken.contains("再来") {
-      // 跳到同曲内下一处更像副歌的行：首句匹配失败时仅提示
-      emit(FollowEvent {
-        kind: "partial".into(),
-        message: "识别到副歌口令".into(),
-        text: Some(spoken.to_string()),
-        index: Some(self.curr),
-        preview: self.armed,
-        rms_db: None,
-        percent: None,
-        busy: true,
-      });
-    }
 
-    // B. 刺客：同曲其它行首句
-    let tail_py = take_tail(&spoken_py, 18);
-    for (pos, line) in self.lines.iter().enumerate() {
-      if pos == self.curr || line.is_title || line.song_id != curr.song_id {
-        continue;
+    let all = to_syls(spoken);
+    let tail = &all[all.len().saturating_sub(SPOKEN_TAIL)..];
+    if let Some(a) = self.align(tail) {
+      if a.score >= MIN_SCORE {
+        self.heard = true;
       }
-      if line.head_pinyin.is_empty() {
-        continue;
-      }
-      let sim = jaro_winkler(&tail_py, &line.head_pinyin);
-      if sim > 0.86 {
-        self.jump_to(
-          pos,
-          &format!("突发跳段：匹配「{}」({:.2})", line.raw_head, sim),
-        );
-        return;
-      }
-    }
-
-    // C. 顺唱：当前句尾锚点 → Armed 下一句
-    if self.armed.is_none() && self.curr + 1 < self.lines.len() {
-      let next = &self.lines[self.curr + 1];
-      if next.song_id == curr.song_id && !next.is_title && !curr.tail_pinyin.is_empty() {
-        let hit = spoken_py.contains(&curr.tail_pinyin)
-          || jaro_winkler(&tail_py, &curr.tail_pinyin) > 0.85;
-        if hit {
-          self.armed = Some(self.curr + 1);
-          self.armed_at = Instant::now();
-          emit(FollowEvent {
-            kind: "armed".into(),
-            message: format!("已唱到尾句锚点，等待换气翻到下一句"),
-            text: Some(spoken.to_string()),
-            index: Some(self.curr),
-            preview: Some(self.curr + 1),
-            rms_db: None,
-            percent: None,
-            busy: true,
-          });
+      if a.line < self.curr {
+        // 兜底推快了：主领其实还在上一行，退回去（只纠正猜的那一步，正常翻过的行不回退）
+        let len = self.lines[a.line].syls.len().max(1);
+        let p = (a.pos + 1) as f32 / len as f32;
+        if self.guessed && a.score >= MIN_SCORE && p < FLIP_AT {
+          self.jump_to(a.line, "兜底推快了：退回主领所在行");
+          self.set_progress(p);
         }
+      } else if a.line > self.curr {
+        let need = if Some(a.line) == self.next_index() { MIN_SCORE } else { SKIP_SCORE };
+        if a.score >= need {
+          // 主领已经唱进后面的行：追上，并按已唱进度继续判断
+          self.jump_to(a.line, "已唱到这一句：追上");
+          let len = self.lines[a.line].syls.len().max(1);
+          self.set_progress((a.pos + 1) as f32 / len as f32);
+        }
+      } else if a.line == self.curr && a.score >= MIN_SCORE {
+        let len = curr_line.syls.len().max(1);
+        let p = (a.pos + 1) as f32 / len as f32;
+        // 进度只进不退（识别结果偶尔回改）
+        if p > self.progress {
+          self.set_progress(p);
+        }
+        self.voiced_ms = 0.0;
       }
     }
 
@@ -287,21 +407,77 @@ impl FlipperEngine {
       index: Some(self.curr),
       preview: self.armed,
       rms_db: None,
-      percent: None,
+      percent: Some((self.progress * 100.0).clamp(0.0, 100.0)),
       busy: true,
     });
   }
 
-  fn on_rms(&mut self, rms_db: f32) {
-    let Some(target) = self.armed else {
+  fn set_progress(&mut self, p: f32) {
+    self.progress = p;
+    self.voiced_ms = 0.0;
+    if p >= FLIP_AT {
+      if let Some(n) = self.next_index() {
+        self.jump_to(n, "快唱完这一句：提前翻下一句");
+      }
       return;
-    };
-    let elapsed = self.armed_at.elapsed();
-    if elapsed > Duration::from_millis(500) && rms_db < -42.0 {
-      self.jump_to(target, "换气抢跑：提前翻下一句");
-    } else if elapsed > Duration::from_millis(1800) {
-      self.jump_to(target, "延时兜底：提前翻下一句");
     }
+    if p >= PREVIEW_AT && self.armed.is_none() {
+      if let Some(n) = self.next_index() {
+        self.armed = Some(n);
+        emit(FollowEvent {
+          kind: "armed".into(),
+          message: "已唱过半：预告下一句".into(),
+          text: Some(self.lines[n].text.clone()),
+          index: Some(self.curr),
+          preview: Some(n),
+          rms_db: None,
+          percent: Some(p * 100.0),
+          busy: true,
+        });
+      }
+    }
+  }
+
+  /// sidecar 断句（通常是一口气唱完、换气停顿）
+  fn on_endpoint(&mut self) {
+    if self.progress >= BREATH_FLIP_AT {
+      if let Some(n) = self.next_index() {
+        self.jump_to(n, "断句：翻下一句");
+      }
+    }
+  }
+
+  /// 每块麦克风音频调用一次：rms 电平 + 该块时长（毫秒）
+  fn on_rms(&mut self, rms_db: f32, ms: f32) {
+    if rms_db < BREATH_DB {
+      self.quiet_ms += ms;
+      if self.quiet_ms >= BREATH_MS && self.progress >= BREATH_FLIP_AT {
+        if let Some(n) = self.next_index() {
+          self.jump_to(n, "换气：提前翻下一句");
+          return;
+        }
+      }
+    } else {
+      self.quiet_ms = 0.0;
+    }
+    if rms_db > VOICE_DB {
+      self.voiced_ms += ms;
+      let limit = self.est_line_ms(self.curr) * 1.5;
+      if self.heard && self.voiced_ms > limit {
+        if let Some(n) = self.next_index() {
+          self.jump_to(n, "跟丢兜底：按时长推进");
+          self.guessed = true;
+        } else {
+          self.voiced_ms = 0.0;
+        }
+      }
+    }
+  }
+
+  /// 按字数估一句大概唱多久（与前端时间轴模式一致）
+  fn est_line_ms(&self, i: usize) -> f32 {
+    let chars = self.lines.get(i).map(|l| l.syls.len()).unwrap_or(0) as f32;
+    (1800.0 + chars * 360.0).clamp(2200.0, 9000.0)
   }
 
   fn jump_to(&mut self, target: usize, reason: &str) {
@@ -310,19 +486,18 @@ impl FlipperEngine {
     }
     self.curr = target;
     self.armed = None;
-    self.last_jump = Instant::now();
+    self.progress = 0.0;
+    self.voiced_ms = 0.0;
+    self.quiet_ms = 0.0;
+    self.guessed = false;
     emit(FollowEvent {
       kind: "jump".into(),
       message: reason.into(),
       text: Some(self.lines[target].text.clone()),
       index: Some(target),
-      preview: if target + 1 < self.lines.len() {
-        Some(target + 1)
-      } else {
-        None
-      },
+      preview: self.next_index(),
       rms_db: None,
-      percent: None,
+      percent: Some(0.0),
       busy: true,
     });
   }
@@ -331,6 +506,11 @@ impl FlipperEngine {
     if idx < self.lines.len() {
       self.curr = idx;
       self.armed = None;
+      self.progress = 0.0;
+      self.voiced_ms = 0.0;
+      self.quiet_ms = 0.0;
+      self.guessed = false;
+      self.heard = false;
     }
   }
 }
@@ -1005,6 +1185,7 @@ pub async fn lyric_follow_start(
                 engine.on_asr_partial(text);
               }
             }
+            "endpoint" => engine.on_endpoint(),
             "error" => {
               let msg = v
                 .get("message")
@@ -1033,7 +1214,7 @@ pub async fn lyric_follow_start(
               continue;
             }
             let db = rms_db(&samples);
-            engine.on_rms(db);
+            engine.on_rms(db, samples.len() as f32 * 1000.0 / TARGET_SR as f32);
             if last_level_emit.elapsed() >= Duration::from_millis(160) {
               last_level_emit = Instant::now();
               let hearing = db > -48.0;
