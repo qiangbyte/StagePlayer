@@ -115,11 +115,22 @@ function initSettings() {
   async function refreshAudioDevices() {
     try {
       const devices = await invoke('list_audio_output_devices');
-      const saved = lsGet('sp.audio.device', null);
+      // 声卡按名称记（插拔 USB 声卡后序号会变）；旧版只存了序号的，这里换成名称
+      let savedName = lsGet('sp.audio.deviceName', null);
+      const legacyIdx = lsGet('sp.audio.device', null);
+      if (!savedName && legacyIdx != null) {
+        const hit = devices.find((d) => d.index === +legacyIdx);
+        if (hit) {
+          savedName = hit.name;
+          lsSet('sp.audio.deviceName', savedName);
+          lsSet('sp.audio.device', null);
+        }
+      }
+      const missing = savedName && !devices.some((d) => d.name === savedName);
       selDevice.innerHTML = '<option value="">系统默认</option>' + devices.map((d) =>
-        `<option value="${d.index}">${escAttr(d.name)}${d.is_default ? '（系统默认）' : ''}</option>`
-      ).join('');
-      if (saved !== null && saved !== undefined) selDevice.value = String(saved);
+        `<option value="${escAttr(d.name)}">${escAttr(d.name)}${d.is_default ? '（系统默认）' : ''}</option>`
+      ).join('') + (missing ? `<option value="${escAttr(savedName)}">${escAttr(savedName)}（未连接，暂用系统默认）</option>` : '');
+      selDevice.value = savedName || '';
     } catch { /* ignore */ }
   }
 
@@ -131,7 +142,8 @@ function initSettings() {
 
   selDevice.addEventListener('change', () => {
     const v = selDevice.value;
-    lsSet('sp.audio.device', v === '' ? null : +v);
+    lsSet('sp.audio.deviceName', v === '' ? null : v);
+    lsSet('sp.audio.device', null);
     document.dispatchEvent(new CustomEvent('sp:audio-device-changed'));
   });
 

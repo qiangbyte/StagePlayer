@@ -22,6 +22,7 @@ let audioSearch = '';
 let selectedSongPath = null;
 
 const LS_DEVICE = 'sp.audio.device';
+const LS_DEVICE_NAME = 'sp.audio.deviceName';
 
 let currentPath = null;
 /** 引擎实际在播的文件（仅伴奏时为 AI 缓存伴奏 wav） */
@@ -29,8 +30,19 @@ let playPath = null;
 /** 源路径 → AI 伴奏缓存路径 */
 const instrumentalBySource = Object.create(null);
 let playing = false;
-let deviceIndex = lsGet(LS_DEVICE, null);
-let loopMode = 'all'; // all | one | none
+/** 声卡按名称选（旧设置只有序号时兼容传序号）；找不到时后端回落系统默认 */
+function deviceArgs() {
+  const name = lsGet(LS_DEVICE_NAME, null);
+  if (name) return { deviceName: name, deviceIndex: null };
+  const idx = lsGet(LS_DEVICE, null);
+  return { deviceName: null, deviceIndex: idx == null ? null : +idx };
+}
+const LS_LOOP = 'sp.audio.loopMode';
+let loopMode = ['all', 'one', 'none'].includes(lsGet(LS_LOOP, 'all')) ? lsGet(LS_LOOP, 'all') : 'all';
+/** 文件已不在磁盘上的歌（卡片标红；自动续播时跳过） */
+const missingPaths = new Set();
+/** 当前曲的频谱用单声道数据：长期缓存不存它，单独留一份，重播 / 单曲循环时电平表不至于不动 */
+let monoSlot = null;
 
 /** 引擎当前音量（渐起渐弱过程中与滑条目标可能不同） */
 let engineVol = 0.9;
@@ -365,20 +377,19 @@ function paintVocalButtons(path) {
 async function switchPlaybackFile(filePath, at, wasPlaying) {
   playPath = filePath;
   seekGuardUntil = Date.now() + 800;
+  engineVol = volume();
+  // 暂停中切换：直接以暂停状态打开，不漏出一小段声音
   await invoke('audio_play', {
     path: filePath,
-    deviceIndex,
+    ...deviceArgs(),
     startAt: at > 0.05 ? at : null,
     vocalCancel: false,
+    volume: engineVol,
+    paused: !wasPlaying,
   });
-  setEngineVol(volume());
+  syncVolReadout();
   pos = at;
-  if (!wasPlaying) {
-    await invoke('audio_pause');
-    playing = false;
-  } else {
-    playing = true;
-  }
+  playing = !!wasPlaying;
   updatePlayBtn();
   paintSongActive();
 }
@@ -691,6 +702,8 @@ async function startPlayback(startAt = 0, opts = {}) {
   const at = Number.isFinite(startAt) && startAt > 0 ? startAt : (cue.startAt || 0);
   fadeOutStarted = false;
   cancelFade();
+  // 起播期间引擎里还是旧歌：先不认它，旧歌此时报的「播完」一律忽略
+  playPath = null;
 
   // 仅伴奏：若已缓存则播 AI 伴奏；未缓存则先原曲（可再点按钮触发分离）
   if (getItemVocalCancel(currentPath) && !instrumentalBySource[currentPath]) {
@@ -711,23 +724,29 @@ async function startPlayback(startAt = 0, opts = {}) {
     if (tip) tip.textContent = '仅伴奏未就绪 · 先播原唱，可点卡片「仅伴奏」生成';
   }
 
-  // audio_play 本身会换曲，无需先 stop（少一次 IPC）
+  // audio_play 本身会换曲，无需先 stop（少一次 IPC）；起播音量随命令一起给，
+  // 渐起时从 0 开始，不会先按旧音量响一下
+  const target = volume();
+  const withFade = cue.fadeIn > 0 && !opts.noFade;
   await invoke('audio_play', {
     path: playPath,
-    deviceIndex,
+    ...deviceArgs(),
     startAt: at > 0 ? at : null,
     vocalCancel: false,
+    volume: withFade ? 0 : target,
+    paused: !!opts.paused,
   });
+  missingPaths.delete(currentPath);
   pos = at;
-  const target = volume();
-  if (cue.fadeIn > 0 && !opts.noFade) {
+  if (withFade) {
     engineVol = 0;
-    setEngineVol(0);
+    syncVolReadout();
     fadeTo(target, cue.fadeIn);
   } else {
-    setEngineVol(target);
+    engineVol = target;
+    syncVolReadout();
   }
-  playing = true;
+  playing = !opts.paused;
   updatePlayBtn();
   fillCueBar(currentPath);
   // 起播路径默认不整表重渲，只刷高亮
@@ -761,7 +780,7 @@ async function play() {
 export async function toggleAudio() {
   if (!currentPath) {
     const first = eventAudioItems()[0];
-    if (first) return loadFile(first.path, true, { skipList: true });
+    if (first) return loadFile(first.path, true, { skipList: true }).catch(() => {});
     toast('请先导入音频');
     return;
   }
@@ -801,6 +820,8 @@ function loadFile(path, autoplay = true, opts = {}) {
   const pushOutput = opts.pushOutput ?? (!stay && !!$('audio-auto-push')?.checked);
   // 按下播放那一刻的输出世代：出声要等 IPC，期间按了黑屏/切走则标题卡不再推送
   const outSeq = pendingOutputSeq ?? currentOutputSeq();
+  // 新歌打不开时用来回到原来那首（后端会让它继续放）
+  const prev = { currentPath, playPath, playSource, currentName, selectedSongPath };
 
   playSource = opts.source || (stay ? 'program' : 'library');
   currentPath = path;
@@ -831,11 +852,21 @@ function loadFile(path, autoplay = true, opts = {}) {
         if (pushOutput) pushCard(outSeq).catch(() => {});
         paintSongActive();
       })
-      .catch((err) => {
-        playing = false;
-        updatePlayBtn();
-        paintSongActive();
-        toast('播放失败：' + err);
+      .catch(async (err) => {
+        const msg = errText(err);
+        if (/文件不存在/.test(msg)) {
+          missingPaths.add(path);
+          paintMissing();
+        }
+        const restored = await restoreAfterFailedLoad(path, prev);
+        if (!restored && currentPath === path) {
+          playing = false;
+          updatePlayBtn();
+          paintSongActive();
+        }
+        if (!opts.quietError) {
+          toast(`无法播放：${msg}${restored ? '（原来的歌继续播放）' : ''}`, 6000);
+        }
         throw err;
       });
   }
@@ -849,6 +880,73 @@ function loadFile(path, autoplay = true, opts = {}) {
   if (!skipList) requestAnimationFrame(() => renderList());
   scheduleBuildWave(path);
   return Promise.resolve();
+}
+
+function errText(err) {
+  return String(err?.message || err || '未知错误');
+}
+
+/**
+ * 新歌没打开（文件丢失 / 格式不支持）：后端没动原来那首。
+ * 若它还在引擎里，界面回到那首，别显示成「停了」
+ */
+async function restoreAfterFailedLoad(failedPath, prev) {
+  if (!prev?.playPath || currentPath !== failedPath) return false;
+  let st = null;
+  try { st = await invoke('audio_state'); } catch { return false; }
+  if (!st?.exists || st.path !== prev.playPath || currentPath !== failedPath) return false;
+  currentPath = prev.currentPath;
+  playPath = prev.playPath;
+  playSource = prev.playSource;
+  currentName = prev.currentName;
+  selectedSongPath = prev.selectedSongPath;
+  const titleEl = $('audio-title');
+  if (titleEl) titleEl.textContent = currentName;
+  fillCueBar(currentPath);
+  applyWaveCache(currentPath);
+  scheduleBuildWave(currentPath);
+  bindAudioMeta(currentPath);
+  playing = !!st.playing;
+  pos = st.position;
+  seekGuardUntil = 0;
+  updatePlayBtn();
+  paintSongActive();
+  return true;
+}
+
+/** 卡片上标出「文件丢失」 */
+function paintMissing() {
+  const list = $('audio-song-list');
+  list?.querySelectorAll('.audio-card').forEach((card) => {
+    const miss = missingPaths.has(card.dataset.path);
+    card.classList.toggle('is-missing', miss);
+    let badge = card.querySelector('.audio-card-missing');
+    if (miss && !badge) {
+      badge = document.createElement('div');
+      badge.className = 'audio-card-missing';
+      badge.textContent = '文件丢失';
+      badge.title = '电脑上找不到这个文件（被移动、改名或 U 盘没插）';
+      card.querySelector('.audio-card-body')?.appendChild(badge);
+    } else if (!miss && badge) {
+      badge.remove();
+    }
+  });
+}
+
+let missingCheckToken = 0;
+/** 列表渲染后检查文件是否还在（空闲时做，不挡交互） */
+function checkMissing(paths) {
+  const token = ++missingCheckToken;
+  if (!paths.length) return;
+  invoke('existing_files', { paths }).then((have) => {
+    if (token !== missingCheckToken || !Array.isArray(have)) return;
+    const ok = new Set(have);
+    for (const p of paths) {
+      if (ok.has(p)) missingPaths.delete(p);
+      else missingPaths.add(p);
+    }
+    paintMissing();
+  }).catch(() => {});
 }
 
 function bindAudioMeta(path) {
@@ -872,16 +970,22 @@ function applyWaveCache(path) {
   peaks = hit.peaks;
   waveDur = hit.waveDur;
   sampleRate = hit.sampleRate;
-  // 长期缓存不再含 mono；频谱仅当前曲 decode 时才有
-  mono = hit.mono || null;
-  monoSr = hit.monoSr || 0;
+  // 长期缓存不含 mono；频谱数据单独留给当前曲（重播 / 单曲循环仍有电平表）
+  const slot = monoSlot?.path === path ? monoSlot : null;
+  mono = slot?.mono || null;
+  monoSr = slot?.monoSr || 0;
   updateTech();
   draw();
   return true;
 }
 
+/** 波形已缓存且频谱数据也在手 → 不必再解码 */
+function waveReady(path) {
+  return waveCache.has(path) && monoSlot?.path === path;
+}
+
 function scheduleBuildWave(path) {
-  if (waveCache.has(path)) return;
+  if (waveReady(path)) return;
   const token = ++waveBuildToken;
   // 等播放 IPC 先走完，再在空闲时解码
   setTimeout(() => {
@@ -900,7 +1004,7 @@ function step(d) {
   if (!items.length) return false;
   const idx = items.findIndex((i) => i.path === currentPath);
   const next = items[(((idx < 0 ? 0 : idx) + d) % items.length + items.length) % items.length];
-  loadFile(next.path, true);
+  loadFile(next.path, true).catch(() => {});
   return true;
 }
 
@@ -963,7 +1067,7 @@ function syncLyricsOutput() {
 }
 
 async function buildWave(path, token = waveBuildToken) {
-  if (waveCache.has(path)) {
+  if (waveReady(path)) {
     if (currentPath === path) applyWaveCache(path);
     return;
   }
@@ -982,6 +1086,7 @@ async function buildWave(path, token = waveBuildToken) {
     const isCur = token === waveBuildToken && currentPath === path;
     const md = isCur ? w.mono : null;
     const mdSr = isCur ? w.monoSr : 0;
+    if (isCur && md) monoSlot = { path, mono: md, monoSr: mdSr };
     // 缓存只存 peaks + 时长（约 4KB/首），不存整轨 PCM
     const pack = {
       peaks: arr,
@@ -1236,7 +1341,9 @@ function renderList() {
       </div>
     </div>`;
   }).join('');
+  paintMissing();
   scheduleDurProbe(items.map((it) => it.path));
+  checkMissing(items.map((it) => it.path));
 }
 
 function currentModule() {
@@ -1292,7 +1399,15 @@ export function initAudio() {
 
   initStemProgressUi();
 
-  listen('sp-audio-ended', () => {
+  listen('sp-audio-device-fallback', (e) => {
+    const name = e?.payload || '';
+    toast(`找不到声卡「${name}」，已改用系统默认输出。请检查连线或到设置里重选声卡`, 8000);
+  });
+
+  listen('sp-audio-ended', (e) => {
+    // 迟到的结束事件：手动换了歌之后旧歌才报结束 → 不能再把新歌跳走
+    const endedPath = e?.payload?.path;
+    if (endedPath && endedPath !== playPath) return;
     playing = false;
     updatePlayBtn();
     const fromProgram = playSource === 'program';
@@ -1304,7 +1419,7 @@ export function initAudio() {
           stay: true,
           pushOutput: false,
           skipList: true,
-        });
+        }).catch(() => {});
         return;
       }
       document.dispatchEvent(new CustomEvent('sp:program-audio-ended', {
@@ -1318,15 +1433,30 @@ export function initAudio() {
     if (!items.length) return;
     const idx = items.findIndex((i) => i.path === currentPath);
     if (currentPath && shouldRepeatCurrent(currentPath) && idx >= 0) {
-      return loadFile(items[idx].path, true, { source: 'library', skipList: true });
+      loadFile(items[idx].path, true, { source: 'library', skipList: true }).catch(() => {});
+      return;
     }
-    if (loopMode === 'none' && (idx < 0 || idx >= items.length - 1)) {
+    if (loopMode === 'none' && idx < 0) {
       paintSongActive();
       return;
     }
-    const next = items[(Math.max(0, idx) + 1) % items.length];
-    if (next) loadFile(next.path, true, { source: 'library', skipList: true });
+    autoAdvance(items, idx, 0);
   });
+
+  /** 播完续下一首；下一首丢失 / 打不开就提示并跳过，全都不行才停 */
+  function autoAdvance(items, idx, tries) {
+    const ni = Math.max(0, idx) + 1;
+    if (tries >= items.length || (loopMode === 'none' && ni >= items.length)) {
+      paintSongActive();
+      return;
+    }
+    const next = items[ni % items.length];
+    loadFile(next.path, true, { source: 'library', skipList: true, quietError: true }).catch((err) => {
+      if (currentPath !== next.path) return; // 期间已手动换歌
+      toast(`「${cardLabel(next)}」无法播放（${errText(err)}），已跳过`, 6000);
+      autoAdvance(items, ni % items.length, tries + 1);
+    });
+  }
 
   document.addEventListener('sp:program-changed', renderList);
 
@@ -1387,30 +1517,36 @@ export function initAudio() {
 
   // 切换声卡：与正常起播同一路径（含已生成的伴奏 wav）
   document.addEventListener('sp:audio-device-changed', async () => {
-    deviceIndex = lsGet(LS_DEVICE, null);
     if (!currentPath) return;
     try {
       const st = await invoke('audio_state');
-      const wasPlaying = st.playing || (st.exists && isEnginePath(st.path) && playing);
-      const at = st.exists && isEnginePath(st.path) ? st.position : pos;
+      const loaded = st.exists && isEnginePath(st.path);
+      // 当前没在引擎里（已停 / 播完）：只记设置，下次起播用新声卡
+      if (!loaded) {
+        toast('已切换音频输出设备（下次播放生效）');
+        return;
+      }
+      const wasPlaying = st.playing;
+      const at = st.position;
       cancelFade();
       fadeOutStarted = false;
       const file = effectivePlayPath(currentPath) || currentPath;
       playPath = file;
+      engineVol = volume();
       await invoke('audio_play', {
         path: file,
-        deviceIndex,
-        startAt: at,
+        ...deviceArgs(),
+        startAt: at > 0.05 ? at : null,
         vocalCancel: false,
+        volume: engineVol,
+        paused: !wasPlaying,
       });
-      setEngineVol(volume());
-      if (!wasPlaying) {
-        await invoke('audio_pause');
-        playing = false;
-      } else {
-        playing = true;
-      }
+      syncVolReadout();
+      playing = !!wasPlaying;
+      pos = at;
+      seekGuardUntil = Date.now() + 500;
       updatePlayBtn();
+      paintSongActive();
       toast('已切换音频输出设备');
     } catch (err) {
       toast('切换声卡失败：' + err);
@@ -1490,6 +1626,7 @@ export function initAudio() {
   }, 100);
 
   // 单击卡片即播；右上角切换 单曲循环 ↔ 自动下一首
+  let lastCardClick = { path: null, at: 0 };
   list?.addEventListener('click', (e) => {
     const item = e.target.closest('.audio-card, .song-row, .file-item');
     if (!item?.dataset.path) return;
@@ -1521,18 +1658,28 @@ export function initAudio() {
       toggleItemVocalCancel(item.dataset.path);
       return;
     }
+    // 同一张卡片 400ms 内的第二下当手抖忽略（否则刚开播就被暂停）
+    const now = Date.now();
+    if (item.dataset.path === lastCardClick.path && now - lastCardClick.at < 400) return;
+    lastCardClick = { path: item.dataset.path, at: now };
     selectedSongPath = item.dataset.path;
     fillCueBar(item.dataset.path);
-    if (item.dataset.path === currentPath && playing) {
-      invoke('audio_pause').then(() => {
-        playing = false;
-        updatePlayBtn();
-        paintSongActive();
-      }).catch((err) => toast('暂停失败：' + err));
+    if (item.dataset.path === currentPath) {
+      // 当前这首：播放中 → 暂停；暂停中 → 从原位置继续（不从头重播）
+      if (playing) {
+        cancelFade();
+        invoke('audio_pause').then(() => {
+          playing = false;
+          updatePlayBtn();
+          paintSongActive();
+        }).catch((err) => toast('暂停失败：' + err));
+      } else {
+        play();
+      }
       return;
     }
     // skipList：先出声，不在起播前整表重渲
-    loadFile(item.dataset.path, true, { skipList: true });
+    loadFile(item.dataset.path, true, { skipList: true }).catch(() => {});
   });
 
   $('audio-play').addEventListener('click', () => toggleAudio());
@@ -1581,12 +1728,7 @@ export function initAudio() {
     } catch (err) {
       try {
         const wasPlaying = playing;
-        await startPlayback(t, { noFade: true, skipList: true });
-        if (!wasPlaying) {
-          await invoke('audio_pause');
-          playing = false;
-          updatePlayBtn();
-        }
+        await startPlayback(t, { noFade: true, skipList: true, paused: !wasPlaying });
         pos = t;
         seekGuardUntil = Date.now() + 350;
         draw();
@@ -1678,10 +1820,23 @@ export function initAudio() {
   engineVol = volume();
   syncVolReadout();
   vol?.addEventListener('input', () => {
-    cancelFade();
-    setEngineVol(+vol.value);
-    lsSet(LS_VOL, +vol.value);
+    const v = +vol.value;
+    // 点在滑条轨道上会一下跳很多：大跳变用 0.15 秒滑过去，拖动时的小步照常即时跟手
+    if (Math.abs(v - engineVol) > 0.1) fadeTo(v, 0.15);
+    else {
+      cancelFade();
+      setEngineVol(v);
+    }
+    lsSet(LS_VOL, v);
     paintSongActive();
+  });
+  // 鼠标调完滑条 / 勾选框把焦点还给页面：否则空格不能暂停、←/→ 改的是音量而不是切歌
+  $('panel-audio')?.addEventListener('pointerup', (e) => {
+    const el = e.target.closest?.('input[type="range"], input[type="checkbox"]');
+    if (!el) return;
+    setTimeout(() => {
+      if (document.activeElement === el) el.blur();
+    }, 0);
   });
   $('audio-vol-unity')?.addEventListener('click', () => {
     if (!vol) return;
@@ -1715,6 +1870,8 @@ export function initAudio() {
   btnLoop.addEventListener('click', () => {
     cycleLoopMode();
   });
+  // 记住上次的循环方式（重启后不再默默回到列表循环）
+  paintLoopMode();
 
   btnPush.addEventListener('click', () => {
     if (currentPath) pushCard().catch(() => {});
@@ -1833,6 +1990,13 @@ export async function seekAudio(t) {
 
 export function cycleLoopMode() {
   loopMode = loopMode === 'all' ? 'one' : loopMode === 'one' ? 'none' : 'all';
+  lsSet(LS_LOOP, loopMode);
+  paintLoopMode();
+  return loopMode;
+}
+
+/** 底部循环按钮 + 节目单音乐条上的同款按钮 */
+function paintLoopMode() {
   const label = getLoopModeLabel();
   const btnLoop = $('audio-loop');
   if (btnLoop) btnLoop.textContent = label;
@@ -1841,7 +2005,6 @@ export function cycleLoopMode() {
     pgLoop.textContent = label;
     pgLoop.dataset.mode = loopMode;
   }
-  return loopMode;
 }
 
 export function getLoopModeLabel() {
