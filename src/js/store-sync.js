@@ -1,7 +1,7 @@
 // localStorage ⇄ 应用数据目录 store.json
 // localStorage 是运行时缓存（同步读写快）；store.json 是真正的存档，带自动备份
 // 启动：boot.js 先 hydrateFromFile()，再加载 main.js
-import { invoke, setLsWriteHook } from './util.js';
+import { invoke, setLsWriteHook, toast } from './util.js';
 
 const PREFIX = 'sp.';
 /** 内部标记，不进存档 */
@@ -33,10 +33,22 @@ function hasLocalData() {
 let lastSaved = '';
 let timer = 0;
 let saving = null;
+/** 保存排队执行：同时只有一次写盘，避免两次写同一个临时文件、旧快照后写完盖掉新快照 */
+let saveChain = Promise.resolve();
+let failWarned = false;
 
-async function saveNow({ backup = false } = {}) {
+function saveNow(opts = {}) {
   clearTimeout(timer);
   timer = 0;
+  const run = saveChain.then(() => saveOnce(opts));
+  saveChain = run.catch(() => {});
+  saving = run;
+  run.finally(() => { if (saving === run) saving = null; }).catch(() => {});
+  return run;
+}
+
+/** 轮到这次时才取快照，保证写下去的总是最新数据 */
+async function saveOnce({ backup = false } = {}) {
   const data = snapshotData();
   const body = JSON.stringify(data);
   if (body === lastSaved && !backup) {
@@ -46,14 +58,18 @@ async function saveNow({ backup = false } = {}) {
   const savedAt = Date.now();
   const json = `{"version":${VERSION},"savedAt":${savedAt},"data":${body}}`;
   try {
-    await (saving = invoke('store_save', { json, backup }));
+    await invoke('store_save', { json, backup });
     lastSaved = body;
     localStorage.setItem(SAVED_AT, String(savedAt));
     localStorage.removeItem(DIRTY);
+    failWarned = false;
   } catch (err) {
     console.warn('[store] 保存失败', err);
-  } finally {
-    saving = null;
+    // 连续失败只提醒一次（磁盘满 / 文件被占用等），成功后再失败会重新提醒
+    if (!failWarned) {
+      failWarned = true;
+      toast('数据保存到磁盘失败：' + err + '（改动暂存在本机缓存，请检查磁盘空间）', 8000);
+    }
   }
 }
 

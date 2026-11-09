@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>StagePlayer 演出播放器</title>
-  <link rel="stylesheet" href="css/app.css?v=audio-dock2" />
+  <link rel="stylesheet" href="css/app.css?v=audio-note3" />
 </head>
 <body>
   <div id="app">
@@ -173,10 +173,16 @@
             </div>
             <div class="lib-dock audio-pro" id="audio-dock">
               <div class="audio-dock-bar">
-                <button type="button" class="mini-btn" id="audio-extra-toggle" title="起播 / 渐变 / 备注">本曲设置</button>
+                <button type="button" class="mini-btn" id="audio-extra-toggle" title="起播点 / 渐起 / 渐弱">本曲设置</button>
                 <button type="button" class="mini-btn is-on" id="audio-monitor-toggle" title="显示/隐藏波形与计时">监视器</button>
                 <span class="audio-file" id="audio-title">未选择音频</span>
                 <span class="audio-tech mono" id="audio-tech">总时长 --:--:-- · 采样率 --</span>
+              </div>
+              <div class="media-note-bar audio-note-bar">
+                <span class="cue-kicker">备注</span>
+                <input type="text" id="audio-note" class="media-note-input" maxlength="200"
+                  placeholder="开播前提示，例如：等司仪介绍完再放…" />
+                <button type="button" class="mini-btn" id="audio-note-save">存备注</button>
               </div>
 
               <div class="audio-extra hidden" id="audio-extra">
@@ -197,12 +203,6 @@
                   </label>
                   <button type="button" class="mini-btn primary" id="audio-cue-apply">保存</button>
                   <span class="cue-tip" id="audio-cue-tip">先选一首歌</span>
-                </div>
-                <div class="media-note-bar">
-                  <span class="cue-kicker">备注</span>
-                  <input type="text" id="audio-note" class="media-note-input" maxlength="200"
-                    placeholder="开播前提示，例如：等司仪介绍完再放…" />
-                  <button type="button" class="mini-btn" id="audio-note-save">存备注</button>
                 </div>
               </div>
 
@@ -268,7 +268,7 @@
                   <span class="vol-db mono" id="audio-vol-db">-0.9 dB</span>
                 </span>
                 <button class="mini-btn" id="audio-vol-unity" title="音量回到 100%（0 dB）">0 dB</button>
-                <button class="mini-btn" id="audio-loop">列表循环</button>
+                <button class="mini-btn" id="audio-loop" title="列表策略：列表循环 / 全局单曲 / 顺序停。卡片右上角循环只改本曲">列表循环</button>
                 <button class="mini-btn" id="audio-push-card" title="推到扩展屏：有同名 .lrc/.txt 则滚歌词，否则标题卡">推送歌词/标题</button>
                 <button class="mini-btn hl" id="audio-karaoke" title="消除立体声中置人声（保留贝斯），导出 WAV 伴奏文件">消除人声导出</button>
                 <label class="check"><input type="checkbox" id="audio-auto-push" checked />自动推送</label>
@@ -419,11 +419,28 @@
                   <input type="text" id="lshow-title" class="lshow-title-input" placeholder="歌名" />
                 </div>
                 <button type="button" class="mini-btn accent" id="lshow-push" title="把当前行投到大屏（Enter）">投屏</button>
+                <button type="button" class="mini-btn" id="lshow-auto" title="语音跟词：听主领干声自动换行并预计下一句（需 ASR 模型）">自动播放</button>
                 <button type="button" class="mini-btn" id="lshow-to-program" title="加入当前节目单">加入节目单</button>
                 <button type="button" class="mini-btn danger" id="lshow-del">删除</button>
               </div>
               <div class="lshow-secs" id="lshow-secs"></div>
               <div class="lshow-keys hint-inline">↑↓ / 空格 换行 · C 副歌 · V 主歌 · Q 桥段 · P 预副歌 · E 尾声 · 1–9 第几段 · Home 回开头 · B 黑屏</div>
+              <div id="lshow-auto-bar" class="lshow-auto-bar hidden" aria-live="polite">
+                <div class="lshow-auto-hd">
+                  <span class="lshow-auto-kicker">自动跟词</span>
+                  <span class="lshow-auto-timer mono" id="lshow-auto-timer">—</span>
+                </div>
+                <div class="lshow-auto-mic" id="lshow-auto-mic">
+                  <span class="lshow-mic-dot" id="lshow-auto-mic-dot" data-state="off" title="干声接入状态"></span>
+                  <span class="lshow-mic-state" id="lshow-auto-mic-state">未听干声</span>
+                  <div class="lshow-mic-meter" title="干声电平" aria-hidden="true"><div class="lshow-mic-fill" id="lshow-auto-mic-fill"></div></div>
+                  <span class="lshow-mic-db mono" id="lshow-auto-mic-db">—</span>
+                  <select id="lshow-auto-mic-dev" class="lshow-mic-dev" title="主领干声输入设备"></select>
+                </div>
+                <div class="lshow-auto-now"><span class="muted">当前</span> <span id="lshow-auto-cur">—</span></div>
+                <div class="lshow-auto-next"><span class="lshow-auto-next-tag">预计下一句</span> <span id="lshow-auto-next">—</span></div>
+                <div class="lshow-auto-track" aria-hidden="true"><div class="lshow-auto-fill" id="lshow-auto-fill"></div></div>
+              </div>
               <div class="lshow-lines" id="lshow-lines"></div>
             </div>
             <div class="lshow-side" id="lshow-editor">
@@ -467,18 +484,32 @@
               <details class="lshow-box" open>
                 <summary>显示</summary>
                 <div class="lshow-form">
-                  <label>方式
-                    <select id="lshow-view">
-                      <option value="scroll">滚动（当前行居中）</option>
-                      <option value="stanza">整段显示</option>
+                  <label>显示模式
+                    <select id="lshow-mode">
+                      <option value="line">一句一句（滚动，当前句居中）</option>
+                      <option value="line2">两句两句（滚动）</option>
+                      <option value="page">一段一段（整段全亮，按段切换）</option>
                     </select>
                   </label>
-                  <label>每次
-                    <select id="lshow-step">
-                      <option value="1">一行</option>
-                      <option value="2">两行</option>
+                  <label>字体
+                    <select id="lshow-font">
+                      <option value="fzchs">方正粗黑宋简体</option>
+                      <option value="yahei">微软雅黑</option>
+                      <option value="hei">黑体</option>
+                      <option value="song">宋体</option>
                     </select>
                   </label>
+                  <label>切换动画（整段切换时）
+                    <select id="lshow-anim">
+                      <option value="fade">淡入</option>
+                      <option value="rise">上浮淡入</option>
+                      <option value="zoom">放大淡入</option>
+                      <option value="blur">模糊渐清</option>
+                      <option value="stagger">逐行出现</option>
+                      <option value="none">无动画（直接切换）</option>
+                    </select>
+                  </label>
+                  <span class="lshow-font-tip hidden" id="lshow-font-tip">本机未安装「方正粗黑宋简体」，暂用微软雅黑显示。安装字体后重启软件即可生效</span>
                   <label>字号 <input type="range" id="lshow-scale" min="0.6" max="1.6" step="0.05" value="1" /></label>
                   <label class="lshow-check"><input type="checkbox" id="lshow-show-label" checked /> 显示段落名（主歌 / 副歌）</label>
                   <label class="lshow-check"><input type="checkbox" id="lshow-show-title" /> 显示歌名</label>
@@ -501,7 +532,7 @@
               <span id="pg-audio-pos" class="mono">0:00</span>
               <input type="range" id="pg-audio-seek" min="0" max="1000" value="0" step="1" title="拖动跳转进度" />
               <span id="pg-audio-dur" class="mono">0:00</span>
-              <button type="button" class="mini-btn" id="pg-audio-loop" title="循环模式：列表循环 / 单曲循环 / 顺序播放">列表循环</button>
+              <button type="button" class="mini-btn" id="pg-audio-loop" title="列表策略（非卡片本曲循环）：列表循环 / 全局单曲 / 顺序停">列表循环</button>
             </div>
           </div>
           <div class="panel-toolbar">
@@ -526,7 +557,7 @@
             <button class="mini-btn" id="pg-rename">重命名</button>
             <button class="mini-btn" id="pg-delete">删除</button>
             <button class="mini-btn" id="pg-export" title="把当前演出导出为 .json 文件（备份 / 换电脑）">导出</button>
-            <button class="mini-btn" id="pg-import" title="从 .json 文件导入为一场新演出">导入</button>
+            <button class="mini-btn" id="pg-import" title="从 .json 节目单或 .pect 诗歌演示文件导入为一场新演出">导入</button>
           </div>
           <div class="panel-toolbar rename-row hidden" id="pg-rename-row">
             <input type="text" id="pg-rename-input" class="rename-input" placeholder="演出名称" />
@@ -809,6 +840,90 @@
       AI <span class="mono" id="stem-progress-chip-pct">0%</span>
     </button>
   </div>
+  <!-- 无模块兜底：ESM 挂了也能点正计时；并显示启动状态 -->
+  <div id="sp-boot-badge" style="position:fixed;left:10px;bottom:10px;z-index:99999;padding:6px 10px;border-radius:8px;background:#3a2030;color:#ffd0e0;font-size:12px;border:1px solid #8a4058;pointer-events:none">启动中…</div>
+  <script>
+    (function () {
+      var badge = document.getElementById('sp-boot-badge');
+      function setBadge(t, ok) {
+        if (!badge) return;
+        badge.textContent = t;
+        badge.style.background = ok ? '#1d3a24' : '#3a2030';
+        badge.style.borderColor = ok ? '#2f6b45' : '#8a4058';
+        badge.style.color = ok ? '#c8ffd8' : '#ffd0e0';
+      }
+      window.__spBootMark = setBadge;
+      window.addEventListener('error', function (e) {
+        setBadge('脚本错误: ' + (e.message || e.error), false);
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e.reason;
+        setBadge('Promise 错误: ' + ((r && r.message) || r), false);
+      });
+
+      function pad(n) { return String(n).padStart(2, '0'); }
+      function fmt(sec) {
+        sec = Math.max(0, Math.floor(sec || 0));
+        return pad(Math.floor(sec / 3600)) + ':' + pad(Math.floor((sec % 3600) / 60)) + ':' + pad(sec % 60);
+      }
+
+      var swEl = document.getElementById('sw-display');
+      var swStart = document.getElementById('sw-start');
+      var swReset = document.getElementById('sw-reset');
+      if (swStart && swEl && !swStart.dataset.fallbackBound) {
+        swStart.dataset.fallbackBound = '1';
+        var running = false, base = 0, t0 = 0, timer = null;
+        swStart.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (running) {
+            base += performance.now() - t0;
+            clearInterval(timer);
+            running = false;
+            swStart.textContent = '开始';
+            swStart.classList.remove('active');
+          } else {
+            t0 = performance.now();
+            timer = setInterval(function () {
+              swEl.textContent = fmt((base + performance.now() - t0) / 1000);
+            }, 100);
+            running = true;
+            swStart.textContent = '暂停';
+            swStart.classList.add('active');
+          }
+        }, true);
+        if (swReset) {
+          swReset.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            clearInterval(timer);
+            running = false;
+            base = 0;
+            swStart.textContent = '开始';
+            swStart.classList.remove('active');
+            swEl.textContent = fmt(0);
+          }, true);
+        }
+      }
+
+      var imp = document.getElementById('btn-import');
+      if (imp && !imp.dataset.fallbackBound) {
+        imp.dataset.fallbackBound = '1';
+        imp.addEventListener('click', function () {
+          if (!window.__spMainReady) {
+            setBadge('主脚本未就绪：导入暂不可用', false);
+          }
+        }, true);
+      }
+
+      setBadge('基础脚本已加载，等待主模块…', false);
+      setTimeout(function () {
+        if (!window.__spMainReady && badge && badge.textContent.indexOf('主模块') >= 0) {
+          setBadge('主模块未加载（检查控制台 / 路径）', false);
+        }
+      }, 4000);
+    })();
+  </script>
   <script type="module" src="js/boot.js"></script>
 </body>
 </html>

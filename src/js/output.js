@@ -162,25 +162,19 @@ async function exitFsOrClose() {
   await closeOutput();
 }
 
-/** 可靠关闭：先退全屏/取消置顶，再用当前窗口 API 关闭 */
+/**
+ * 可靠关闭：交给后端隐藏 + 强制销毁。
+ * 不用 win.close()：全屏 / 置顶时它偶尔「成功返回但窗口还在」，之后再点也没反应
+ */
 async function closeOutput() {
   if (closing) return;
   closing = true;
+  // 万一没关掉，过一会儿允许再点
+  setTimeout(() => { closing = false; }, 1500);
   try {
-    const win = await currentWin();
-    try { await win.setFullscreen(false); } catch { /* ignore */ }
-    try { await win.setAlwaysOnTop(false); } catch { /* ignore */ }
-    isFs = false;
-    // 稍等状态落稳再关（Windows 全屏下直接 close 常会失败）
-    await new Promise((r) => setTimeout(r, 60));
-    await win.close();
-  } catch {
-    // 回退到后端命令
-    try {
-      await invoke('close_output_window');
-    } catch (err) {
-      closing = false;
-      console.error('关闭输出窗口失败', err);
-    }
+    await invoke('close_output_window');
+  } catch (err) {
+    console.error('关闭输出窗口失败', err);
+    try { await (await currentWin()).destroy(); } catch { /* ignore */ }
   }
 }

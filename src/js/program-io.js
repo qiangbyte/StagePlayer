@@ -3,6 +3,8 @@
 import { invoke, pickFiles, toast } from './util.js';
 import { normalizeItem } from './program-store.js';
 import { flushStore } from './store-sync.js';
+import { readPect } from './pect-import.js';
+import { addLyricSongs } from './lyrics-show.js';
 
 const FORMAT = 'stageplayer-show';
 const VERSION = 1;
@@ -44,13 +46,35 @@ export async function exportEvent(ev) {
   }
 }
 
+/** .pect 诗歌演示 → 一场新演出：每首歌进歌词库，节目单里按原顺序排好 */
+async function importPectEvent(path, genId) {
+  let pect;
+  try {
+    pect = await readPect(path);
+  } catch (err) {
+    toast('读取 .pect 失败：' + err, 6000);
+    return null;
+  }
+  if (!pect.songs.length) {
+    toast('这个文件里没有歌词', 5000);
+    return null;
+  }
+  const lib = addLyricSongs(pect.songs);
+  const items = lib.map((s) => normalizeItem({
+    id: genId(), type: 'lyrics', songId: s.id, name: s.title, text: s.text, bg: s.bg, path: '', note: '',
+  }));
+  toast(`已导入「${pect.name}」（${items.length} 首歌，已同时加入歌词库）`, 5000);
+  return { id: genId(), name: pect.name, items };
+}
+
 /**
  * 选择文件导入为一场新演出；返回规范化后的演出对象（失败 / 取消返回 null）
  * @param {() => string} genId
  */
 export async function importEvent(genId) {
-  const files = await pickFiles([{ name: '节目单', extensions: ['json'] }], '导入节目单');
+  const files = await pickFiles([{ name: '节目单 / 诗歌演示', extensions: ['json', 'pect'] }], '导入节目单');
   if (!files.length) return null;
+  if (/\.pect$/i.test(files[0])) return importPectEvent(files[0], genId);
   let doc;
   try {
     doc = JSON.parse(await invoke('read_show_file', { path: files[0] }));

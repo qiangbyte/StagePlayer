@@ -8,6 +8,7 @@ import {
   assignPath, listFolders, getSelectedFolder, FOLDER_ALL, FOLDER_UNCAT,
   getDisplayName, promptRenameMedia, setDisplayName, bindViewZoom,
 } from './media-library.js';
+import { pushUndo } from './undo.js';
 
 const LS_KEY = 'sp.ppt.paths';
 
@@ -102,6 +103,7 @@ function renderDocs() {
         <span class="fi-icon">P</span>
         <span class="fi-name">${esc(d.name)}</span>
         <span class="fi-badge">${pages}</span>
+        <button type="button" class="fi-del" data-act="del" title="从列表移除（不删除电脑上的文件）">✕</button>
       </div>`;
       }).join('')
       : '<div class="empty-tip">此目录暂无文稿</div>';
@@ -205,6 +207,31 @@ function goto(i, opts = {}) {
   return ok !== false;
 }
 
+/** 从列表移除一个文稿（不删除电脑上的文件） */
+function removeDoc(i) {
+  const d = docs[i];
+  if (!d) return;
+  docs.splice(i, 1);
+  if (i === currentDoc) {
+    currentDoc = -1;
+    currentSlide = -1;
+  } else if (i < currentDoc) {
+    currentDoc -= 1;
+  }
+  persistPaths();
+  renderDocs();
+  renderGrid();
+  if (currentDoc < 0) ensureVisibleDocSelected();
+  pushUndo(`移除「${d.name}」`, () => {
+    if (docs.some((x) => x.path === d.path)) return; // 已重新导入
+    const at = Math.min(i, docs.length);
+    docs.splice(at, 0, d);
+    if (currentDoc >= at) currentDoc += 1;
+    persistPaths();
+    renderDocs();
+  });
+}
+
 function persistPaths() {
   lsSet(LS_KEY, docs.map((d) => ({ path: d.path, name: d.name })));
 }
@@ -269,6 +296,7 @@ export function initPpt() {
 
   docList?.addEventListener('click', (e) => {
     const item = e.target.closest('.file-item');
+    if (item && e.target.closest('[data-act="del"]')) return removeDoc(+item.dataset.i);
     if (item) selectDoc(+item.dataset.i).catch(() => {});
   });
   $('ppt-doc-select')?.addEventListener('change', (e) => {
@@ -329,6 +357,14 @@ export function initPpt() {
 
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'ppt') return;
+    const snap = docs.slice();
+    if (!snap.length) return;
+    pushUndo(`清空文稿列表（${snap.length} 个）`, () => {
+      for (const d of snap) if (!docs.some((x) => x.path === d.path)) docs.push(d);
+      persistPaths();
+      renderDocs();
+      ensureVisibleDocSelected();
+    });
     docs = [];
     currentDoc = -1;
     currentSlide = -1;

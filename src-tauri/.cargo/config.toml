@@ -1,0 +1,4 @@
+# 国内直连 GitHub 常失败：本地放置 sherpa-onnx 预编译库压缩包后走此目录
+# 文件名：sherpa-onnx-v2.0.1-win-x64-static-MT-Release-lib.tar.bz2
+[env]
+SHERPA_ONNX_ARCHIVE_DIR = { value = "native/sherpa", relative = true }

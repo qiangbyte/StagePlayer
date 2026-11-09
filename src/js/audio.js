@@ -5,6 +5,7 @@ import {
   bindMetersHost, analyze, drawSpectrum, drawVU, resetMeters, resetClip, meterReadings,
 } from './audio-meters.js';
 import { decodeWaveNative, decodeWaveWeb } from './audio-wave.js';
+import { pushUndo } from './undo.js';
 import {
   initStemProgressUi, showStemProgressPanel, hideStemProgressPanel,
 } from './audio-stem-ui.js';
@@ -144,17 +145,103 @@ function currentEvent() {
   return evs.find((e) => e.id === cid) || evs[0] || null;
 }
 
-function eventAudioItems() {
-  const ev = currentEvent();
-  const items = ev ? ev.items.filter((i) => i.type === 'audio') : [];
+/**
+ * 音乐页自己的曲库，与节目单分开：音乐页导入只进曲库，节目单导入只进节目单。
+ * 单曲设置（起播点 / 渐变 / 循环 / 伴奏 / 备注）各存各的
+ */
+const LS_LIB = 'sp.audio.library';
+/** 当前这首由谁起播：节目单起播时，单曲设置与播完续播都按节目单 */
+let playSource = 'library';
+
+function withName(items) {
   return items.map((it) => ({
     ...it,
     name: it.name || getDisplayName(it.path, fileName(it.path).replace(/\.[^.]+$/, '')),
   }));
 }
 
+function programAudioItems() {
+  const ev = currentEvent();
+  return ev ? ev.items.filter((i) => i.type === 'audio') : [];
+}
+
+function libraryRaw() {
+  const v = lsGetCached(LS_LIB, []);
+  return Array.isArray(v) ? v : [];
+}
+
+/** 音乐页显示的歌曲 */
+function eventAudioItems() {
+  return withName(libraryRaw());
+}
+
+/** 这首歌的设置存在哪：节目单正在播的那首 → 节目单；否则曲库优先 */
+function itemOwner(path) {
+  const inProgram = programAudioItems().some((i) => i.path === path);
+  if (playSource === 'program' && path === currentPath && inProgram) return 'program';
+  if (libraryRaw().some((i) => i.path === path)) return 'library';
+  return inProgram ? 'program' : 'library';
+}
+
+function libraryItemByPath(path) {
+  return libraryRaw().find((i) => i.path === path) || null;
+}
+
+function findItem(path) {
+  const owner = itemOwner(path);
+  const primary = (owner === 'program' ? programAudioItems() : libraryRaw()).find((i) => i.path === path);
+  if (owner !== 'program') return primary || null;
+  // 节目单条目缺起播/渐变/循环/伴奏时，回落到曲库同路径设置
+  const lib = libraryItemByPath(path);
+  if (!primary) return lib;
+  if (!lib) return primary;
+  return {
+    ...lib,
+    ...primary,
+    note: (primary.note || '').trim() || lib.note || '',
+    startAt: primary.startAt != null ? primary.startAt : lib.startAt,
+    fadeIn: primary.fadeIn != null ? primary.fadeIn : lib.fadeIn,
+    fadeOut: primary.fadeOut != null ? primary.fadeOut : lib.fadeOut,
+    loop: primary.loop || lib.loop,
+    vocalCancel: primary.vocalCancel != null ? primary.vocalCancel : lib.vocalCancel,
+  };
+}
+
+/** 改单曲设置：写回它所在的曲库或节目单 */
+function updateItem(path, fn) {
+  if (itemOwner(path) === 'program') {
+    return updateEvent((ev) => {
+      for (const item of ev.items) if (item.type === 'audio' && item.path === path) fn(item);
+    });
+  }
+  return updateLibrary((items) => {
+    for (const item of items) if (item.path === path) fn(item);
+  });
+}
+
+function updateLibrary(fn) {
+  const items = libraryRaw().map((i) => ({ ...i }));
+  fn(items);
+  return lsSet(LS_LIB, items);
+}
+
+/** 旧版音乐页直接显示节目单里的歌：首次升级时把它们复制进曲库，列表不至于变空 */
+function migrateLibrary() {
+  if (lsGet(LS_LIB, null) != null) return;
+  const seen = new Set();
+  const items = [];
+  for (const ev of lsGet('sp.program.events', [])) {
+    for (const it of ev.items || []) {
+      if (it.type !== 'audio' || !it.path || seen.has(it.path)) continue;
+      seen.add(it.path);
+      items.push({ ...it, id: genId() });
+    }
+  }
+  lsSet(LS_LIB, items);
+}
+
 function resolveItemName(path) {
-  const it = eventAudioItems().find((i) => i.path === path);
+  const it = findItem(path);
   return it?.name || getDisplayName(path, fileName(path).replace(/\.[^.]+$/, ''));
 }
 
@@ -163,10 +250,8 @@ function renameAudioItem(path) {
   const n = promptRenameMedia(path, resolveItemName(path));
   if (n == null) return;
   if (n === false) return toast('名称不能为空');
-  updateEvent((ev) => {
-    for (const item of ev.items) {
-      if (item.type === 'audio' && item.path === path) item.name = n;
-    }
+  updateItem(path, (item) => {
+    item.name = n;
   });
   if (currentPath === path) {
     currentName = n;
@@ -177,25 +262,66 @@ function renameAudioItem(path) {
   toast('已重命名');
 }
 
-/** 单曲：one=单曲循环；next=播完自动下一首（默认） */
+/** 从音乐库移除一首（节目单里的同一首不受影响，电脑上的文件也不删） */
+function removeAudioItem(path) {
+  if (!path) return;
+  const name = resolveItemName(path);
+  const snap = libraryRaw().map((i) => ({ ...i }));
+  updateLibrary((items) => {
+    for (let i = items.length - 1; i >= 0; i--) if (items[i].path === path) items.splice(i, 1);
+  });
+  if (selectedSongPath === path) selectedSongPath = null;
+  // 正在放的就是这首（音乐页起播的）：停下
+  if (path === currentPath && playSource === 'library') {
+    stopAudio();
+    currentPath = null;
+    playPath = null;
+    $('audio-title').textContent = '未选择音频';
+    fillCueBar(null);
+  }
+  renderList();
+  pushUndo(`移除「${name}」`, () => restoreLibrary(snap));
+}
+
+/**
+ * 撤销移除：只把快照里、当前曲库没有的歌放回原位置附近；
+ * 删除之后新导入或改过的歌保持不动（不整表回滚）
+ */
+function restoreLibrary(snap) {
+  updateLibrary((items) => {
+    snap.forEach((it, k) => {
+      if (items.some((i) => i.path === it.path)) return;
+      const prev = k > 0 ? items.findIndex((i) => i.path === snap[k - 1].path) : -1;
+      items.splice(prev + 1, 0, { ...it });
+    });
+  });
+  renderList();
+}
+
+/** 卡片上的本曲循环：只读本曲字段，不跟底部全局（避免一点全变） */
 function getItemLoopMode(path) {
-  const it = eventAudioItems().find((i) => i.path === path);
-  if (it?.loop === 'one') return 'one';
-  if (it?.loop === 'next') return 'next';
-  // 未单独设置时跟底部全局：one→单曲，其余→自动下一首
-  return loopMode === 'one' ? 'one' : 'next';
+  const it = findItem(path);
+  return it?.loop === 'one' ? 'one' : 'next';
+}
+
+/** 播完时是否重播本曲：本曲 one 优先；未设为 next 时才看底部「单曲循环」 */
+function shouldRepeatCurrent(path) {
+  const it = findItem(path);
+  if (it?.loop === 'one') return true;
+  if (it?.loop === 'next') return false;
+  return loopMode === 'one';
 }
 
 function loopBtnMeta(mode) {
   if (mode === 'one') {
-    return { icon: '🔂', title: '单曲循环中 · 再点改为自动下一首', cls: 'is-one' };
+    return { icon: '🔂', title: '仅本曲循环中 · 再点改为播完下一首', cls: 'is-one' };
   }
-  return { icon: '⏭', title: '自动下一首 · 再点改为单曲循环', cls: 'is-next' };
+  return { icon: '⏭', title: '本曲播完下一首 · 再点改为仅本曲循环', cls: 'is-next' };
 }
 
 /** 本曲是否开启仅伴奏（AI 伴奏轨） */
 function getItemVocalCancel(path) {
-  const it = eventAudioItems().find((i) => i.path === path);
+  const it = findItem(path);
   return !!it?.vocalCancel;
 }
 
@@ -317,10 +443,8 @@ async function toggleItemVocalCancel(path) {
     instrumentalBySource[path] = info.instrumentalPath;
   }
 
-  const ok = updateEvent((ev) => {
-    for (const item of ev.items) {
-      if (item.type === 'audio' && item.path === path) item.vocalCancel = next;
-    }
+  const ok = updateItem(path, (item) => {
+    item.vocalCancel = next;
   });
   if (!ok) return toast('无法保存伴奏设置');
   paintVocalButtons(path);
@@ -354,20 +478,12 @@ function toggleItemLoopMode(path) {
   if (!path) return;
   const cur = getItemLoopMode(path);
   const next = cur === 'one' ? 'next' : 'one';
-  const ok = updateEvent((ev) => {
-    for (const item of ev.items) {
-      if (item.type === 'audio' && item.path === path) item.loop = next;
-    }
+  const ok = updateItem(path, (item) => {
+    item.loop = next;
   });
-  if (!ok) return toast('无法保存播放顺序');
-  // 正在播这首时，同步底部按钮文案，避免误解
-  if (path === currentPath) {
-    loopMode = next === 'one' ? 'one' : 'all';
-    const btnLoop = $('audio-loop');
-    if (btnLoop) btnLoop.textContent = getLoopModeLabel();
-  }
+  if (!ok) return toast('无法保存本曲循环');
+  // 只改这一首，不动底部「列表循环 / 单曲循环 / 顺序播放」
   paintSongActive();
-  // 轻量刷图标；若列表刚建好也 OK
   const list = $('audio-song-list');
   list?.querySelectorAll('.audio-card').forEach((card) => {
     if (card.dataset.path !== path) return;
@@ -380,7 +496,8 @@ function toggleItemLoopMode(path) {
     btn.classList.toggle('is-next', next === 'next');
     card.classList.toggle('loop-one', next === 'one');
   });
-  toast(next === 'one' ? '已设为单曲循环' : '已设为自动下一首');
+  const name = cardLabel(findItem(path) || { path }) || '本曲';
+  toast(next === 'one' ? `「${name}」仅本曲循环` : `「${name}」播完下一首`);
 }
 
 /** 通过节目单模块改数据，避免直接写旧 LS 把内存里的整场演出冲掉 */
@@ -482,7 +599,7 @@ function fadeTo(target, durationSec) {
 
 /** @returns {{ startAt:number, fadeIn:number, fadeOut:number }} */
 function getItemCue(path) {
-  const it = eventAudioItems().find((i) => i.path === path) || {};
+  const it = findItem(path) || {};
   const startAt = Math.max(0, Number(it.startAt) || 0);
   const fadeIn = Math.max(0, Math.min(60, Number(it.fadeIn) || 0));
   const fadeOut = Math.max(0, Math.min(60, Number(it.fadeOut) || 0));
@@ -503,7 +620,7 @@ function cueBadgeText(cue) {
 
 function resolveItemNote(path) {
   if (!path) return '';
-  const it = eventAudioItems().find((i) => i.path === path);
+  const it = findItem(path);
   const fromItem = (it?.note || '').trim();
   if (fromItem) return fromItem;
   return getMediaNote(path).trim();
@@ -530,12 +647,16 @@ function saveAudioNote() {
   if (!path) return toast('请先选中一首歌');
   const note = ($('audio-note')?.value || '').trim();
   setMediaNote(path, note);
-  const ok = updateEvent((ev) => {
-    for (const item of ev.items) {
-      if (item.type === 'audio' && item.path === path) item.note = note;
-    }
+  const ok = updateItem(path, (item) => {
+    item.note = note;
   });
-  if (!ok) return toast('备注未能写入节目单，已存本地');
+  // 同步到节目单里同路径音频条目，便于现场播控直接看到
+  try {
+    document.dispatchEvent(new CustomEvent('sp:media-note-changed', {
+      detail: { path, note, type: 'audio' },
+    }));
+  } catch { /* ignore */ }
+  if (!ok) return toast('备注未能写入曲库，已存本地');
   renderList();
   toast(note ? '备注已保存' : '已清除备注');
 }
@@ -548,14 +669,10 @@ function saveCueFromBar() {
   const fadeIn = Math.max(0, Math.min(60, Number($('audio-fade-in')?.value) || 0));
   const fadeOut = Math.max(0, Math.min(60, Number($('audio-fade-out')?.value) || 0));
   const startAt = min * 60 + sec;
-  const ok = updateEvent((ev) => {
-    for (const item of ev.items) {
-      if (item.type === 'audio' && item.path === path) {
-        item.startAt = startAt;
-        item.fadeIn = fadeIn;
-        item.fadeOut = fadeOut;
-      }
-    }
+  const ok = updateItem(path, (item) => {
+    item.startAt = startAt;
+    item.fadeIn = fadeIn;
+    item.fadeOut = fadeOut;
   });
   if (!ok) return toast('保存失败');
   fillCueBar(path);
@@ -585,6 +702,14 @@ async function startPlayback(startAt = 0, opts = {}) {
     } catch { /* ignore */ }
   }
   playPath = effectivePlayPath(currentPath);
+  if (
+    getItemVocalCancel(currentPath)
+    && playPath === currentPath
+    && !instrumentalBySource[currentPath]
+  ) {
+    const tip = $('audio-cue-tip');
+    if (tip) tip.textContent = '仅伴奏未就绪 · 先播原唱，可点卡片「仅伴奏」生成';
+  }
 
   // audio_play 本身会换曲，无需先 stop（少一次 IPC）
   await invoke('audio_play', {
@@ -677,6 +802,7 @@ function loadFile(path, autoplay = true, opts = {}) {
   // 按下播放那一刻的输出世代：出声要等 IPC，期间按了黑屏/切走则标题卡不再推送
   const outSeq = pendingOutputSeq ?? currentOutputSeq();
 
+  playSource = opts.source || (stay ? 'program' : 'library');
   currentPath = path;
   pos = 0;
   resetMeters();
@@ -1096,15 +1222,17 @@ function renderList() {
       <div class="audio-card-body">
         <span class="audio-card-vol" title="${esc(volTip)}">🔊 ${volPct}%</span>
         <button type="button" class="audio-card-rename" data-act="rename" title="重命名显示名">✎</button>
+        <button type="button" class="audio-card-note-btn" data-act="note" title="编辑备注">📝</button>
         <button type="button" class="audio-card-vocal ${vm.cls}" data-act="vocal" title="${esc(vm.title)}">${vm.icon}</button>
         <button type="button" class="audio-card-go ${lm.cls}" data-act="loop" title="${esc(lm.title)}">${lm.icon}</button>
         <div class="audio-card-name">${esc(label)}</div>
-        ${note ? `<div class="audio-card-note" title="${esc(note)}">📝 ${esc(note)}</div>` : ''}
+        ${note ? `<div class="audio-card-note" title="${esc(note)}">${esc(note)}</div>` : ''}
         ${badge ? `<div class="audio-card-cue">${esc(badge)}</div>` : ''}
         ${vocalOn ? '<div class="audio-card-vocal-badge">仅伴奏</div>' : ''}
       </div>
       <div class="audio-card-foot">
         <span class="audio-card-dur mono">${fmtHms(dur)}</span>
+        <button type="button" class="card-del" data-act="del" title="从列表移除（不删除电脑上的文件）">✕</button>
       </div>
     </div>`;
   }).join('');
@@ -1116,6 +1244,7 @@ function currentModule() {
 }
 
 export function initAudio() {
+  migrateLibrary();
   bindMetersHost({
     meterState: () => ({ mono, monoSr, pos, playing, engineVol }),
     syncMeterReadout,
@@ -1166,18 +1295,37 @@ export function initAudio() {
   listen('sp-audio-ended', () => {
     playing = false;
     updatePlayBtn();
+    const fromProgram = playSource === 'program';
+    // 节目单：交给走台（更新高亮 / 不跳过中间非音频 / 默认不推屏）
+    if (fromProgram) {
+      if (currentPath && shouldRepeatCurrent(currentPath)) {
+        loadFile(currentPath, true, {
+          source: 'program',
+          stay: true,
+          pushOutput: false,
+          skipList: true,
+        });
+        return;
+      }
+      document.dispatchEvent(new CustomEvent('sp:program-audio-ended', {
+        detail: { path: currentPath },
+      }));
+      paintSongActive();
+      return;
+    }
+    // 音乐页：在当前目录曲库内续播
     const items = visibleAudioItems();
     if (!items.length) return;
     const idx = items.findIndex((i) => i.path === currentPath);
-    const itemMode = currentPath ? getItemLoopMode(currentPath) : 'next';
-    // 卡片单曲循环优先；否则跟全局 none（播完停）
-    if (itemMode === 'one' && idx >= 0) return loadFile(items[idx].path, true);
-    if (loopMode === 'none' && itemMode !== 'one' && (idx < 0 || idx >= items.length - 1)) {
+    if (currentPath && shouldRepeatCurrent(currentPath) && idx >= 0) {
+      return loadFile(items[idx].path, true, { source: 'library', skipList: true });
+    }
+    if (loopMode === 'none' && (idx < 0 || idx >= items.length - 1)) {
       paintSongActive();
       return;
     }
     const next = items[(Math.max(0, idx) + 1) % items.length];
-    if (next) loadFile(next.path, true);
+    if (next) loadFile(next.path, true, { source: 'library', skipList: true });
   });
 
   document.addEventListener('sp:program-changed', renderList);
@@ -1237,7 +1385,7 @@ export function initAudio() {
     toast('已移动到目录');
   });
 
-  // 切换声卡：无缝续播
+  // 切换声卡：与正常起播同一路径（含已生成的伴奏 wav）
   document.addEventListener('sp:audio-device-changed', async () => {
     deviceIndex = lsGet(LS_DEVICE, null);
     if (!currentPath) return;
@@ -1247,11 +1395,13 @@ export function initAudio() {
       const at = st.exists && isEnginePath(st.path) ? st.position : pos;
       cancelFade();
       fadeOutStarted = false;
+      const file = effectivePlayPath(currentPath) || currentPath;
+      playPath = file;
       await invoke('audio_play', {
-        path: currentPath,
+        path: file,
         deviceIndex,
         startAt: at,
-        vocalCancel: getItemVocalCancel(currentPath),
+        vocalCancel: false,
       });
       setEngineVol(volume());
       if (!wasPlaying) {
@@ -1345,6 +1495,22 @@ export function initAudio() {
     if (!item?.dataset.path) return;
     if (e.target.closest('[data-act="rename"]')) {
       renameAudioItem(item.dataset.path);
+      return;
+    }
+    if (e.target.closest('[data-act="note"]')) {
+      const path = item.dataset.path;
+      selectedSongPath = path;
+      fillCueBar(path);
+      const cur = resolveItemNote(path);
+      const v = window.prompt('歌曲备注（开播提示）', cur);
+      if (v === null) return;
+      const noteEl = $('audio-note');
+      if (noteEl) noteEl.value = v.trim();
+      saveAudioNote();
+      return;
+    }
+    if (e.target.closest('[data-act="del"]')) {
+      removeAudioItem(item.dataset.path);
       return;
     }
     if (e.target.closest('[data-act="loop"]')) {
@@ -1558,15 +1724,17 @@ export function initAudio() {
   document.addEventListener('sp:import-audio', async () => {
     const files = await pickFiles([{ name: '音频', extensions: AUDIO_EXT }], '导入音频');
     if (!files.length) return;
-    const ok = updateEvent((ev) => {
+    let added = 0;
+    const ok = updateLibrary((items) => {
       for (const f of files) {
-        if (ev.items.some((i) => i.type === 'audio' && i.path === f)) continue;
-        ev.items.push({ id: genId(), type: 'audio', path: f, name: fileName(f).replace(/\.[^.]+$/, '') });
+        if (items.some((i) => i.path === f)) continue;
+        items.push({ id: genId(), type: 'audio', path: f, name: fileName(f).replace(/\.[^.]+$/, '') });
+        added++;
       }
     });
-    if (!ok) return;
+    if (!ok) return toast('保存曲库失败');
     renderList();
-    toast(`已添加 ${files.length} 个音频到「${currentEvent()?.name || ''}」`);
+    toast(added ? `已添加 ${added} 首到音乐库` : '这些歌已在音乐库里');
     if (!currentPath) {
       const first = eventAudioItems()[0];
       if (first) loadFile(first.path, false);
@@ -1575,9 +1743,11 @@ export function initAudio() {
 
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'audio') return;
-    updateEvent((ev) => {
-      ev.items = ev.items.filter((i) => i.type !== 'audio');
-    });
+    // 只清音乐库，节目单里的歌不动
+    const snap = libraryRaw().map((i) => ({ ...i }));
+    if (!snap.length) return;
+    updateLibrary((items) => { items.length = 0; });
+    pushUndo(`清空音乐库（${snap.length} 首）`, () => restoreLibrary(snap));
     invoke('audio_stop');
     currentPath = null;
     playPath = null;

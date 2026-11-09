@@ -9,6 +9,7 @@ import {
   assignPath, listFolders, getSelectedFolder, FOLDER_UNCAT,
   getDisplayName, promptRenameMedia, bindViewZoom, getMediaNote, setMediaNote,
 } from './media-library.js';
+import { pushUndo } from './undo.js';
 
 const LS_KEY = 'sp.video.list';
 
@@ -177,10 +178,49 @@ function renderList() {
       </div>
       <div class="audio-card-foot">
         <span class="audio-card-dur mono">${dur > 0 ? fmtTimeLong(dur) : '--:--:--'}</span>
+        <button type="button" class="card-del" data-act="del" title="从列表移除（不删除电脑上的文件）">✕</button>
       </div>
     </div>`;
   }).join('');
   scheduleDurProbe(items.map((it) => it.path));
+}
+
+/** 从视频列表移除一个（不删除电脑上的文件） */
+function removeVideoItem(path) {
+  const i = videos.indexOf(path);
+  if (i < 0) return;
+  const snap = videos.slice();
+  videos.splice(i, 1);
+  lsSet(LS_KEY, videos);
+  if (i === current) {
+    const preview = $('video-preview');
+    if (preview) {
+      preview.pause();
+      preview.removeAttribute('src');
+      preview.load();
+    }
+    current = -1;
+    setPreviewTitle(null);
+    fillVideoNote(null);
+    updatePlayBtn();
+  } else if (i < current) {
+    current -= 1;
+  }
+  renderList();
+  pushUndo(`移除「${cardLabel(path)}」`, () => restoreVideos(snap));
+}
+
+/** 撤销：只放回快照里、当前列表没有的视频（删除后新导入的保持不动），正在预览的那个保持选中 */
+function restoreVideos(snap) {
+  const curPath = videos[current];
+  snap.forEach((p, k) => {
+    if (videos.includes(p)) return;
+    const prev = k > 0 ? videos.indexOf(snap[k - 1]) : -1;
+    videos.splice(prev + 1, 0, p);
+  });
+  lsSet(LS_KEY, videos);
+  current = curPath ? videos.indexOf(curPath) : -1;
+  renderList();
 }
 
 function setPreviewTitle(path) {
@@ -352,6 +392,10 @@ export function initVideo() {
     }
     const renameBtn = e.target.closest('[data-act="rename"]');
     const item = e.target.closest('.video-card, .song-row, .file-item');
+    if (e.target.closest('[data-act="del"]') && item?.dataset.path) {
+      removeVideoItem(item.dataset.path);
+      return;
+    }
     if (renameBtn && item?.dataset.path) {
       renameVideoItem(item.dataset.path);
       return;
@@ -472,6 +516,9 @@ export function initVideo() {
 
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'video') return;
+    const snap = videos.slice();
+    if (!snap.length) return;
+    pushUndo(`清空视频列表（${snap.length} 个）`, () => restoreVideos(snap));
     videos = [];
     lsSet(LS_KEY, videos);
     preview.pause();

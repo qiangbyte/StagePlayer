@@ -16,12 +16,14 @@ commands.allow = [
   "store_dir",
   "vocal_cancel_export",
   "parse_pptx",
+  "import_pect",
   "open_output_window",
   "set_output_fullscreen",
   "close_output_window",
   "set_output_always_on_top",
   "list_monitors",
   "place_output_on_monitor",
+  "quit_app",
   "list_audio_output_devices",
   "audio_play",
   "audio_pause",
@@ -39,5 +41,10 @@ commands.allow = [
   "spl_start",
   "spl_stop",
   "spl_set_params",
-  "spl_get_snapshot"
+  "spl_get_snapshot",
+  "lyric_asr_status",
+  "lyric_asr_ensure_model",
+  "lyric_follow_start",
+  "lyric_follow_stop",
+  "lyric_follow_sync"
 ]

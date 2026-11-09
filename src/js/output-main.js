@@ -3,7 +3,7 @@
 import {
   OUTPUT_EVENT, VIDEO_TIME_EVENT, renderOutput, applyFitMode, paintVideoTime,
 } from './output-core.js';
-import { emit, listen, lsGet, lsSet } from './util.js';
+import { emit, listen, lsGet, lsSet, toast } from './util.js';
 
 let previewEl = null;
 let current = { kind: 'clear' };
@@ -35,6 +35,7 @@ listen(VIDEO_TIME_EVENT, (e) => {
   if (!rep || current.kind !== 'video' || rep.path !== current.path) return;
   lastVideoReport = { ...rep, at: performance.now() };
   paintVideoTime(previewEl, rep);
+  if (rep.error) toast(`大屏视频无法播放：${rep.error}`, 7000);
   document.dispatchEvent(new CustomEvent('sp:output-video-time', { detail: lastVideoReport }));
 }).catch(() => {});
 

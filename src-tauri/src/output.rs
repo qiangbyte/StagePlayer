@@ -103,26 +103,78 @@ pub async fn set_output_fullscreen(app: AppHandle, fullscreen: bool) -> Result<(
     Ok(())
 }
 
-/// 关闭输出窗口（先退全屏/置顶，避免 Windows 下关不掉）
+async fn sleep_ms(ms: u64) {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    })
+    .await
+    .ok();
+}
+
+/// 关闭输出窗口。
+/// 先隐藏（观众立刻看不到），再 destroy 强制销毁：close() 走关闭请求流程，
+/// 全屏 / 置顶状态下在 Windows 上偶尔石沉大海，窗口就一直挂在扩展屏上
 #[tauri::command]
 pub async fn close_output_window(app: AppHandle) -> Result<(), String> {
     let Some(win) = app.get_webview_window("output") else {
         return Ok(());
     };
-    let _ = win.set_fullscreen(false);
     let _ = win.set_always_on_top(false);
-    let _ = win.set_decorations(true);
+    let _ = win.set_fullscreen(false);
     let _ = win.hide();
-    tauri::async_runtime::spawn_blocking(|| {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    })
-    .await
-    .ok();
-    // hide 后窗口句柄可能仍在
-    if let Some(win) = app.get_webview_window("output") {
-        win.close().map_err(|e| e.to_string())?;
+    let _ = win.destroy();
+    // 确认真的没了；没了才算关闭成功
+    for _ in 0..10 {
+        sleep_ms(50).await;
+        match app.get_webview_window("output") {
+            None => return Ok(()),
+            Some(w) => {
+                let _ = w.hide();
+                let _ = w.destroy();
+            }
+        }
+    }
+    if app.get_webview_window("output").is_some() {
+        return Err("输出窗口未能关闭，请重试".into());
     }
     Ok(())
+}
+
+/// 上次「关主窗口需确认」的时间（毫秒）。5 秒内再点一次 ✕ 直接关闭：
+/// 万一主界面卡死、确认框弹不出来，也不会关不掉
+static LAST_CLOSE_ASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 关主窗口前是否要先让用户确认：只有大屏开着、且不是 5 秒内第二次点关闭
+pub fn should_confirm_close(app: &AppHandle) -> bool {
+    if app.get_webview_window("output").is_none() {
+        return false;
+    }
+    let now = now_ms();
+    let last = LAST_CLOSE_ASK.swap(now, std::sync::atomic::Ordering::Relaxed);
+    now.saturating_sub(last) > 5000
+}
+
+/// 用户确认退出：先关大屏再退出程序
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    destroy_output(&app);
+    app.exit(0);
+}
+
+/// 主窗口关闭时一并销毁输出窗口，避免扩展屏上留下孤儿窗口、程序关不掉
+pub fn destroy_output(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("output") {
+        let _ = win.set_always_on_top(false);
+        let _ = win.hide();
+        let _ = win.destroy();
+    }
 }
 
 /// 输出窗口置顶
@@ -184,7 +236,37 @@ pub async fn place_output_on_monitor(
         }
     }
 
+    // 跨屏（两块屏缩放比例不同）时 Windows 会在窗口挪过去后按新 DPI 再改一次窗口大小，
+    // 晚到的这一次会把刚铺满的窗口改小 = 画面一圈黑边。后台盯一会儿，发现没铺满就校正
+    let (app2, info2) = (app.clone(), info.clone());
+    tauri::async_runtime::spawn(async move { ensure_fills(&app2, index, &info2).await });
+
     Ok(info)
+}
+
+/// 窗口是否正好铺满该屏（允许 2px 误差）
+fn window_fills(win: &tauri::WebviewWindow, info: &MonitorInfo) -> bool {
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else {
+        return false;
+    };
+    (pos.x - info.x).abs() <= 2
+        && (pos.y - info.y).abs() <= 2
+        && (size.width as i64 - info.width as i64).abs() <= 2
+        && (size.height as i64 - info.height as i64).abs() <= 2
+}
+
+/// 反复确认窗口铺满目标屏；没铺满就退出全屏改用无边框铺满（效果相同，最稳）
+async fn ensure_fills(app: &AppHandle, index: usize, info: &MonitorInfo) {
+    for wait in [150u64, 250, 500, 1000] {
+        sleep_ms(wait).await;
+        let Some(win) = app.get_webview_window("output") else {
+            return;
+        };
+        if window_fills(&win, info) {
+            continue;
+        }
+        let _ = place_on_monitor(app, index, false);
+    }
 }
 
 fn window_on_monitor(win: &tauri::WebviewWindow, info: &MonitorInfo) -> bool {

@@ -457,6 +457,11 @@ export function applyFitMode(stage, mode) {
 export function paintVideoTime(stage, rep) {
   const badge = stage?.querySelector('.out-video-time');
   if (!badge || !rep) return;
+  badge.classList.toggle('is-error', !!rep.error);
+  if (rep.error) {
+    badge.textContent = `⚠ 大屏无法播放：${rep.error}`;
+    return;
+  }
   const state = rep.ended ? '■ 已播完' : rep.paused ? '⏸ 已暂停' : '▶ 输出中';
   badge.textContent = `${state} ${fmtTimeLong(rep.t)} / ${fmtTimeLong(rep.d)}`;
 }
@@ -475,6 +480,14 @@ export function reportVideoTime(stage, path, send) {
   for (const ev of ['loadedmetadata', 'timeupdate', 'play', 'pause', 'ended', 'seeked']) {
     v.addEventListener(ev, report);
   }
+  // 文件不存在 / 格式不支持时大屏只会黑着：把原因回报给主控
+  v.addEventListener('error', () => {
+    const code = v.error?.code;
+    const why = code === 4 ? '文件不存在或格式不支持'
+      : code === 3 ? '视频解码失败（编码格式不受支持）'
+        : code === 2 ? '读取文件失败' : '未知错误';
+    send({ path, t: 0, d: 0, paused: true, ended: false, error: why });
+  });
 }
 
 export function controlVideo(action, value) {

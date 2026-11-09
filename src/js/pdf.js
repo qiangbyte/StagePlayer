@@ -8,6 +8,7 @@ import {
   assignPath, listFolders, getSelectedFolder, FOLDER_ALL, FOLDER_UNCAT,
   getDisplayName, promptRenameMedia, setDisplayName, getViewSize, bindViewZoom,
 } from './media-library.js';
+import { pushUndo } from './undo.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../lib/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
 
@@ -123,6 +124,7 @@ function renderDocs() {
         <span class="fi-icon">PDF</span>
         <span class="fi-name">${esc(d.name)}</span>
         <span class="fi-badge">${pages}</span>
+        <button type="button" class="fi-del" data-act="del" title="从列表移除（不删除电脑上的文件）">✕</button>
       </div>`;
       }).join('')
       : '<div class="empty-tip">此目录暂无文档</div>';
@@ -290,6 +292,36 @@ async function showPage(i, opts = {}) {
   }
 }
 
+/** 从列表移除一个文档（不删除电脑上的文件） */
+function removeDoc(i) {
+  const d = docs[i];
+  if (!d) return;
+  destroyDoc(d);
+  docs.splice(i, 1);
+  for (const k of [...pageCache.keys()]) if (k.startsWith(d.path + '#')) pageCache.delete(k);
+  if (i === currentDoc) {
+    currentDoc = -1;
+    currentPage = -1;
+    $('pdf-grid').innerHTML = '<div class="empty-tip big">导入 PDF 文件开始播放</div>';
+    $('pdf-info').textContent = '';
+  } else if (i < currentDoc) {
+    currentDoc -= 1;
+  }
+  persistPaths();
+  renderDocs();
+  if (currentDoc < 0) ensureVisibleDocSelected();
+  pushUndo(`移除「${d.name}」`, () => {
+    if (docs.some((x) => x.path === d.path)) return; // 已重新导入
+    // 原文档已释放，放回一个未加载的条目，点开时再加载
+    const k = registerStub(d.path, d.name);
+    const at = Math.min(i, k);
+    docs.splice(at, 0, docs.splice(k, 1)[0]);
+    if (currentDoc >= at) currentDoc += 1;
+    persistPaths();
+    renderDocs();
+  });
+}
+
 function persistPaths() {
   lsSet(LS_KEY, docs.map((d) => ({ path: d.path, name: d.name })));
 }
@@ -374,6 +406,7 @@ export function initPdf() {
 
   docList?.addEventListener('click', (e) => {
     const item = e.target.closest('.file-item');
+    if (item && e.target.closest('[data-act="del"]')) return removeDoc(+item.dataset.i);
     if (item) selectDoc(+item.dataset.i);
   });
   $('pdf-doc-select')?.addEventListener('change', (e) => {
@@ -433,6 +466,14 @@ export function initPdf() {
 
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'pdf') return;
+    const snap = docs.map((d) => ({ path: d.path, name: d.name }));
+    if (!snap.length) return;
+    pushUndo(`清空文档列表（${snap.length} 个）`, () => {
+      for (const d of snap) registerStub(d.path, d.name);
+      persistPaths();
+      renderDocs();
+      ensureVisibleDocSelected();
+    });
     docs.forEach(destroyDoc);
     docs = [];
     pageCache.clear();

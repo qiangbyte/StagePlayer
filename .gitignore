@@ -4,3 +4,8 @@ src-tauri/target/
 src-tauri/gen/schemas/
 .tmp-test/
 diag-log.txt
+
+# 语音跟词：sherpa-onnx 预编译库压缩包（约 120MB，手动放置，见 src-tauri/.cargo/config.toml）
+src-tauri/native/
+# 打包时由 scripts/stage-sidecar.mjs 生成的 sidecar 可执行文件
+src-tauri/binaries/

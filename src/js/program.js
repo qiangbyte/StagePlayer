@@ -14,6 +14,7 @@ import {
   toggleAudio,
   stopAudio,
 } from './audio.js';
+import { getMediaNote } from './media-library.js';
 import { playByPath as videoPlay } from './video.js';
 import { getPageCount as pptPages, playPage as pptPlayPage } from './ppt.js';
 import { getPageCount as pdfPages, playPage as pdfPlayPage } from './pdf.js';
@@ -34,6 +35,7 @@ import {
 } from './program-lobby.js';
 import { exportEvent, importEvent } from './program-io.js';
 import { playLyricsItem } from './lyrics-show.js';
+import { pushUndo } from './undo.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
@@ -243,6 +245,43 @@ export function initProgram() {
     syncAudioFloat();
     if (!$('pg-lobby-panel')?.classList.contains('hidden')) fillLobbyForm();
     syncLobbyRemain();
+  });
+
+  // 节目单叠播的音乐播完：按完整走台进下一条（不跳过中间 PPT/图片等）
+  document.addEventListener('sp:program-audio-ended', () => {
+    const ev = curEvent();
+    if (!ev?.items?.length) return;
+    let idx = activeIndex();
+    if (idx < 0) return;
+    const next = idx + 1;
+    if (next >= ev.items.length) {
+      updateNowBar();
+      syncAudioBar(true);
+      syncPlayGoBtn();
+      toast('节目单已到末条');
+      return;
+    }
+    activate(ev.items[next]);
+  });
+
+  // 音频库改备注时，同步同路径节目条目
+  document.addEventListener('sp:media-note-changed', (e) => {
+    const path = e.detail?.path;
+    if (!path) return;
+    const note = (e.detail.note || '').trim();
+    let changed = false;
+    for (const ev of events) {
+      for (const it of ev.items || []) {
+        if (it.type === 'audio' && it.path === path && (it.note || '') !== note) {
+          it.note = note;
+          changed = true;
+        }
+      }
+    }
+    if (!changed) return;
+    save({ soft: true });
+    renderItems({ soft: true });
+    updateNowBar();
   });
 
   initAudioFloat();
@@ -514,9 +553,16 @@ export function initProgram() {
         [ev.items[idx + 1], ev.items[idx]] = [ev.items[idx], ev.items[idx + 1]];
         save(); renderItems({ soft: false }); updateNowBar();
       } else if (op === 'del') {
-        ev.items.splice(idx, 1);
+        const [removed] = ev.items.splice(idx, 1);
         if (activeItemId === item.id) activeItemId = null;
         save(); renderItems({ soft: false }); updateNowBar(); syncAudioBar();
+        const evId = ev.id;
+        pushUndo(`从节目单移除「${removed.name || TYPE_META[removed.type]?.label || '节目'}」`, () => {
+          const target = events.find((x) => x.id === evId);
+          if (!target || target.items.some((x) => x.id === removed.id)) return;
+          target.items.splice(Math.min(idx, target.items.length), 0, removed);
+          save(); renderItems({ soft: false }); updateNowBar(); syncAudioBar();
+        });
       }
       return;
     }
@@ -699,13 +745,30 @@ async function pushMedia(ev, path, type) {
       return 0;
     }
   }
-  ev.items.push({
+  const libNote = (getMediaNote(path) || '').trim();
+  const item = {
     id: genId(),
     type,
     path,
     name: fileName(path).replace(/\.[^.]+$/, ''),
-    note: '',
-  });
+    note: libNote,
+  };
+  // 音频：带上曲库里的本曲设置（起播/渐变/循环/伴奏）
+  if (type === 'audio') {
+    try {
+      const lib = (lsGet('sp.audio.library', []) || []).find((i) => i.path === path);
+      if (lib) {
+        if ((lib.note || '').trim()) item.note = lib.note.trim();
+        if (lib.name) item.name = lib.name;
+        if (lib.startAt != null) item.startAt = lib.startAt;
+        if (lib.fadeIn != null) item.fadeIn = lib.fadeIn;
+        if (lib.fadeOut != null) item.fadeOut = lib.fadeOut;
+        if (lib.loop) item.loop = lib.loop;
+        if (lib.vocalCancel != null) item.vocalCancel = !!lib.vocalCancel;
+      }
+    } catch { /* ignore */ }
+  }
+  ev.items.push(item);
   return 1;
 }
 
@@ -1026,10 +1089,20 @@ function updateNowBar() {
     : it.type === 'blank'
       ? (it.blankKind === 'lyric' ? ` · 歌词段${it.lyricIndex != null ? it.lyricIndex : ''}` : ' · 歌名片')
       : '';
+  const noteText = (it.note || '').trim();
+  const noteCls = noteText ? 'pg-now-note' : 'pg-now-note is-empty';
   now.innerHTML = `
     <span class="pg-now-meta" style="color:${meta.color}">${idx + 1} / ${total} · ${meta.label}${pageHint}</span>
     <span class="pg-now-title">${esc(it.name)}</span>
+    <span class="pg-now-note-row">
+      <span class="${noteCls}" title="${esc(noteText || '无备注')}">${esc(noteText || '无备注')}</span>
+      <button type="button" class="mini-btn" id="pg-now-note" title="编辑本条备注">备注</button>
+    </span>
     <span class="pg-now-next">${next ? '下一条：' + esc(next.name) : '（最后一条）'}</span>`;
+  $('pg-now-note')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    editItemNote(it);
+  });
 }
 
 function scrollActiveIntoView() {

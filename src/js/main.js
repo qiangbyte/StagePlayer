@@ -14,6 +14,8 @@ import {
   resyncOutput,
 } from './output-main.js';
 import { invoke, listen, lsGet, lsSet, toast } from './util.js';
+import { undoLast } from './undo.js';
+import { flushStore } from './store-sync.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -264,6 +266,13 @@ function initOutputControls() {
     btnFreeze.classList.toggle('primary', next);
   });
 
+  // 大屏开着时点主窗口 ✕：确认后先把数据存盘，再退出（大屏一起关）
+  listen('main:close-requested', async () => {
+    if (!window.confirm('大屏正在投屏，确定退出演出播放器吗？\n退出后大屏会一起关闭。')) return;
+    try { await flushStore(); } catch { /* 存盘失败也照样退出：改动仍在本机缓存里 */ }
+    invoke('quit_app').catch(() => {});
+  }).catch(() => {});
+
   // 输出窗口加载完成后自动同步画面
   listen('output:ready', () => {
     resyncOutput();
@@ -319,6 +328,12 @@ function initKeyboard() {
     }
     const now = document.activeElement;
     if (isTyping(now) || now?.tagName === 'SELECT') return;
+    // Ctrl+Z：撤销最近一次移除 / 清空（文字输入框里仍是普通的撤销输入）
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault();
+      undoLast();
+      return;
+    }
     // 其它模块保持原样：焦点在任何输入控件（如音量滑块）上时不处理快捷键
     if (module !== 'lyrics' && now?.tagName === 'INPUT') return;
 
@@ -391,13 +406,23 @@ function initKeyboard() {
       case 'x':
       case 'X':
         // 节目单里 X 容易误触，仅非节目单时关闭输出
+        // 与 Esc 一样先确认：演出中误按一下大屏就黑了
         if (module !== 'program') {
           e.preventDefault();
-          closeOutputFromMain();
+          if (window.confirm('确定关闭输出窗口？大屏将停止显示。')) closeOutputFromMain();
         }
         break;
     }
   });
+}
+
+function safeInit(name, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(`[boot] ${name} 失败`, err);
+    toast(`${name} 初始化失败：${err?.message || err}`, 6000);
+  }
 }
 
 function boot() {
@@ -409,23 +434,33 @@ function boot() {
     toast('错误：' + (r?.message || r), 6000);
   });
 
-  initTimers();
-  setPreviewEl($('preview-stage'));
-  initTabs();
-  initOutputControls();
-  initSettings();
-  initKeyboard();
+  // 顶栏计时 / 导入 / 清零必须最先挂上，避免后续模块抛错导致整页按钮假死
+  safeInit('计时器', initTimers);
+  safeInit('页签', initTabs);
+  safeInit('输出预览', () => setPreviewEl($('preview-stage')));
+  safeInit('输出控制', initOutputControls);
+  safeInit('设置', initSettings);
+  safeInit('快捷键', initKeyboard);
   // 节目单先初始化，确保默认活动存在，供音频列表绑定
-  initProgram();
-  initAudio();
-  initVideo();
-  initPpt();
-  initPdf();
-  initSpl();
-  initKaraoke();
-  initLyricsShow();
+  safeInit('节目单', initProgram);
+  safeInit('音频', initAudio);
+  safeInit('视频', initVideo);
+  safeInit('PPT', initPpt);
+  safeInit('PDF', initPdf);
+  safeInit('声压', initSpl);
+  safeInit('卡拉OK', initKaraoke);
+  safeInit('歌词', initLyricsShow);
   // 默认进入节目单：按一场演出的时间顺序走台
-  switchModule('program');
+  safeInit('切换模块', () => switchModule('program'));
+  window.__spMainReady = true;
+  if (typeof window.__spBootMark === 'function') {
+    window.__spBootMark('主模块就绪', true);
+    setTimeout(() => {
+      const b = document.getElementById('sp-boot-badge');
+      if (b) b.style.opacity = '0';
+      setTimeout(() => b?.remove(), 400);
+    }, 2500);
+  }
 }
 
 // 由 boot.js 在数据恢复后动态加载，此时 DOM 通常已就绪

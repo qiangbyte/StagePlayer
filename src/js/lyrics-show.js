@@ -2,10 +2,12 @@
 // 敬拜现场领唱随时可能转副歌：一个键就能切过去，大屏平滑滚动
 
 import {
-  pickFiles, esc, fileName, lsGet, lsSet, toast, convertFileSrc, invoke, IMAGE_EXT, VIDEO_EXT,
+  pickFiles, esc, fileName, lsGet, lsSet, toast, convertFileSrc, invoke, listen, IMAGE_EXT, VIDEO_EXT,
 } from './util.js';
 import { pushToOutput, claimOutputSeq, getCurrentOutput } from './output-main.js';
 import { renderOutput } from './output-core.js';
+import { pushUndo } from './undo.js';
+import { readPect } from './pect-import.js';
 import {
   parseLyricSheet, paletteFromColor, hslToHex, LSHOW_SWATCHES, defaultLshowBg,
 } from './lyrics-show-render.js';
@@ -13,20 +15,44 @@ import {
 const LS_SONGS = 'sp.lyrics.songs';
 const LS_STYLE = 'sp.lyrics.style';
 const LS_CUR = 'sp.lyrics.current';
+const LS_AUTO = 'sp.lyrics.autoPlay';
+const LS_MIC = 'sp.lyrics.micDevice';
 
 const $ = (id) => document.getElementById(id);
 const genId = () => 'ly' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
+/** scroll 一句一句滚动 / stanza 整段显示逐句高亮 / page 一段一页，按段翻 */
+const VIEWS = ['scroll', 'stanza', 'page'];
+const isPage = () => style.view === 'page';
+
 const SEC_KEYS = { chorus: 'C', verse: 'V', bridge: 'Q', pre: 'P', ending: 'E' };
 
 let songs = (lsGet(LS_SONGS, []) || []).filter((s) => s && s.id);
-let style = { view: 'scroll', step: 1, scale: 1, showLabel: true, showTitle: false, ...(lsGet(LS_STYLE, {}) || {}) };
+let style = { view: 'scroll', step: 1, scale: 1, font: 'fzchs', anim: 'fade', showLabel: true, showTitle: false, ...(lsGet(LS_STYLE, {}) || {}) };
+// 旧的「整段显示，逐句高亮」并入「一段一段」：整段显示就整段全亮、按段切换
+if (style.view === 'stanza') style = { ...style, view: 'page', step: 1 };
 let curId = lsGet(LS_CUR, null);
 /** 正在控制的歌（可能来自节目单快照，不在歌词库里） */
 let song = null;
-let sheet = { lines: [], secOf: [], sections: [] };
+let sheet = { lines: [], times: [], secOf: [], sections: [] };
 let active = 0;
 let filter = '';
+
+/** 自动播放：优先语音跟词（Sherpa 流式 ASR）；失败则回退字数/时间轴 */
+let autoPlay = !!lsGet(LS_AUTO, false);
+let autoArmed = false;
+let autoLineStartedAt = 0;
+let autoDwellMs = 4000;
+let autoRaf = 0;
+let autoManualHoldUntil = 0;
+let autoAsrMode = false; // true = 正在用麦克风 ASR 跟词
+let autoAsrText = '';
+let autoFollowUnlisten = null;
+/** off | open | wait | live | hear */
+let autoMicState = 'off';
+let autoMicName = '';
+let autoRmsDb = null;
+let autoMicPct = 0;
 
 function saveSongs() { lsSet(LS_SONGS, songs); }
 function saveStyle() { lsSet(LS_STYLE, style); }
@@ -50,6 +76,8 @@ function loadSong(s, at = 0) {
   renderEditor();
   renderLines();
   renderMini();
+  resetAutoClock();
+  paintAutoUi();
 }
 
 function isLive() {
@@ -57,7 +85,24 @@ function isLive() {
   return out?.kind === 'lyricshow' && !!song && out.songId === song.id;
 }
 
+function previewIndex() {
+  if (!sheet.lines.length) return -1;
+  if (isPage()) {
+    const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
+    return ns ? ns.start : -1;
+  }
+  if (style.step === 2) {
+    const sec = secAt(active);
+    const n = active + 2;
+    if (sec && n < sec.end) return n;
+    const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
+    return ns ? ns.start : -1;
+  }
+  return active + 1 < sheet.lines.length ? active + 1 : -1;
+}
+
 function payload() {
+  const preview = previewIndex();
   return {
     kind: 'lyricshow',
     songId: song.id,
@@ -66,11 +111,326 @@ function payload() {
     secOf: sheet.secOf,
     sections: sheet.sections,
     active,
+    preview,
+    autoPlay: autoPlay && autoArmed,
     step: style.step === 2 ? 2 : 1,
-    view: style.view === 'stanza' ? 'stanza' : 'scroll',
+    view: VIEWS.includes(style.view) ? style.view : 'scroll',
     bg: { ...defaultLshowBg(), ...(song.bg || {}) },
-    style: { scale: style.scale, showLabel: style.showLabel, showTitle: style.showTitle },
+    style: { scale: style.scale, font: style.font, anim: style.anim, showLabel: style.showLabel, showTitle: style.showTitle },
   };
+}
+
+/** 当前句停留时长：有 LRC 用时间差；否则按字数估算，并略早挂起「预计下一句」 */
+function dwellForActive() {
+  const times = sheet.times || [];
+  const t0 = times[active];
+  const next = previewIndex();
+  if (t0 != null && next >= 0 && times[next] != null && times[next] > t0) {
+    return Math.min(12000, Math.max(1800, (times[next] - t0) * 1000));
+  }
+  // 一段一页：按整段字数
+  if (isPage()) {
+    const sec = secAt(active);
+    const text = sec ? sheet.lines.slice(sec.start, sec.end).join('') : (sheet.lines[active] || '');
+    const chars = [...text].length;
+    return Math.min(14000, Math.max(3500, 2800 + chars * 220));
+  }
+  const line = sheet.lines[active] || '';
+  const chars = [...line].length;
+  return Math.min(9000, Math.max(2200, 1800 + chars * 360));
+}
+
+function resetAutoClock() {
+  autoArmed = false;
+  autoLineStartedAt = performance.now();
+  autoDwellMs = dwellForActive();
+}
+
+function stopAutoLoop() {
+  if (autoRaf) {
+    cancelAnimationFrame(autoRaf);
+    autoRaf = 0;
+  }
+}
+
+function micStateLabel() {
+  if (!autoPlay) return '未听干声';
+  if (!autoAsrMode) return '时间轴模式（未听干声）';
+  if (autoMicState === 'open') return autoMicName ? `已开输入 · ${autoMicName}` : '正在打开输入…';
+  if (autoMicState === 'wait') return autoMicName ? `已接 · 等待干声（${autoMicName}）` : '已接 · 等待干声';
+  if (autoMicState === 'live') return '干声有电平 · 等待识别';
+  if (autoMicState === 'hear') return `正在听唱 · ${autoAsrText || '…'}`;
+  return '语音跟词中';
+}
+
+function paintMicUi() {
+  const dot = $('lshow-auto-mic-dot');
+  const state = $('lshow-auto-mic-state');
+  const fill = $('lshow-auto-mic-fill');
+  const dbEl = $('lshow-auto-mic-db');
+  const row = $('lshow-auto-mic');
+  if (state) state.textContent = micStateLabel();
+  if (dot) dot.dataset.state = autoAsrMode ? autoMicState : 'off';
+  if (fill) fill.style.width = autoAsrMode ? `${Math.max(2, autoMicPct).toFixed(0)}%` : '0%';
+  if (dbEl) {
+    dbEl.textContent = autoAsrMode && autoRmsDb != null
+      ? `${autoRmsDb.toFixed(0)} dB`
+      : '—';
+  }
+  row?.classList.toggle('is-live', autoMicState === 'live' || autoMicState === 'hear');
+  row?.classList.toggle('is-wait', autoMicState === 'wait' || autoMicState === 'open');
+}
+
+async function refreshMicDevices() {
+  const sel = $('lshow-auto-mic-dev');
+  if (!sel) return;
+  try {
+    const list = await invoke('spl_list_inputs');
+    const saved = lsGet(LS_MIC, null);
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">系统默认输入</option>' + (list || []).map((d) =>
+      `<option value="${d.index}">${esc(d.name)}${d.isDefault ? '（默认）' : ''}</option>`
+    ).join('');
+    const prefer = cur !== '' ? cur : (saved != null ? String(saved) : '');
+    if (prefer !== '' && [...sel.options].some((o) => o.value === prefer)) sel.value = prefer;
+    else sel.value = '';
+  } catch {
+    sel.innerHTML = '<option value="">系统默认输入</option>';
+  }
+}
+
+function selectedMicIndex() {
+  const v = $('lshow-auto-mic-dev')?.value;
+  if (v === '' || v == null) return null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function paintAutoUi() {
+  const btn = $('lshow-auto');
+  const bar = $('lshow-auto-bar');
+  btn?.classList.toggle('is-on', autoPlay);
+  btn && (btn.textContent = autoPlay ? (autoAsrMode ? '语音跟词中' : '自动中') : '自动播放');
+  if (!bar) return;
+  bar.classList.toggle('hidden', !autoPlay || !song || !sheet.lines.length);
+  bar.classList.toggle('is-armed', autoArmed);
+  bar.classList.toggle('is-asr', autoAsrMode);
+  const cur = $('lshow-auto-cur');
+  const nxt = $('lshow-auto-next');
+  const timer = $('lshow-auto-timer');
+  const fill = $('lshow-auto-fill');
+  if (cur) {
+    cur.textContent = autoAsrText
+      ? `${sheet.lines[active] || '—'}  · 听：${autoAsrText}`
+      : (sheet.lines[active] || '—');
+  }
+  const pi = previewIndex();
+  if (nxt) {
+    nxt.textContent = pi >= 0
+      ? (autoArmed ? sheet.lines[pi] : `（将预告）${sheet.lines[pi]}`)
+      : '（已到末句）';
+  }
+  paintMicUi();
+  if (autoAsrMode) {
+    if (timer) {
+      if (autoMicState === 'wait' || autoMicState === 'open') timer.textContent = '等干声';
+      else if (autoArmed) timer.textContent = '换气抢跑中';
+      else if (autoMicState === 'hear') timer.textContent = '听唱匹配中';
+      else timer.textContent = '干声已接入';
+    }
+    if (fill) {
+      fill.style.width = autoArmed ? '85%'
+        : autoMicState === 'hear' ? '55%'
+          : autoMicState === 'live' ? '40%'
+            : '18%';
+    }
+    return;
+  }
+  const elapsed = performance.now() - autoLineStartedAt;
+  const pct = Math.max(0, Math.min(100, (elapsed / Math.max(1, autoDwellMs)) * 100));
+  const left = Math.max(0, autoDwellMs - elapsed);
+  if (timer) {
+    timer.textContent = autoPlay
+      ? (autoArmed ? `预告中 · ${(left / 1000).toFixed(1)}s` : `${(left / 1000).toFixed(1)}s`)
+      : '—';
+  }
+  if (fill) fill.style.width = pct.toFixed(1) + '%';
+}
+
+function autoTick() {
+  autoRaf = 0;
+  // 语音跟词模式下不走时间轴推进
+  if (!autoPlay || !song || !sheet.lines.length || autoAsrMode) {
+    paintAutoUi();
+    return;
+  }
+  if (performance.now() < autoManualHoldUntil) {
+    paintAutoUi();
+    autoRaf = requestAnimationFrame(autoTick);
+    return;
+  }
+  const elapsed = performance.now() - autoLineStartedAt;
+  const armAt = autoDwellMs * 0.72;
+  if (!autoArmed && previewIndex() >= 0 && elapsed >= armAt) {
+    autoArmed = true;
+    paintLines();
+    if (isLive()) push();
+  }
+  if (elapsed >= autoDwellMs) {
+    const before = active;
+    if (previewIndex() < 0) {
+      setAutoPlay(false);
+      toast('自动播放已到末句');
+      paintAutoUi();
+      return;
+    }
+    next({ fromAuto: true });
+    if (active === before) {
+      setAutoPlay(false);
+      toast('自动播放已到末句');
+    }
+  }
+  paintAutoUi();
+  if (autoPlay && !autoAsrMode) autoRaf = requestAnimationFrame(autoTick);
+}
+
+async function stopAsrFollow() {
+  autoAsrMode = false;
+  autoAsrText = '';
+  autoMicState = 'off';
+  autoMicName = '';
+  autoRmsDb = null;
+  autoMicPct = 0;
+  try { await invoke('lyric_follow_stop'); } catch { /* ignore */ }
+  if (autoFollowUnlisten) {
+    try { autoFollowUnlisten(); } catch { /* ignore */ }
+    autoFollowUnlisten = null;
+  }
+}
+
+async function startAsrFollow() {
+  await stopAsrFollow();
+  await refreshMicDevices();
+  let st = await invoke('lyric_asr_status');
+  if (!st?.ready) {
+    toast('首次使用需下载流式 ASR 模型（约 200MB）…');
+    st = await invoke('lyric_asr_ensure_model');
+  }
+  if (!st?.ready) throw new Error(st?.message || '模型未就绪');
+
+  const lines = sheet.lines.map((text) => ({
+    text,
+    songId: 1,
+    isTitle: false,
+  }));
+  autoMicState = 'open';
+  autoFollowUnlisten = await listen('sp-lyric-follow', (e) => {
+    const p = e?.payload || e;
+    if (!p || !autoPlay) return;
+    if (p.kind === 'input') {
+      autoMicName = p.text || '';
+      autoMicState = 'wait';
+      paintAutoUi();
+    }
+    if (p.kind === 'level') {
+      if (p.rmsDb != null) autoRmsDb = Number(p.rmsDb);
+      if (p.percent != null) autoMicPct = Number(p.percent);
+      if (autoAsrText) autoMicState = 'hear';
+      else if (autoRmsDb != null && autoRmsDb > -48) autoMicState = 'live';
+      else autoMicState = 'wait';
+      paintMicUi();
+      const timer = $('lshow-auto-timer');
+      if (timer && autoAsrMode && !autoArmed) {
+        timer.textContent = autoMicState === 'wait' ? '等干声'
+          : autoMicState === 'live' ? '干声已接入'
+            : '听唱匹配中';
+      }
+    }
+    if (p.kind === 'partial' && p.text) {
+      autoAsrText = p.text;
+      autoMicState = 'hear';
+      paintAutoUi();
+    }
+    if (p.kind === 'start') {
+      if (autoMicState === 'open') autoMicState = 'wait';
+      paintAutoUi();
+    }
+    if (p.kind === 'download' && p.message) {
+      const timer = $('lshow-auto-timer');
+      if (timer) timer.textContent = p.message;
+      if (p.percent != null && $('lshow-auto-fill')) {
+        $('lshow-auto-fill').style.width = Math.min(100, Number(p.percent)) + '%';
+      }
+    }
+    if (p.kind === 'armed') {
+      autoArmed = true;
+      paintLines();
+      paintAutoUi();
+      if (isLive()) push();
+    }
+    if (p.kind === 'jump' && p.index != null) {
+      autoArmed = false;
+      go(p.index | 0, { fromAuto: true });
+      paintAutoUi();
+    }
+    if (p.kind === 'error') {
+      toast('语音跟词：' + (p.message || '失败') + '，已改用时间轴');
+      autoAsrMode = false;
+      autoMicState = 'off';
+      resetAutoClock();
+      paintAutoUi();
+      autoRaf = requestAnimationFrame(autoTick);
+    }
+    if (p.kind === 'stop') {
+      autoAsrMode = false;
+      autoMicState = 'off';
+      paintAutoUi();
+    }
+  });
+
+  const deviceIndex = selectedMicIndex();
+  lsSet(LS_MIC, deviceIndex);
+  await invoke('lyric_follow_start', {
+    lines,
+    startIndex: active,
+    deviceIndex,
+    channel: 0,
+  });
+  autoAsrMode = true;
+  autoArmed = false;
+  paintAutoUi();
+}
+
+async function setAutoPlay(on, { toastOn = true } = {}) {
+  autoPlay = !!on;
+  lsSet(LS_AUTO, autoPlay);
+  stopAutoLoop();
+  await stopAsrFollow();
+  if (autoPlay) {
+    if (!song || !sheet.lines.length) {
+      autoPlay = false;
+      lsSet(LS_AUTO, false);
+      toast('请先选一首有歌词的歌');
+      paintAutoUi();
+      return;
+    }
+    resetAutoClock();
+    if (!isLive()) push();
+    try {
+      await startAsrFollow();
+      if (toastOn) toast('已开启语音跟词：看下方电平，有跳动才算干声接入');
+    } catch (err) {
+      autoAsrMode = false;
+      autoMicState = 'off';
+      autoRaf = requestAnimationFrame(autoTick);
+      if (toastOn) toast('语音跟词暂不可用，已用时间轴：' + (err?.message || err));
+    }
+  } else if (toastOn) {
+    toast('已关闭自动播放');
+  }
+  paintAutoUi();
+  paintLines();
+  if (isLive()) push();
 }
 
 function push(seq) {
@@ -81,10 +441,16 @@ function push(seq) {
   return pushToOutput(payload(), seq ?? claimOutputSeq()) !== false;
 }
 
-function go(i, { send = true } = {}) {
+function go(i, { send = true, fromAuto = false } = {}) {
   if (!sheet.lines.length) return false;
   active = Math.min(Math.max(0, i), sheet.lines.length - 1);
+  if (!fromAuto) {
+    autoManualHoldUntil = performance.now() + 1800;
+    if (autoAsrMode) invoke('lyric_follow_sync', { index: active }).catch(() => {});
+  }
+  resetAutoClock();
   paintLines();
+  paintAutoUi();
   renderMini();
   if (send) push();
   return true;
@@ -92,20 +458,29 @@ function go(i, { send = true } = {}) {
 
 function secAt(i) { return sheet.sections[sheet.secOf[i] | 0]; }
 
-function next() {
+function next({ fromAuto = false } = {}) {
   if (!sheet.lines.length) return false;
+  const opt = { fromAuto };
+  if (isPage()) {
+    const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
+    return ns ? go(ns.start, opt) : go(active, opt);
+  }
   if (style.step === 2) {
     const sec = secAt(active);
     const n = active + 2;
-    if (sec && n < sec.end) return go(n);
+    if (sec && n < sec.end) return go(n, opt);
     const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
-    return ns ? go(ns.start) : go(active);
+    return ns ? go(ns.start, opt) : go(active, opt);
   }
-  return go(active + 1);
+  return go(active + 1, opt);
 }
 
 function prev() {
   if (!sheet.lines.length) return false;
+  if (isPage()) {
+    const ps = sheet.sections[(sheet.secOf[active] | 0) - 1];
+    return ps ? go(ps.start) : go(secAt(active)?.start ?? 0);
+  }
   if (style.step === 2) {
     const sec = secAt(active);
     if (sec && active - 2 >= sec.start) return go(active - 2);
@@ -180,6 +555,31 @@ export function playLyricsItem(item, seq) {
 
 // ---------- 渲染 ----------
 
+/** 「显示模式」下拉 ⇄ 样式里的 view / step */
+const MODES = {
+  line: { view: 'scroll', step: 1 },
+  line2: { view: 'scroll', step: 2 },
+  page: { view: 'page', step: 1 },
+};
+function modeOf(st) {
+  if (st.view === 'page') return 'page';
+  return st.step === 2 ? 'line2' : 'line';
+}
+
+/** 字体是否装在本机：与等宽兜底字体比字宽，宽度不同即说明命中了该字体 */
+const fontCache = {};
+function fontInstalled(name) {
+  if (name in fontCache) return fontCache[name];
+  const g = document.createElement('canvas').getContext('2d');
+  const probe = '敬拜赞美永远歌唱主恩 Aa1';
+  return (fontCache[name] = ['monospace', 'serif'].some((base) => {
+    g.font = `40px ${base}`;
+    const w0 = g.measureText(probe).width;
+    g.font = `40px "${name}", ${base}`;
+    return g.measureText(probe).width !== w0;
+  }));
+}
+
 function renderList() {
   const box = $('lyrics-songs');
   if (!box) return;
@@ -212,9 +612,11 @@ function renderEditor() {
   document.querySelectorAll('#lshow-swatches .lshow-swatch').forEach((el) => {
     el.classList.toggle('active', el.dataset.color === bg.color);
   });
-  $('lshow-view').value = style.view;
-  $('lshow-step').value = String(style.step);
+  $('lshow-mode').value = modeOf(style);
   $('lshow-scale').value = String(style.scale);
+  $('lshow-font').value = style.font || 'fzchs';
+  $('lshow-anim').value = style.anim || 'fade';
+  $('lshow-font-tip')?.classList.toggle('hidden', (style.font || 'fzchs') !== 'fzchs' || fontInstalled('方正粗黑宋简体'));
   $('lshow-show-label').checked = style.showLabel !== false;
   $('lshow-show-title').checked = !!style.showTitle;
 }
@@ -249,11 +651,18 @@ function paintLines(instant = false) {
   const box = $('lshow-lines');
   if (!box) return;
   const lit = new Set([active]);
-  if (style.step === 2 && sheet.secOf[active + 1] === sheet.secOf[active] && active + 1 < sheet.lines.length) lit.add(active + 1);
+  if (isPage()) {
+    const sec = secAt(active);
+    if (sec) for (let i = sec.start; i < sec.end; i++) lit.add(i);
+  } else if (style.step === 2 && sheet.secOf[active + 1] === sheet.secOf[active] && active + 1 < sheet.lines.length) lit.add(active + 1);
+  const pi = previewIndex();
+  const showNext = autoPlay && autoArmed && pi >= 0 && !lit.has(pi);
   let first = null;
   box.querySelectorAll('.lshow-row').forEach((el) => {
-    const on = lit.has(+el.dataset.i);
+    const i = +el.dataset.i;
+    const on = lit.has(i);
     el.classList.toggle('active', on);
+    el.classList.toggle('is-next', showNext && i === pi);
     if (on && !first) first = el;
   });
   const si = sheet.secOf[active] | 0;
@@ -339,11 +748,42 @@ async function readTextFile(path) {
   }
 }
 
+/**
+ * 批量加入歌词库（.pect 导入用），按原顺序排在最前；同名同词的歌复用已有的（更新背景）。
+ * 返回对应的歌曲对象（顺序与传入一致）
+ */
+export function addLyricSongs(list) {
+  const out = [];
+  const fresh = [];
+  for (const it of list) {
+    let s = songs.find((x) => x.title === it.title && x.text === it.text);
+    if (s) {
+      s.bg = it.bg;
+      s.updatedAt = Date.now();
+    } else {
+      s = { id: genId(), title: it.title, text: it.text, bg: it.bg, updatedAt: Date.now() };
+      fresh.push(s);
+    }
+    out.push(s);
+  }
+  songs.unshift(...fresh);
+  saveSongs();
+  renderList();
+  // 大屏正在投别的歌时不切换当前歌（否则下一次 ↑↓ 会把刚导入的歌推上大屏）
+  if (out[0] && !isLive()) loadSong(out[0]);
+  return out;
+}
+
 async function importFiles() {
-  const files = await pickFiles([{ name: '歌词', extensions: ['txt', 'lrc'] }], '导入歌词');
+  const files = await pickFiles([{ name: '歌词 / 诗歌演示', extensions: ['txt', 'lrc', 'pect'] }], '导入歌词');
   let n = 0;
   for (const p of files) {
     try {
+      if (/\.pect$/i.test(p)) {
+        const { songs: list } = await readPect(p);
+        n += addLyricSongs(list).length;
+        continue;
+      }
       const text = await readTextFile(p);
       newSong(fileName(p).replace(/\.[^.]+$/, ''), text);
       n += 1;
@@ -435,13 +875,34 @@ export function initLyricsShow() {
   }
   $('lshow-del')?.addEventListener('click', () => {
     if (!song || !libSong(song.id)) return;
-    if (!window.confirm(`删除歌词「${song.title}」？`)) return;
-    songs = songs.filter((s) => s.id !== song.id);
+    const removed = song;
+    const at = songs.findIndex((s) => s.id === removed.id);
+    songs = songs.filter((s) => s.id !== removed.id);
     saveSongs();
     song = null;
     loadSong(songs[0] || null);
+    pushUndo(`删除歌词「${removed.title}」`, () => {
+      if (libSong(removed.id)) return;
+      songs.splice(Math.min(at, songs.length), 0, removed);
+      saveSongs();
+      loadSong(removed);
+    });
   });
   $('lshow-push')?.addEventListener('click', () => push());
+  $('lshow-auto')?.addEventListener('click', () => { setAutoPlay(!autoPlay); });
+  $('lshow-auto-mic-dev')?.addEventListener('change', async () => {
+    const v = $('lshow-auto-mic-dev')?.value;
+    lsSet(LS_MIC, v === '' ? null : parseInt(v, 10));
+    if (autoPlay && autoAsrMode) {
+      try {
+        await startAsrFollow();
+        toast('已切换干声输入设备');
+      } catch (err) {
+        toast('切换输入失败：' + (err?.message || err));
+      }
+    }
+  });
+  refreshMicDevices();
   $('lshow-to-program')?.addEventListener('click', addToProgram);
 
   $('lshow-secs')?.addEventListener('click', (e) => {
@@ -483,16 +944,17 @@ export function initLyricsShow() {
   });
 
   // 显示
-  $('lshow-view')?.addEventListener('change', (e) => setStyle({ view: e.target.value }));
-  $('lshow-step')?.addEventListener('change', (e) => {
-    setStyle({ step: +e.target.value === 2 ? 2 : 1 });
-    if (style.step === 2) {
-      // 对齐到「段首 + 偶数行」
-      const sec = secAt(active);
-      if (sec) go(sec.start + Math.floor((active - sec.start) / 2) * 2, { send: isLive() });
-    }
+  $('lshow-mode')?.addEventListener('change', (e) => {
+    setStyle(MODES[e.target.value] || MODES.line);
+    const sec = secAt(active);
+    if (!sec) return;
+    // 一段一页：回到段首；两句两句：对齐到「段首 + 偶数行」
+    if (isPage()) go(sec.start, { send: isLive() });
+    else if (style.step === 2) go(sec.start + Math.floor((active - sec.start) / 2) * 2, { send: isLive() });
   });
   $('lshow-scale')?.addEventListener('change', (e) => setStyle({ scale: +e.target.value }));
+  $('lshow-anim')?.addEventListener('change', (e) => setStyle({ anim: e.target.value }));
+  $('lshow-font')?.addEventListener('change', (e) => { setStyle({ font: e.target.value }); renderEditor(); });
   $('lshow-show-label')?.addEventListener('change', (e) => setStyle({ showLabel: e.target.checked }));
   $('lshow-show-title')?.addEventListener('change', (e) => setStyle({ showTitle: e.target.checked }));
 
@@ -502,7 +964,20 @@ export function initLyricsShow() {
   });
 
   // 输出被别的内容替换后刷新「投屏中」状态
-  document.addEventListener('sp:module-change', (e) => { if (e.detail === 'lyrics') { paintLines(true); renderMini(); } });
+  document.addEventListener('sp:module-change', (e) => {
+    if (e.detail === 'lyrics') {
+      paintLines(true);
+      renderMini();
+      paintAutoUi();
+    }
+  });
 
   loadSong(libSong(curId) || songs[0] || null);
+  // 冷启动不要自动抢麦 / 下 ASR 模型，否则顶栏按钮会像「按不动」
+  if (autoPlay && song && sheet.lines.length) {
+    autoAsrMode = false;
+    resetAutoClock();
+    autoRaf = requestAnimationFrame(autoTick);
+  }
+  paintAutoUi();
 }

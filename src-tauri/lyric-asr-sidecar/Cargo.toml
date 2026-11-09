@@ -1,0 +1,15 @@
+[package]
+name = "lyric-asr-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "独立 ASR 进程：避免与主程序 ort(MD) 的 CRT 冲突"
+
+[[bin]]
+name = "lyric-asr-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# 单独进程可用 static MT；勿与主程序 ort 同链
+sherpa-onnx = "2.0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
