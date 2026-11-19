@@ -53,7 +53,7 @@ async function saveOnce({ backup = false } = {}) {
   const body = JSON.stringify(data);
   if (body === lastSaved && !backup) {
     localStorage.removeItem(DIRTY);
-    return;
+    return true;
   }
   const savedAt = Date.now();
   const json = `{"version":${VERSION},"savedAt":${savedAt},"data":${body}}`;
@@ -63,6 +63,7 @@ async function saveOnce({ backup = false } = {}) {
     localStorage.setItem(SAVED_AT, String(savedAt));
     localStorage.removeItem(DIRTY);
     failWarned = false;
+    return true;
   } catch (err) {
     console.warn('[store] 保存失败', err);
     // 连续失败只提醒一次（磁盘满 / 文件被占用等），成功后再失败会重新提醒
@@ -70,6 +71,7 @@ async function saveOnce({ backup = false } = {}) {
       failWarned = true;
       toast('数据保存到磁盘失败：' + err + '（改动暂存在本机缓存，请检查磁盘空间）', 8000);
     }
+    return false;
   }
 }
 
@@ -83,7 +85,9 @@ function markDirty() {
 
 /** 立即落盘（导出、关闭前） */
 export function flushStore() {
-  return timer || localStorage.getItem(DIRTY) ? saveNow() : saving || Promise.resolve();
+  return timer || localStorage.getItem(DIRTY)
+    ? saveNow()
+    : saving || Promise.resolve(true);
 }
 
 /**

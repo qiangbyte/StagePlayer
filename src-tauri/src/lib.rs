@@ -1,5 +1,8 @@
 mod audio;
+mod audio_pack;
+mod llm;
 mod dialog;
+mod dictation_polish;
 mod fileio;
 mod karaoke;
 mod lyric_follow;
@@ -9,6 +12,8 @@ mod pptx;
 mod spl;
 mod stem;
 mod store;
+mod sysvol;
+mod transcribe;
 mod wave;
 
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize};
@@ -68,10 +73,6 @@ pub fn run() {
                 let _ = win.unminimize();
                 let _ = win.show();
                 let _ = win.set_focus();
-                #[cfg(debug_assertions)]
-                {
-                    win.open_devtools();
-                }
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -79,6 +80,8 @@ pub fn run() {
         .manage(fileio::ApprovedSavePaths::default())
         .manage(stem::StemLock(std::sync::atomic::AtomicBool::new(false)))
         .manage(lyric_follow::LyricFollowHandle::new())
+        .manage(transcribe::TranscribeState::default())
+        .manage(llm::SummaryState::default())
         .setup(|app| {
             app.manage(audio::AudioHandle::new(app.handle().clone()));
             app.manage(spl::SplHandle::new(app.handle().clone()));
@@ -92,22 +95,6 @@ pub fn run() {
                 ensure_main_on_screen(&win);
                 let _ = win.show();
                 let _ = win.set_focus();
-                // WebView2 刚 show 时立刻 open_devtools 常失败，延后补开
-                #[cfg(debug_assertions)]
-                {
-                    win.open_devtools();
-                    let win2 = win.clone();
-                    std::thread::spawn(move || {
-                        for delay_ms in [300u64, 900, 1800] {
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                            if !win2.is_devtools_open() {
-                                win2.open_devtools();
-                            } else {
-                                break;
-                            }
-                        }
-                    });
-                }
             }
             Ok(())
         })
@@ -116,12 +103,14 @@ pub fn run() {
                 return;
             }
             match ev {
-                // 大屏正在投屏时关主窗口：先交给前端确认（演出中误点 ✕ 大屏会跟着黑掉）
+                // 主窗口退出前先让前端保存数据；大屏打开时由前端额外确认。
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if output::should_confirm_close(win.app_handle()) {
+                    if output::should_intercept_close() {
                         api.prevent_close();
-                        let _ = win.emit("main:close-requested", ());
+                        let has_output = win.app_handle().get_webview_window("output").is_some();
+                        let _ = win.emit("main:close-requested", has_output);
                     } else {
+                        // 双击关闭作为前端卡死时的紧急退出方式。
                         output::destroy_output(win.app_handle());
                     }
                 }
@@ -153,6 +142,8 @@ pub fn run() {
             output::list_monitors,
             output::place_output_on_monitor,
             output::quit_app,
+            audio_pack::audio_pack_export,
+            audio_pack::audio_pack_import,
             audio::list_audio_output_devices,
             audio::audio_play,
             audio::audio_pause,
@@ -161,6 +152,8 @@ pub fn run() {
             audio::audio_set_volume,
             audio::audio_seek,
             audio::audio_state,
+            sysvol::system_volume_get,
+            sysvol::system_volume_set,
             audio::audio_set_vocal_cancel,
             wave::audio_wave,
             stem::stem_get_instrumental,
@@ -175,7 +168,19 @@ pub fn run() {
             lyric_follow::lyric_asr_ensure_model,
             lyric_follow::lyric_follow_start,
             lyric_follow::lyric_follow_stop,
-            lyric_follow::lyric_follow_sync
+            lyric_follow::lyric_follow_sync,
+            lyric_follow::dictation_start,
+            lyric_follow::dictation_stop,
+            dictation_polish::dictation_refine_status,
+            dictation_polish::dictation_ensure_refine_model,
+            dictation_polish::dictation_polish_text,
+            transcribe::transcribe_file,
+            transcribe::transcribe_cancel,
+            llm::ai_settings_get,
+            llm::ai_settings_set,
+            llm::ai_summarize,
+            llm::ai_refine,
+            llm::ai_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

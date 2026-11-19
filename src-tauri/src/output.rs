@@ -140,7 +140,7 @@ pub async fn close_output_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 上次「关主窗口需确认」的时间（毫秒）。5 秒内再点一次 ✕ 直接关闭：
+/// 上次「关主窗口」的时间（毫秒）。5 秒内再点一次 ✕ 直接关闭：
 /// 万一主界面卡死、确认框弹不出来，也不会关不掉
 static LAST_CLOSE_ASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -151,11 +151,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 关主窗口前是否要先让用户确认：只有大屏开着、且不是 5 秒内第二次点关闭
-pub fn should_confirm_close(app: &AppHandle) -> bool {
-    if app.get_webview_window("output").is_none() {
-        return false;
-    }
+/// 第一次关闭先交给前端保存；5 秒内再次点关闭则作为卡死时的强制退出。
+pub fn should_intercept_close() -> bool {
     let now = now_ms();
     let last = LAST_CLOSE_ASK.swap(now, std::sync::atomic::Ordering::Relaxed);
     now.saturating_sub(last) > 5000

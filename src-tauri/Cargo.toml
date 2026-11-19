@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "stage-player"
-version = "0.1.1"
+version = "0.1.11"
 description = "演出播放器：音频 / 视频 / PPT / PDF 一体化演出播放"
 authors = ["you"]
 edition = "2021"
@@ -36,11 +36,13 @@ rodio = { version = "0.20", features = [
   "symphonia-isomp4",
 ] }
 cpal = "0.15"
+# 转写模块直接用 symphonia 解码：rodio 的 ReadSeekSource 没有 byte_len，
+# 打不开 moov 在文件末尾的 m4a（微信/下载站常见）；这里改用 File 作为 MediaSource
+symphonia = { version = "0.5", default-features = false, features = [
+  "aac", "isomp4", "mp3", "flac", "wav", "ogg", "vorbis", "pcm", "adpcm", "mkv",
+] }
 rustfft = "6"
 realfft = "3"
-# AI 人声分离（HTDemucs ONNX）→ 本地缓存伴奏
-# Windows 上优先启用 DirectML（GPU），显著快于纯 CPU
-stem-splitter-core = { version = "1.2", features = ["directml", "onednn", "xnnpack"] }
 hound = "3"
 sha2 = "0.10"
 directories = "5"
@@ -50,14 +52,25 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 pinyin = "0.10"
 parking_lot = "0.12"
 
-# 视频缩略图：Windows 系统缩略图接口（IShellItemImageFactory）
+# AI 人声分离（HTDemucs ONNX）→ 本地缓存伴奏
+# Windows 上优先启用 DirectML（GPU），显著快于纯 CPU
+# 另有：视频缩略图（IShellItemImageFactory）、系统音量（IAudioEndpointVolume）
 [target.'cfg(windows)'.dependencies]
+stem-splitter-core = { version = "1.2", features = ["directml", "onednn", "xnnpack"] }
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
   "Win32_System_Com",
   "Win32_UI_Shell",
 ] }
+
+# macOS（Apple 芯片）：AI 人声分离只开 CoreML；DirectML / OneDNN / CUDA 在 Mac 上不存在，不能带进来
+[target.'cfg(target_os = "macos")'.dependencies]
+stem-splitter-core = { version = "1.2", default-features = false, features = ["coreml"] }
 
 # 开发态也给推理相关 crate 开优化，否则 AI 分离会极慢
 [profile.dev.package.stem-splitter-core]

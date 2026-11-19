@@ -32,6 +32,7 @@ npm run build     # 打包 NSIS 安装包
 
 ## 快捷键（主控窗口）
 
+- 音频页 `←` / `→`：直接切换上一首 / 下一首；`A` / `D`：预选上一首 / 下一首，`Enter` 确认播放（鼠标单击歌曲仍可直接播放）
 - `←` / `→`：PPT / PDF 上下页（需先点击过某一页）
 - `空格`：音频播放/暂停
 - `F`：打开并全屏输出窗口
@@ -90,3 +91,15 @@ src-tauri/
 - 正式版测速：以同样的环境变量直接运行 `src-tauri/target/release/stage-player.exe`，再 `node scripts/diag/bench-release.mjs <音频> <视频> [pptx]`
 - 注意：开发版（`127.0.0.1:1430`）与正式版（`tauri.localhost`）的 localStorage 互不共享，但两者读写同一个 `store.json`，启动时较新的一方会恢复到另一方（被覆盖的数据在 `backups/` 里）
 - `node scripts/diag/eval.mjs [--output] "<表达式>"` 或 `--file <脚本>`：在主控 / 输出窗口里执行一段 JS
+
+## macOS（Apple 芯片 M1/M2/M3…）安装包
+
+Windows 电脑编不出 Mac 的包，有两种办法（都需要真正的 macOS 环境）：
+
+1. **GitHub 自动打包（不需要自己有 Mac）**：把项目推到 GitHub，仓库页 `Actions → build-mac → Run workflow`，约 20–40 分钟后在页面底部 Artifacts 下载 `StagePlayer-macOS-arm64`（里面是 `.dmg`）。配置在 `.github/workflows/build-mac.yml`。
+2. **在自己的 Mac 上打包**：装好 Xcode 命令行工具、Node 20+、Rust 后执行 `bash scripts/build-mac.sh`，安装包在 `src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/`。
+
+注意：
+- 安装包没有 Apple 开发者签名。第一次打开如果提示“已损坏 / 无法验证开发者”，在终端执行 `xattr -cr /Applications/演出播放器.app`，或右键 → 打开。
+- 语音跟词首次使用会弹出麦克风授权，请点允许。
+- Mac 上没有 Windows 的两个系统接口：视频缩略图在 Mac 上不生成（显示占位图），系统音量联动不可用；其余功能（音频 / 视频 / PPT / PDF / 转写 / 总结 / 主题）同 Windows。

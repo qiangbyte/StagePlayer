@@ -1,7 +1,7 @@
 // 主控窗口入口：模块切换、侧栏、输出控制、快捷键
 
 import { initTimers } from './timers.js';
-import { initAudio, toggleAudio, audioStep } from './audio.js';
+import { initAudio, toggleAudio, audioStep, audioSelectStep, playSelectedAudio, nudgeAudioVolume } from './audio.js';
 import { initVideo } from './video.js';
 import { initPpt, pptNavigate } from './ppt.js';
 import { initPdf, pdfNavigate } from './pdf.js';
@@ -9,6 +9,10 @@ import { initProgram, programGo, programStep, programActiveType } from './progra
 import { initSpl } from './spl.js';
 import { initKaraoke } from './karaoke.js';
 import { initLyricsShow, lyricsHandleKey, lyricsProgramKey } from './lyrics-show.js';
+import { initTalkNotes } from './talk-notes.js';
+import { initTranscribe } from './transcribe.js';
+import { initTheme } from './theme.js';
+import { initStageNotes } from './stage-notes.js';
 import {
   setPreviewEl, getCurrentOutput, pushFitMode, toggleBlack, setOutputFrozen, isOutputFrozen,
   resyncOutput,
@@ -27,6 +31,8 @@ const MODULES = {
   program: { listTitle: '本场演出' },
   lyrics: { listTitle: '歌词库', importEv: 'sp:import-lyrics', noClear: true },
   spl: { listTitle: '声压测量' },
+  talk: { listTitle: '讲话记录', noClear: true },
+  transcribe: { listTitle: '转写记录', noClear: true },
 };
 
 const SIDEBAR_MAP = {
@@ -36,6 +42,8 @@ const SIDEBAR_MAP = {
   pdf: 'pdf-docs-wrap',
   program: 'program-events-wrap',
   lyrics: 'lyrics-list-wrap',
+  talk: 'talk-list-wrap',
+  transcribe: 'tr-list-wrap',
 };
 
 let module = 'audio';
@@ -58,6 +66,24 @@ function switchModule(m) {
 document.addEventListener('sp:switch-module', (e) => {
   if (e.detail && MODULES[e.detail]) switchModule(e.detail);
 });
+
+/** 右侧「输出预览 + 演出备忘」栏可折叠成窄条，腾出空间给中间内容；状态会记住 */
+function initPreviewCollapse() {
+  const app = $('app');
+  const btn = $('preview-toggle');
+  if (!app || !btn) return;
+  const apply = (collapsed) => {
+    app.classList.toggle('preview-collapsed', collapsed);
+    btn.textContent = collapsed ? '◂' : '▸';
+    btn.title = collapsed ? '展开右侧栏（输出预览 / 演出备忘）' : '收起右侧栏（腾出更多空间）';
+  };
+  apply(!!lsGet('sp.ui.previewCollapsed', false));
+  btn.addEventListener('click', () => {
+    const next = !app.classList.contains('preview-collapsed');
+    apply(next);
+    lsSet('sp.ui.previewCollapsed', next);
+  });
+}
 
 function initTabs() {
   document.querySelectorAll('.tab').forEach((tab) => {
@@ -278,11 +304,25 @@ function initOutputControls() {
     btnFreeze.classList.toggle('primary', next);
   });
 
-  // 大屏开着时点主窗口 ✕：确认后先把数据存盘，再退出（大屏一起关）
-  listen('main:close-requested', async () => {
-    if (!window.confirm('大屏正在投屏，确定退出演出播放器吗？\n退出后大屏会一起关闭。')) return;
-    try { await flushStore(); } catch { /* 存盘失败也照样退出：改动仍在本机缓存里 */ }
-    invoke('quit_app').catch(() => {});
+  // 关闭主窗口前先落盘；存盘失败时让用户重试或明确选择仍然退出。
+  listen('main:close-requested', async (event) => {
+    if (event.payload && !window.confirm('大屏正在投屏，确定退出演出播放器吗？\n退出后大屏会一起关闭。')) return;
+
+    let saved = false;
+    try { saved = await flushStore(); } catch { saved = false; }
+    while (!saved) {
+      const retry = window.confirm(
+        '演出数据保存失败，目前改动只在本机缓存中。\n\n选择“确定”重试保存；选择“取消”仍要退出。',
+      );
+      if (!retry) break;
+      try { saved = await flushStore(); } catch { saved = false; }
+    }
+
+    try {
+      await invoke('quit_app');
+    } catch (err) {
+      toast('退出播放器失败：' + err, 6000);
+    }
   }).catch(() => {});
 
   // 输出窗口加载完成后自动同步画面
@@ -323,6 +363,26 @@ function isTyping(el) {
   return ['text', 'search', 'number', 'email', 'url', 'password', 'tel', ''].includes(el.type || '');
 }
 
+/** 音量提示只占一条：按住 ↑/↓ 时原地刷新数字，不刷屏 */
+let volToastTimer = 0;
+function showVolumeToast(v) {
+  let box = document.getElementById('sp-toast-box');
+  if (!box) {
+    toast(`音乐音量 ${Math.round(v * 100)}%`, 1500);
+    return;
+  }
+  let el = document.getElementById('sp-vol-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'sp-vol-toast';
+    el.className = 'sp-toast';
+    box.appendChild(el);
+  }
+  el.textContent = `音乐音量 ${Math.round(v * 100)}%`;
+  clearTimeout(volToastTimer);
+  volToastTimer = setTimeout(() => el.remove(), 1500);
+}
+
 function initKeyboard() {
   // 输出窗口获得焦点时，按键转发到这里（全屏在同一块屏上时常见）
   listen('output:key', (ev) => {
@@ -331,23 +391,54 @@ function initKeyboard() {
   }).catch(() => {});
 
   document.addEventListener('keydown', (e) => {
-    const active = document.activeElement;
+    let active = document.activeElement;
+    // 正在打字：快捷键全部让开（讲话记录 / 备注 / 搜索框等）
+    if (isTyping(active)) return;
+
+    const isSpace = e.key === ' ';
+    const isEnter = e.key === 'Enter';
     const tag = active?.tagName;
-    // 歌词模块：点过滑块 / 下拉框 / 按钮后焦点留在控件上，上下键仍要能换行
-    if (module === 'lyrics' && !isTyping(active) && active && active !== document.body
-      && ['INPUT', 'SELECT', 'BUTTON'].includes(tag)) {
-      active.blur();
+
+    // 空格是演出主快捷键（暂停音乐 / 换行 / 下一条）：
+    // 焦点若留在「循环」按钮、音量滑条、下拉框上，浏览器会先点控件，导致歌停不掉。
+    if (isSpace) {
+      if (active && active !== document.body && active !== document.documentElement) {
+        const sticky =
+          tag === 'BUTTON' ||
+          tag === 'SELECT' ||
+          tag === 'SUMMARY' ||
+          (tag === 'INPUT' &&
+            ['range', 'checkbox', 'radio', 'button', 'file', 'color'].includes(active.type || ''));
+        if (sticky) {
+          e.preventDefault();
+          active.blur();
+        }
+      }
+    } else {
+      // 歌词模块：点过滑块 / 下拉框 / 按钮后焦点留在控件上，上下键仍要能换行
+      if (
+        module === 'lyrics' &&
+        !isEnter &&
+        active &&
+        active !== document.body &&
+        ['INPUT', 'SELECT', 'BUTTON'].includes(tag)
+      ) {
+        active.blur();
+      }
+      active = document.activeElement;
+      if (isTyping(active) || active?.tagName === 'SELECT') return;
+      // Enter 聚焦按钮时只保留按钮自身点击，避免同时切歌或推进节目
+      if (active?.tagName === 'BUTTON' && isEnter) return;
+      // 其它模块：焦点在文本以外的 INPUT（如音量滑块）上时不抢快捷键
+      if (module !== 'lyrics' && active?.tagName === 'INPUT') return;
     }
-    const now = document.activeElement;
-    if (isTyping(now) || now?.tagName === 'SELECT') return;
+
     // Ctrl+Z：撤销最近一次移除 / 清空（文字输入框里仍是普通的撤销输入）
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
       e.preventDefault();
       undoLast();
       return;
     }
-    // 其它模块保持原样：焦点在任何输入控件（如音量滑块）上时不处理快捷键
-    if (module !== 'lyrics' && now?.tagName === 'INPUT') return;
 
     // 歌词投屏：换行 / 段落跳转（B、F、Esc 等全局键不拦）
     if (module === 'lyrics' && lyricsHandleKey(e)) {
@@ -375,6 +466,18 @@ function initKeyboard() {
       }
     }
 
+    // 音频页：方向键预选歌曲，Enter 确认播放
+    if (module === 'audio' && e.key === 'Enter') {
+      e.preventDefault();
+      playSelectedAudio();
+      return;
+    }
+    if (module === 'audio' && (e.key === 'a' || e.key === 'A' || e.key === 'd' || e.key === 'D')) {
+      e.preventDefault();
+      audioSelectStep(e.key.toLowerCase() === 'a' ? -1 : 1);
+      return;
+    }
+
     switch (e.key) {
       case ' ':
         e.preventDefault();
@@ -400,6 +503,18 @@ function initKeyboard() {
         e.preventDefault();
         if (!navigatePages(-1) && module === 'audio') toast('请先导入音频');
         break;
+      case 'ArrowUp':
+      case 'ArrowDown': {
+        // 音乐推子：↑/↓ 每次 5%，Shift 微调 1%（键盘音量键调的是 Windows 系统总音量，与此无关）
+        const onAudio = module === 'audio' || (module === 'program' && programActiveType() === 'audio');
+        if (!onAudio) break;
+        e.preventDefault();
+        const step = (e.shiftKey ? 0.01 : 0.05) * (e.key === 'ArrowUp' ? 1 : -1);
+        const v = nudgeAudioVolume(step);
+        // 节目单页看不到推子，给个提示
+        if (v != null && module !== 'audio') showVolumeToast(v);
+        break;
+      }
       case 'f':
       case 'F':
         openOutput(true);
@@ -447,9 +562,12 @@ function boot() {
   });
 
   // 顶栏计时 / 导入 / 清零必须最先挂上，避免后续模块抛错导致整页按钮假死
+  safeInit('主题', initTheme);
   safeInit('计时器', initTimers);
   safeInit('页签', initTabs);
   safeInit('输出预览', () => setPreviewEl($('preview-stage')));
+  safeInit('右侧栏折叠', initPreviewCollapse);
+  safeInit('演出备忘', initStageNotes);
   safeInit('输出控制', initOutputControls);
   safeInit('设置', initSettings);
   safeInit('快捷键', initKeyboard);
@@ -462,6 +580,8 @@ function boot() {
   safeInit('声压', initSpl);
   safeInit('卡拉OK', initKaraoke);
   safeInit('歌词', initLyricsShow);
+  safeInit('讲话记录', initTalkNotes);
+  safeInit('转写', initTranscribe);
   // 默认进入节目单：按一场演出的时间顺序走台
   safeInit('切换模块', () => switchModule('program'));
   window.__spMainReady = true;

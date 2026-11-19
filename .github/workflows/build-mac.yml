@@ -1,0 +1,47 @@
+name: build-mac
+
+# 在 GitHub 的 Apple 芯片机器上打 macOS 安装包（.dmg）。
+# 用法：把项目推到 GitHub → 仓库页 Actions → build-mac → Run workflow；跑完在页面底部 Artifacts 下载。
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  dmg:
+    runs-on: macos-14 # Apple 芯片（arm64）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 这个文件指向 Windows 版 sherpa-onnx 本地压缩包，在 Mac 上要去掉，让构建自动下载对应的 macOS 版
+      - name: 移除 Windows 专用的 cargo 配置
+        run: rm -f src-tauri/.cargo/config.toml
+
+      - run: npm ci
+
+      - name: 编译语音跟词 sidecar
+        run: |
+          npm run sidecar:release
+          npm run sidecar:stage
+
+      - name: 打包 dmg
+        run: npx tauri build --bundles dmg --target aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StagePlayer-macOS-arm64
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error

@@ -366,6 +366,15 @@ export function initProgram() {
   $('pg-audio-loop')?.addEventListener('click', () => {
     cycleLoopMode();
     syncAudioBar(true);
+    $('pg-audio-loop')?.blur();
+  });
+  // 点完节目单音乐条控件后清焦点，避免空格误触循环/按钮而停不了歌
+  $('pg-audio-bar')?.addEventListener('pointerup', (e) => {
+    const el = e.target.closest?.('input[type="range"], button, select');
+    if (!el) return;
+    setTimeout(() => {
+      if (document.activeElement === el) el.blur();
+    }, 0);
   });
 
   const seek = $('pg-audio-seek');

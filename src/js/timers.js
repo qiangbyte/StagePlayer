@@ -51,6 +51,7 @@ export function initTimers() {
   let cdRunning = false;
   let cdRemain = 0;     // 秒
   let cdTimer = null;
+  let cdEndAt = 0;      // performance.now() 计时截止点，避免后台/卡顿导致倒计时变慢
 
   const cdRender = () => {
     cdEl.textContent = fmtTimeLong(cdRemain);
@@ -71,20 +72,26 @@ export function initTimers() {
   }
 
   cdStart.addEventListener('click', () => {
-    if (cdRunning) { cdStop(false); return; }
+    if (cdRunning) {
+      cdRemain = Math.max(0, Math.ceil((cdEndAt - performance.now()) / 1000));
+      cdStop(false);
+      cdRender();
+      return;
+    }
     if (cdRemain <= 0) {
       cdRemain = Math.max(0, parseInt(cdMin.value || '0', 10) * 60);
     }
     if (cdRemain <= 0) return;
+    cdEndAt = performance.now() + cdRemain * 1000;
     cdStop(true);
     cdTimer = setInterval(() => {
-      cdRemain = Math.max(0, cdRemain - 1);
+      cdRemain = Math.max(0, Math.ceil((cdEndAt - performance.now()) / 1000));
       cdRender();
       if (cdRemain === 0) {
         cdStop(false);
         toast('⏰ 倒计时时间到！', 6000);
       }
-    }, 1000);
+    }, 100);
   });
 
   cdReset.addEventListener('click', () => {

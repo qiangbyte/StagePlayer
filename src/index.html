@@ -4,7 +4,19 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>StagePlayer 演出播放器</title>
-  <link rel="stylesheet" href="css/app.css?v=audio-note3" />
+  <link rel="stylesheet" href="css/app.css?v=th1" />
+  <link rel="stylesheet" href="css/themes.css?v=th1" />
+  <script>
+    // 首屏前先套上上次选的主题，避免从深色闪到浅色（正式逻辑在 js/theme.js）
+    try {
+      var t = JSON.parse(localStorage.getItem('sp.ui.theme') || 'null');
+      var a = JSON.parse(localStorage.getItem('sp.ui.accent') || 'null');
+      var r = document.documentElement;
+      if (t === 'auto') t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      if (t && t !== 'dark') r.setAttribute('data-theme', t);
+      if (a && a !== 'blue') r.setAttribute('data-accent', a);
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <div id="app">
@@ -24,6 +36,8 @@
         <button class="tab" data-module="ppt">PPT</button>
         <button class="tab" data-module="pdf">PDF</button>
         <button class="tab" data-module="spl">声压</button>
+        <button class="tab" data-module="talk">讲话记录</button>
+        <button class="tab" data-module="transcribe" title="录音文件转文字（本地模型）+ DeepSeek 总结">转写</button>
       </nav>
 
       <div class="spacer"></div>
@@ -59,6 +73,26 @@
         <div class="settings-wrap">
           <button id="btn-settings" class="btn" title="显示器 / 画面适配 / 音频声卡">⚙ 设置</button>
           <div id="settings-pop" class="pop hidden">
+            <div class="pop-title">界面主题</div>
+            <div class="theme-grid" id="theme-grid">
+              <button type="button" class="theme-card" data-theme="auto" title="跟随系统的明暗设置"><span class="theme-sw"></span>跟随系统</button>
+              <button type="button" class="theme-card" data-theme="dark"><span class="theme-sw"></span>深色</button>
+              <button type="button" class="theme-card" data-theme="light"><span class="theme-sw"></span>浅色</button>
+              <button type="button" class="theme-card" data-theme="sepia" title="米黄底色，长时间看更舒服"><span class="theme-sw"></span>护眼</button>
+              <button type="button" class="theme-card" data-theme="midnight"><span class="theme-sw"></span>深蓝</button>
+            </div>
+            <div class="pop-row accent-row">
+              <label>强调色</label>
+              <span class="accent-dots" id="accent-dots">
+                <button type="button" class="accent-dot" data-accent="blue" title="蓝色"></button>
+                <button type="button" class="accent-dot" data-accent="green" title="青绿"></button>
+                <button type="button" class="accent-dot" data-accent="purple" title="紫色"></button>
+                <button type="button" class="accent-dot" data-accent="orange" title="橙色"></button>
+                <button type="button" class="accent-dot" data-accent="rose" title="玫红"></button>
+              </span>
+            </div>
+            <div class="pop-tip">只改主控界面；扩展屏上的输出画面不受影响</div>
+            <div class="pop-divider"></div>
             <div class="pop-title">投屏设置</div>
             <div class="pop-row">
               <label>输出显示器</label>
@@ -104,6 +138,8 @@
             <button type="button" class="mini-btn" id="audio-dir-add" title="新建目录">＋目录</button>
             <button type="button" class="mini-btn" id="audio-dir-rename" title="重命名当前目录">改名</button>
             <button type="button" class="mini-btn danger" id="audio-dir-del" title="删除当前目录">删</button>
+            <button type="button" class="mini-btn" id="audio-pack-export" title="把曲库与设置打成包，换电脑可导入">打包导出</button>
+            <button type="button" class="mini-btn" id="audio-pack-import" title="导入 .spaudio 曲库包（含设置）">打包导入</button>
           </div>
         </div>
         <div id="video-list-wrap" class="file-list-wrap dir-wrap" style="display:none">
@@ -141,6 +177,20 @@
             <button type="button" class="mini-btn accent" id="lyrics-new" title="新建一首歌词">＋新歌</button>
           </div>
           <div id="lyrics-songs" class="file-list"></div>
+        </div>
+        <div id="talk-list-wrap" class="file-list-wrap talk-list-wrap" style="display:none">
+          <div class="lyrics-list-head">
+            <input type="search" id="talk-search" class="rename-input" placeholder="搜索主题 / 姓名 / 内容" />
+            <button type="button" class="mini-btn accent" id="talk-new" title="新建讲话记录">＋新建</button>
+          </div>
+          <div id="talk-list" class="file-list"></div>
+        </div>
+        <div id="tr-list-wrap" class="file-list-wrap talk-list-wrap" style="display:none">
+          <div class="lyrics-list-head">
+            <input type="search" id="tr-search" class="rename-input" placeholder="搜索文件名 / 内容" />
+            <button type="button" class="mini-btn accent" id="tr-new" title="新建转写">＋新建</button>
+          </div>
+          <div id="tr-list" class="file-list"></div>
         </div>
       </aside>
 
@@ -201,6 +251,12 @@
                     <input type="number" id="audio-fade-out" class="cue-num" min="0" max="60" step="1" value="0" />
                     <span class="cue-unit">秒</span>
                   </label>
+                  <label class="cue-field" title="空=用全局默认推子；填写后只影响这一首">音量
+                    <input type="number" id="audio-item-vol" class="cue-num cue-num-wide" min="0" max="100" step="1" value="" placeholder="默认" />
+                    <span class="cue-unit">%</span>
+                  </label>
+                  <button type="button" class="mini-btn" id="audio-vol-from-fader" title="把下方 VOL 推子数值填入本曲音量">用推子</button>
+                  <button type="button" class="mini-btn" id="audio-vol-reset" title="清除本曲音量预设，恢复全局默认">重置音量</button>
                   <button type="button" class="mini-btn primary" id="audio-cue-apply">保存</button>
                   <span class="cue-tip" id="audio-cue-tip">先选一首歌</span>
                 </div>
@@ -258,22 +314,31 @@
               </div>
 
               <div class="audio-controls">
-                <button class="ctrl-btn" id="audio-prev" title="上一首">⏮</button>
-                <button class="ctrl-btn big" id="audio-play" title="播放/暂停">▶</button>
-                <button class="ctrl-btn" id="audio-next" title="下一首">⏭</button>
-                <span class="vol-wrap" title="软件推子">
-                  <span class="vol-label">VOL</span>
-                  <input type="range" id="audio-volume" min="0" max="1" step="0.01" value="0.9" />
-                  <span class="vol-pct mono" id="audio-vol-label">90%</span>
-                  <span class="vol-db mono" id="audio-vol-db">-0.9 dB</span>
-                </span>
-                <button class="mini-btn" id="audio-vol-unity" title="音量回到 100%（0 dB）">0 dB</button>
-                <button class="mini-btn" id="audio-loop" title="列表策略：列表循环 / 全局单曲 / 顺序停。卡片右上角循环只改本曲">列表循环</button>
-                <button class="mini-btn" id="audio-push-card" title="推到扩展屏：有同名 .lrc/.txt 则滚歌词，否则标题卡">推送歌词/标题</button>
-                <button class="mini-btn hl" id="audio-karaoke" title="消除立体声中置人声（保留贝斯），导出 WAV 伴奏文件">消除人声导出</button>
-                <label class="check"><input type="checkbox" id="audio-auto-push" checked />自动推送</label>
-                <span class="grow"></span>
-                <span class="hint-inline">VOL%=推子 · 电平表≈M32刻度(dBFS)</span>
+                <div class="audio-ctrl-row audio-ctrl-main">
+                  <button class="ctrl-btn" id="audio-prev" title="上一首">⏮</button>
+                  <button class="ctrl-btn big" id="audio-play" title="播放/暂停">▶</button>
+                  <button class="ctrl-btn" id="audio-next" title="下一首">⏭</button>
+                  <span class="vol-wrap" title="软件推子 · 键盘 ↑/↓ 每次 5%，Shift+↑/↓ 每次 1%。若本曲设了预设音量，开播会自动切到该值">
+                    <span class="vol-label">VOL</span>
+                    <input type="range" id="audio-volume" min="0" max="1" step="0.01" value="0.9" />
+                    <span class="vol-pct mono" id="audio-vol-label">90%</span>
+                    <span class="vol-db mono" id="audio-vol-db">-0.9 dB</span>
+                  </span>
+                  <button class="mini-btn" id="audio-vol-unity" title="音量回到 100%（0 dB）">0 dB</button>
+                  <span class="vol-wrap sys-vol-wrap" id="sys-vol-wrap" title="Windows 系统音量（默认播放设备）。键盘 Fn+音量键调的就是它。实际出声 = 系统 × VOL">
+                    <span class="vol-label">系统</span>
+                    <input type="range" id="sys-volume" min="0" max="1" step="0.01" value="0" />
+                    <span class="vol-pct mono" id="sys-vol-label">--</span>
+                  </span>
+                  <button class="mini-btn" id="audio-loop" title="列表策略：列表循环 / 全局单曲 / 顺序停。卡片右上角循环只改本曲">列表循环</button>
+                </div>
+                <div class="audio-ctrl-row audio-ctrl-extra">
+                  <button class="mini-btn" id="audio-push-card" title="推到扩展屏：有同名 .lrc/.txt 则滚歌词，否则标题卡">推送歌词/标题</button>
+                  <button class="mini-btn hl" id="audio-karaoke" title="消除立体声中置人声（保留贝斯），导出 WAV 伴奏文件">消除人声导出</button>
+                  <label class="check"><input type="checkbox" id="audio-auto-push" checked />自动推送</label>
+                  <span class="grow"></span>
+                  <span class="hint-inline">↑/↓ 调推子（Shift 微调）· 本曲音量在「本曲设置」</span>
+                </div>
               </div>
             </div>
           </div>
@@ -435,7 +500,15 @@
                   <span class="lshow-mic-state" id="lshow-auto-mic-state">未听干声</span>
                   <div class="lshow-mic-meter" title="干声电平" aria-hidden="true"><div class="lshow-mic-fill" id="lshow-auto-mic-fill"></div></div>
                   <span class="lshow-mic-db mono" id="lshow-auto-mic-db">—</span>
-                  <select id="lshow-auto-mic-dev" class="lshow-mic-dev" title="主领干声输入设备"></select>
+                  <select id="lshow-auto-mic-dev" class="lshow-mic-dev" title="主领干声输入设备（如 M32 / DN32-LIVE）"></select>
+                  <label class="lshow-mic-ch-wrap" title="M32 分轨：主领干声（进 ASR）">
+                    <span>干声</span>
+                    <select id="lshow-auto-mic-ch" class="lshow-mic-ch"></select>
+                  </label>
+                  <label class="lshow-mic-ch-wrap" title="同设备参考声道：Click / 鼓组 / 伴奏总线。只辅助节奏，不进识别">
+                    <span>参考</span>
+                    <select id="lshow-auto-mic-ref" class="lshow-mic-ch"></select>
+                  </label>
                 </div>
                 <div class="lshow-auto-now"><span class="muted">当前</span> <span id="lshow-auto-cur">—</span></div>
                 <div class="lshow-auto-next"><span class="lshow-auto-next-tag">预计下一句</span> <span id="lshow-auto-next">—</span></div>
@@ -709,6 +782,173 @@
           <div class="hint">拖滑条缩放缩略图（与右侧预览同比例）· 悬停卡片可操作 · 单击即可播放</div>
         </div>
 
+        <!-- 讲话记录：日期 / 主题 / 姓名 + 实时识别保存 -->
+        <div class="panel" data-module="talk" id="panel-talk">
+          <div class="talk-layout">
+            <div class="talk-main">
+              <div class="lib-toolbar">
+                <div class="lib-title-wrap">
+                  <span class="lib-kicker">讲话记录</span>
+                  <span class="talk-status" id="talk-status">未开始</span>
+                </div>
+                <button type="button" class="mini-btn accent" id="talk-rec" title="开始/停止实时识别">开始识别</button>
+                <button type="button" class="mini-btn" id="talk-polish" title="对已落句文本加标点并替换热词（录音中也可点，不会停录）">润色文本</button>
+                <button type="button" class="mini-btn primary" id="talk-save" title="保存当前记录">保存</button>
+                <button type="button" class="mini-btn" id="talk-export" title="导出为文本">导出</button>
+                <button type="button" class="mini-btn danger" id="talk-del" title="删除当前记录">删除</button>
+              </div>
+              <div class="talk-meta">
+                <label>日期 <input type="date" id="talk-date" /></label>
+                <label>主题 <input type="text" id="talk-topic" maxlength="120" placeholder="例如：主日信息 · 信心" /></label>
+                <label>姓名 <input type="text" id="talk-speaker" maxlength="60" placeholder="讲员姓名" /></label>
+              </div>
+              <div class="talk-mic" id="talk-mic">
+                <span class="lshow-mic-dot" id="talk-mic-dot" data-state="off"></span>
+                <span class="talk-mic-state" id="talk-mic-state">未听输入</span>
+                <div class="lshow-mic-meter" aria-hidden="true"><div class="lshow-mic-fill" id="talk-mic-fill"></div></div>
+                <span class="lshow-mic-db mono" id="talk-mic-db">—</span>
+                <select id="talk-mic-dev" class="lshow-mic-dev" title="讲话输入设备"></select>
+                <label class="lshow-mic-ch-wrap" title="分轨声道">
+                  <span>声道</span>
+                  <select id="talk-mic-ch" class="lshow-mic-ch"></select>
+                </label>
+              </div>
+              <div class="talk-live-wrap">
+                <div class="talk-live-label">实时识别</div>
+                <div class="talk-live" id="talk-live" contenteditable="true" spellcheck="false"
+                  data-placeholder="点「开始识别」后，讲话内容会实时显示在这里；也可手动改字。"></div>
+                <div class="talk-partial" id="talk-partial"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 录音转文字：本地 SenseVoice 转写 + DeepSeek 总结 -->
+        <div class="panel" data-module="transcribe" id="panel-transcribe">
+          <div class="tr-layout">
+            <div class="lib-toolbar">
+              <div class="lib-title-wrap">
+                <span class="lib-kicker">录音转文字</span>
+                <span class="talk-status" id="tr-status">就绪</span>
+              </div>
+              <button type="button" class="mini-btn accent" id="tr-pick" title="选择录音文件（m4a / mp3 / wav / flac / aac / ogg）">选择音频</button>
+              <button type="button" class="mini-btn primary" id="tr-start" title="本地模型转写，不上传音频">开始转写</button>
+              <button type="button" class="mini-btn danger hidden" id="tr-cancel">取消</button>
+              <button type="button" class="mini-btn" id="tr-copy" title="复制转写文字">复制文字</button>
+              <button type="button" class="mini-btn" id="tr-export" title="导出转写文字为 txt">导出文字</button>
+              <button type="button" class="mini-btn danger" id="tr-del" title="删除当前记录">删除</button>
+            </div>
+            <div class="tr-file-row">
+              <input type="text" id="tr-path" spellcheck="false" placeholder="音频文件路径：可直接粘贴，或点「选择音频」" />
+              <label class="tr-lang">语言
+                <select id="tr-lang" title="自动识别适合普通话/粤语/英语混合；已知语种时指定更稳">
+                  <option value="auto">自动</option>
+                  <option value="zh">普通话</option>
+                  <option value="yue">粤语</option>
+                  <option value="en">英语</option>
+                  <option value="ja">日语</option>
+                  <option value="ko">韩语</option>
+                </select>
+              </label>
+            </div>
+            <div class="tr-progress" id="tr-progress">
+              <div class="tr-progress-fill" id="tr-fill"></div>
+              <span class="tr-progress-text mono" id="tr-progress-text"></span>
+            </div>
+            <div class="tr-split">
+              <div class="tr-box">
+                <div class="tr-box-head">
+                  <span class="talk-live-label">转写文字（可直接修改）</span>
+                  <button type="button" class="mini-btn" id="tr-text-zoom" title="放大查看，可滚动阅读">⤢ 放大</button>
+                </div>
+                <textarea id="tr-text" class="tr-text" spellcheck="false"
+                  placeholder="转写结果会实时出现在这里，每段前面带时间点。&#10;首次使用会自动下载本地模型 SenseVoice（约 230MB）。"></textarea>
+              </div>
+              <div class="tr-box">
+                <div class="tr-box-head">
+                  <span class="talk-live-label" id="tr-ai-title">AI 总结</span>
+                  <span class="tr-box-tools">
+                    <button type="button" class="mini-btn" id="tr-sum-mode" title="切换：格式预览 / 编辑 Markdown 源码">编辑源码</button>
+                    <button type="button" class="mini-btn" id="tr-sum-zoom" title="放大查看，可滚动阅读">⤢ 放大</button>
+                  </span>
+                </div>
+                <div class="tr-sum-tabs is-empty" id="tr-sum-tabs"></div>
+                <div class="tr-ai-bar">
+                  <select id="tr-preset" title="总结风格">
+                    <option value="sermon">讲道 / 讲座</option>
+                    <option value="meeting">会议纪要</option>
+                    <option value="brief">200 字摘要</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                  <button type="button" class="mini-btn primary" id="tr-sum" title="把左侧文字发给 DeepSeek 总结（仅发送文字，不发送音频）">AI 总结</button>
+                  <button type="button" class="mini-btn danger hidden" id="tr-sum-stop">停止</button>
+                  <button type="button" class="mini-btn" id="tr-sum-copy">复制</button>
+                  <button type="button" class="mini-btn" id="tr-sum-export" title="导出总结为 Markdown">导出</button>
+                </div>
+                <details class="tr-settings" id="tr-settings">
+                  <summary>AI 设置与提示词 <span class="tr-key-state" id="tr-key-state">未设置 Key</span></summary>
+                  <div class="tr-settings-body">
+                    <div class="tr-settings-row">
+                      <label class="tr-lbl" for="tr-provider">总结服务</label>
+                      <select id="tr-provider" title="选择用哪家大模型做总结">
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="qwen">千问 Qwen</option>
+                      </select>
+                    </div>
+                    <div class="tr-settings-row">
+                      <input type="password" id="tr-key" autocomplete="off" spellcheck="false" placeholder="DeepSeek API Key（sk-…），只保存在本机" />
+                      <input type="text" id="tr-model" list="tr-model-list" spellcheck="false" placeholder="模型" />
+                      <datalist id="tr-model-list">
+                        <option value="deepseek-chat"></option>
+                        <option value="deepseek-reasoner"></option>
+                      </datalist>
+                      <button type="button" class="mini-btn primary" id="tr-key-save">保存</button>
+                      <button type="button" class="mini-btn danger" id="tr-key-clear" title="从本机删除已保存的 Key">清除 Key</button>
+                    </div>
+                    <div class="hint" id="tr-hint">Key 只写入本机配置文件，不进入节目单/导出文件。</div>
+                    <textarea id="tr-prompt" class="tr-prompt" rows="5" spellcheck="false" placeholder="总结要求（提示词）"></textarea>
+                  </div>
+                </details>
+                <div id="tr-summary-view" class="tr-md" tabindex="0" aria-label="AI 总结（格式预览）"></div>
+                <textarea id="tr-summary" class="tr-text hidden" spellcheck="false"
+                  placeholder="转写完成后点「AI 总结」，结果会逐字显示在这里。"></textarea>
+                <div class="tr-refine">
+                  <div class="tr-refine-quick" id="tr-refine-quick">
+                    <span class="tr-refine-label">精修</span>
+                    <button type="button" class="tr-chip" data-q="整体更精炼，删掉重复和啰嗦的表述。">更精炼</button>
+                    <button type="button" class="tr-chip" data-q="内容更详细，补充论证过程和例子。">更详细</button>
+                    <button type="button" class="tr-chip" data-q="对照转写文稿，核对并纠正人名、术语、经文出处中的错字和错误。">纠错核对</button>
+                    <button type="button" class="tr-chip" data-q="把文稿里提到的经文出处补全到对应段落。">补经文出处</button>
+                    <button type="button" class="tr-chip" data-q="洞察部分精简，每类最多保留一条。">精简洞察</button>
+                    <span class="tr-ver" id="tr-ver"></span>
+                  </div>
+                  <div class="tr-refine-row">
+                    <textarea id="tr-refine-input" rows="2" spellcheck="false"
+                      placeholder="哪里有问题就写在这里，例如：第三节太啰嗦请精简；“……”那句不是原话请对照文稿改正。Ctrl+Enter 提交"></textarea>
+                    <div class="tr-refine-btns">
+                      <button type="button" class="mini-btn primary" id="tr-refine-go" title="让 AI 按修改意见改一版（Ctrl+Enter）">精修</button>
+                      <button type="button" class="mini-btn" id="tr-undo" title="回到上一版总结" disabled>↶ 撤销</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 放大查看：全屏阅读转写文字 / AI 总结，字号可调，可滚动 -->
+          <div id="tr-viewer" class="tr-viewer hidden" role="dialog" aria-modal="true" aria-label="放大查看">
+            <div class="tr-viewer-bar">
+              <span class="tr-viewer-title" id="tr-viewer-title"></span>
+              <span class="tr-vtabs" id="tr-viewer-tabs"></span>
+              <span class="tr-viewer-spacer"></span>
+              <span class="tr-viewer-size" id="tr-viewer-size"></span>
+              <button type="button" class="mini-btn" id="tr-viewer-smaller" title="缩小字号">A−</button>
+              <button type="button" class="mini-btn" id="tr-viewer-bigger" title="放大字号">A＋</button>
+              <button type="button" class="mini-btn primary" id="tr-viewer-close" title="关闭（Esc）">关闭</button>
+            </div>
+            <div class="tr-viewer-cols" id="tr-viewer-cols" data-n="1"></div>
+          </div>
+        </div>
+
         <!-- 声压测量 -->
         <div class="panel" data-module="spl" id="panel-spl">
           <div class="spl-layout">
@@ -795,15 +1035,26 @@
 
       <!-- 输出预览 -->
       <aside id="preview">
-        <div class="preview-head">输出预览（实时）</div>
+        <div class="preview-head">
+          <span class="preview-head-title">输出预览（实时）</span>
+          <button type="button" class="preview-toggle" id="preview-toggle" title="收起右侧栏（腾出更多空间）">▸</button>
+        </div>
         <div id="preview-wrap"><div id="preview-stage"></div></div>
         <div class="preview-tips">
           <div>演出快捷键（主控操作）</div>
           <div>Enter 下一条节目 · G 播放当前</div>
           <div>F 全屏 · Esc 关闭输出 · B 黑屏</div>
-          <div>←/→ 音频切歌 · PPT/PDF 翻页</div>
+          <div>音频：←/→ 切歌 · A/D 预选 · Enter 播放</div>
+          <div>PPT/PDF：←/→ 翻页</div>
           <div>空格 音乐暂停/播放</div>
         </div>
+        <section class="stage-notes" id="stage-notes" aria-label="演出备忘">
+          <div class="stage-notes-head">
+            <span>演出备忘</span>
+            <button type="button" class="stage-note-add" id="stage-note-add">＋ 添加一行</button>
+          </div>
+          <div class="stage-note-list" id="stage-note-list"></div>
+        </section>
       </aside>
     </main>
 

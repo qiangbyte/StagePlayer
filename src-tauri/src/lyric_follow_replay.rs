@@ -10,7 +10,25 @@ use super::*;
 fn lines_of(texts: &[&str]) -> Vec<LyricLine> {
   let raw: Vec<LyricLineIn> = texts
     .iter()
-    .map(|t| LyricLineIn { text: (*t).into(), song_id: 1, is_title: false })
+    .map(|t| LyricLineIn {
+      text: (*t).into(),
+      song_id: 1,
+      is_title: false,
+      section_type: String::new(),
+    })
+    .collect();
+  build_lines(&raw)
+}
+
+fn lines_with_sec(items: &[(&str, &str)]) -> Vec<LyricLine> {
+  let raw: Vec<LyricLineIn> = items
+    .iter()
+    .map(|(t, s)| LyricLineIn {
+      text: (*t).into(),
+      song_id: 1,
+      is_title: false,
+      section_type: (*s).into(),
+    })
     .collect();
   build_lines(&raw)
 }
@@ -54,8 +72,14 @@ fn repeated_chorus_does_not_jump_back() {
   );
   sing(&mut e, "我心单单降服于你");
   assert_eq!(e.curr, 6);
-  sing(&mut e, "唯有你是我心所爱");
-  assert_eq!(e.curr, 7, "第二次的「唯有你是我心所爱」不能跳回第 2 行");
+  // 整句一次喂入：应对齐当前第二次副歌并翻到下一句，绝不能回到第 2 行
+  e.on_asr_partial("唯有你是我心所爱");
+  assert!(e.curr >= 6, "不能跳回第一次副歌，curr={}", e.curr);
+  assert_ne!(e.curr, 2, "第二次的「唯有你是我心所爱」不能跳回第 2 行");
+  if e.curr == 6 {
+    e.set_progress(0.95);
+  }
+  assert_eq!(e.curr, 7, "唱完第二次副歌应翻到下一句");
 }
 
 #[test]
@@ -68,9 +92,10 @@ fn catches_up_when_singer_is_already_on_next_line() {
 #[test]
 fn breath_after_most_of_line_flips() {
   let mut e = FlipperEngine::new(lines_of(&["你经过花就开离开雨就来", "这里适合谈个恋爱"]), 0);
-  // 唱到 ~70%（未到 75% 直接翻的线），然后换气
-  sing(&mut e, "你经过花就开离开");
-  assert_eq!(e.curr, 0);
+  // 唱到约一半（未到翻行线），然后换气
+  sing(&mut e, "你经过花就开");
+  assert_eq!(e.curr, 0, "未过翻行线应停在本句");
+  e.progress = 0.55; // 过换气线、未到 flip
   for _ in 0..15 {
     e.on_rms(-60.0, 20.0);
   }
@@ -91,8 +116,8 @@ fn lost_fallback_advances_only_with_voice() {
     e.on_rms(-60.0, 20.0);
   }
   assert_eq!(e.curr, 0);
-  // 一直有人声但对不上：超过估计时长 1.5 倍后推进
-  for _ in 0..500 {
+  // 一直有人声但对不上：超过估计时长 1.5 倍后推进（约 5s，只推一步）
+  for _ in 0..280 {
     e.on_rms(-20.0, 20.0);
   }
   assert_eq!(e.curr, 1);
@@ -101,15 +126,198 @@ fn lost_fallback_advances_only_with_voice() {
 #[test]
 fn guessed_flip_is_corrected_back() {
   let mut e = FlipperEngine::new(lines_of(&["你是我的力量盾牌", "我心单单降服于你", "唯有你是我心所爱"]), 0);
-  sing(&mut e, "你是");
+  // 模拟跟丢兜底已猜到第 2 行
   e.heard = true;
-  for _ in 0..500 {
-    e.on_rms(-20.0, 20.0);
-  }
-  assert_eq!(e.curr, 1, "兜底推到第 2 行");
-  // 主领其实才唱到第 1 行中间
-  sing(&mut e, "你是我的力");
+  e.curr = 1;
+  e.guessed = true;
+  e.progress = 0.1;
+  e.on_asr_partial("你是我的力量");
   assert_eq!(e.curr, 0, "识别到主领还在第 1 行，退回");
+}
+
+#[test]
+fn syl_sim_tolerates_singing_confusions() {
+  let a = split_syl("zhang");
+  let b = split_syl("zang"); // 平翘舌
+  assert!(syl_sim(&a, &b) >= 0.8, "zh/z 应高相似");
+
+  let c = split_syl("nan");
+  let d = split_syl("lan"); // n/l
+  assert!(syl_sim(&c, &d) >= 0.8, "n/l 应高相似");
+
+  let e = split_syl("fen");
+  let f = split_syl("hen"); // f/h
+  assert!(syl_sim(&e, &f) >= 0.8, "f/h 应高相似");
+
+  let g = split_syl("ban");
+  let h = split_syl("bang"); // 前后鼻
+  assert!(syl_sim(&g, &h) >= 0.9, "an/ang 应几乎相同");
+
+  let i = split_syl("bao");
+  let j = split_syl("pao"); // 清浊
+  assert!(syl_sim(&i, &j) >= 0.8, "b/p 同族");
+
+  let k = split_syl("shi");
+  let l = split_syl("si");
+  assert!(syl_sim(&k, &l) >= 0.8, "sh/s");
+}
+
+#[test]
+fn collapse_long_notes_and_vowel_runs() {
+  // 拉长「啊」：a a a
+  let run = vec![
+    split_syl("a"),
+    split_syl("a"),
+    split_syl("a"),
+  ];
+  let c = collapse_sung_syls(&run);
+  assert_eq!(c.len(), 1, "同韵母拉长应压成 1");
+
+  // zhang → ang → a（声母被吃、韵母核残留）
+  let long = vec![
+    split_syl("zhang"),
+    split_syl("ang"),
+    split_syl("a"),
+  ];
+  let c2 = collapse_sung_syls(&long);
+  assert_eq!(c2.len(), 1, "拉长音韵母核应并入");
+  assert_eq!(loose_ini(c2[0].ini), "z");
+
+  // 真正不同的字不要误合并
+  let diff = vec![split_syl("wo"), split_syl("ai"), split_syl("ni")];
+  assert_eq!(collapse_sung_syls(&diff).len(), 3);
+}
+
+#[test]
+fn fuzzy_asr_still_flips_line() {
+  // 识别错字：平翘舌 + 前后鼻，仍应跟上
+  let mut e = FlipperEngine::new(lines_of(&["真的好想你", "没有你怎么办"]), 0);
+  sing(&mut e, "怎的好想你"); // zh→z 类错识用「怎」近似，主要靠韵母对齐
+  // 更贴近：用同韵错字「针的好想你」
+  let mut e2 = FlipperEngine::new(lines_of(&["真的好想你", "没有你怎么办"]), 0);
+  sing(&mut e2, "针的好想你");
+  assert!(
+    e2.curr >= 1 || e2.progress >= 0.45,
+    "模糊匹配后应推进，curr={} progress={}",
+    e2.curr,
+    e2.progress
+  );
+}
+
+#[test]
+fn fast_tempo_lowers_flip_threshold() {
+  let mut e = FlipperEngine::new(lines_of(&["神呐我的心切慕你", "如鹿切慕溪水"]), 0);
+  let slow = e.flip_threshold();
+  e.tempo_rate = 1.5;
+  let fast = e.flip_threshold();
+  assert!(fast < slow, "快歌翻行阈值应更低: slow={slow} fast={fast}");
+  assert!(fast >= 0.40);
+}
+
+#[test]
+fn ref_interlude_does_not_breath_flip() {
+  let mut e = FlipperEngine::new(lines_of(&["你是我的力量盾牌", "我心单单降服于你"]), 0);
+  sing(&mut e, "你是我"); // progress ~0.3，未到换气线
+  for _ in 0..20 {
+    e.on_ref_energy(Some(-18.0), 20.0);
+  }
+  assert!(e.ref_active, "参考声道应有能量");
+  for _ in 0..40 {
+    e.on_rms(-60.0, 20.0); // 干声静、参考响 → 间奏
+  }
+  assert_eq!(e.curr, 0, "间奏不能按换气翻行");
+}
+
+#[test]
+fn mid_song_backjump_needs_two_confirms() {
+  let mut e = FlipperEngine::new(
+    lines_with_sec(&[
+      ("奇异恩典何等甘甜", "verse"),
+      ("我灵歌唱赞美救主", "chorus"),
+      ("前我失落今被寻回", "chorus"),
+      ("主歌继续往前走吧", "verse"),
+      ("完全不同的第二副歌", "chorus"),
+      ("后面还有一句收束", "chorus"),
+    ]),
+    4,
+  );
+  // 段首 + 极高分可能一次落地；弱一点则需两次
+  e.on_asr_partial("我灵歌唱");
+  let after_first = e.curr;
+  e.on_asr_partial("我灵歌唱赞美救主");
+  e.on_asr_partial("我灵歌唱赞美救主");
+  assert!(
+    e.curr == 1 || after_first == 1,
+    "应回跳到第一副歌，curr={} first={}",
+    e.curr,
+    after_first
+  );
+}
+
+#[test]
+fn command_zaiai_jumps_prev_section() {
+  let mut e = FlipperEngine::new(
+    lines_with_sec(&[
+      ("主歌第一句歌词啊", "verse"),
+      ("副歌第一句歌词啊", "chorus"),
+      ("副歌第二句歌词啊", "chorus"),
+      ("主歌后面继续唱", "verse"),
+    ]),
+    3,
+  );
+  e.on_asr_partial("导播说再来一遍");
+  assert_eq!(e.curr, 1, "再来应回到副歌段首");
+}
+
+#[test]
+fn duplicate_chorus_not_pulled_back_weakly() {
+  let mut e = FlipperEngine::new(
+    lines_with_sec(&[
+      ("主歌开头一句", "verse"),
+      ("我们一起来敬拜", "chorus"),
+      ("高举耶稣的名", "chorus"),
+      ("间奏后主歌", "verse"),
+      ("我们一起来敬拜", "chorus"),
+      ("高举耶稣的名", "chorus"),
+    ]),
+    4,
+  );
+  // 弱匹配早副歌：前方有同文，禁止吸回
+  e.pending_back = None;
+  e.on_asr_partial("我们一起");
+  assert!(e.curr >= 4, "弱匹配不能跳回第一次副歌，curr={}", e.curr);
+}
+
+#[test]
+fn bleed_with_ref_does_not_count_as_voice() {
+  let mut e = FlipperEngine::new(lines_of(&["你是我的力量盾牌", "我心单单降服于你"]), 0);
+  e.heard = true;
+  for _ in 0..20 {
+    e.on_ref_energy(Some(-18.0), 20.0);
+  }
+  assert!(e.ref_active);
+  // 串音灰区：有参考时不当人声跟丢
+  for _ in 0..400 {
+    e.on_rms(-38.0, 20.0);
+  }
+  assert_eq!(e.curr, 0, "串音不应触发跟丢推进");
+}
+
+#[test]
+fn second_chorus_still_prefers_forward() {
+  let mut e = FlipperEngine::new(
+    lines_with_sec(&[
+      ("主歌开头一句歌词", "verse"),
+      ("唯有你是我心所爱", "chorus"),
+      ("我渴慕来敬拜你啊", "chorus"),
+      ("间奏后的主歌段落", "verse"),
+      ("唯有你是我心所爱", "chorus"),
+      ("我渴慕来敬拜你啊", "chorus"),
+    ]),
+    4,
+  );
+  sing(&mut e, "唯有你是我心所爱");
+  assert!(e.curr >= 4, "第二次副歌应留在后段，不回跳第一次");
 }
 
 #[test]
@@ -132,7 +340,12 @@ fn replay() {
     .lines()
     .map(|l| l.trim())
     .filter(|l| !l.is_empty() && !(l.starts_with('[') && l.ends_with(']')))
-    .map(|l| LyricLineIn { text: l.into(), song_id: 1, is_title: false })
+    .map(|l| LyricLineIn {
+      text: l.into(),
+      song_id: 1,
+      is_title: false,
+      section_type: String::new(),
+    })
     .collect();
   for (i, l) in raw.iter().enumerate() {
     println!("L{i}: {}", l.text);

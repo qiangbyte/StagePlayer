@@ -174,14 +174,14 @@ fn shell_thumb(path: &str) -> Option<image::DynamicImage> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
-    use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::IBindCtx;
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_BIGGERSIZEOK,
         SIIGBF_THUMBNAILONLY,
     };
     unsafe {
-        // 线程池线程可能已初始化过 COM（返回 S_FALSE / RPC_E_CHANGED_MODE 均可继续用）
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // 线程池线程可能已经初始化 COM；只对本次成功取得的初始化引用做配对释放。
+        let _com = ShellComGuard::initialize();
         let factory: IShellItemImageFactory =
             SHCreateItemFromParsingName(&HSTRING::from(path), None::<&IBindCtx>).ok()?;
         let flags = SIIGBF(SIIGBF_THUMBNAILONLY.0 | SIIGBF_BIGGERSIZEOK.0);
@@ -189,6 +189,26 @@ fn shell_thumb(path: &str) -> Option<image::DynamicImage> {
         let img = bitmap_to_image(hbm);
         let _ = DeleteObject(HGDIOBJ(hbm.0));
         img
+    }
+}
+
+#[cfg(windows)]
+struct ShellComGuard(bool);
+
+#[cfg(windows)]
+impl ShellComGuard {
+    unsafe fn initialize() -> Self {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        Self(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShellComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
     }
 }
 

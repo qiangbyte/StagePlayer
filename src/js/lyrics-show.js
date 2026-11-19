@@ -17,6 +17,8 @@ const LS_STYLE = 'sp.lyrics.style';
 const LS_CUR = 'sp.lyrics.current';
 const LS_AUTO = 'sp.lyrics.autoPlay';
 const LS_MIC = 'sp.lyrics.micDevice';
+const LS_MIC_CH = 'sp.lyrics.micChannel';
+const LS_MIC_REF = 'sp.lyrics.refChannel';
 
 const $ = (id) => document.getElementById(id);
 const genId = () => 'ly' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -38,7 +40,7 @@ let sheet = { lines: [], times: [], secOf: [], sections: [] };
 let active = 0;
 let filter = '';
 
-/** 自动播放：优先语音跟词（Sherpa 流式 ASR）；失败则回退字数/时间轴 */
+/** 自动播放：优先语音跟词（FunASR-Nano 歌词模型）；失败则回退字数/时间轴 */
 let autoPlay = !!lsGet(LS_AUTO, false);
 let autoArmed = false;
 let autoLineStartedAt = 0;
@@ -96,9 +98,11 @@ function previewIndex() {
     const n = active + 2;
     if (sec && n < sec.end) return n;
     const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
-    return ns ? ns.start : -1;
+    if (ns) return ns.start;
+    return sheet.lines.length ? 0 : -1;
   }
-  return active + 1 < sheet.lines.length ? active + 1 : -1;
+  if (active + 1 < sheet.lines.length) return active + 1;
+  return sheet.lines.length ? 0 : -1;
 }
 
 function payload() {
@@ -153,13 +157,23 @@ function stopAutoLoop() {
   }
 }
 
+function micChLabel() {
+  const ch = selectedMicChannel();
+  return `Ch${ch + 1}`;
+}
+
 function micStateLabel() {
   if (!autoPlay) return '未听干声';
   if (!autoAsrMode) return '时间轴模式（未听干声）';
-  if (autoMicState === 'open') return autoMicName ? `已开输入 · ${autoMicName}` : '正在打开输入…';
-  if (autoMicState === 'wait') return autoMicName ? `已接 · 等待干声（${autoMicName}）` : '已接 · 等待干声';
-  if (autoMicState === 'live') return '干声有电平 · 等待识别';
-  if (autoMicState === 'hear') return `正在听唱 · ${autoAsrText || '…'}`;
+  const ch = micChLabel();
+  if (autoMicState === 'open') {
+    return autoMicName ? `已开输入 · ${autoMicName} · ${ch}` : `正在打开输入… · ${ch}`;
+  }
+  if (autoMicState === 'wait') {
+    return autoMicName ? `已接 · 等待干声（${autoMicName} · ${ch}）` : `已接 · 等待干声 · ${ch}`;
+  }
+  if (autoMicState === 'live') return `干声有电平 · ${ch} · 等待识别`;
+  if (autoMicState === 'hear') return `正在听唱 · ${ch} · ${autoAsrText || '…'}`;
   return '语音跟词中';
 }
 
@@ -181,6 +195,36 @@ function paintMicUi() {
   row?.classList.toggle('is-wait', autoMicState === 'wait' || autoMicState === 'open');
 }
 
+function fillMicChannels(maxCh) {
+  const chSel = $('lshow-auto-mic-ch');
+  const refSel = $('lshow-auto-mic-ref');
+  const n = Math.max(1, Math.min(64, parseInt(maxCh, 10) || 1));
+  if (chSel) {
+    const saved = lsGet(LS_MIC_CH, 0);
+    const cur = chSel.value !== '' ? parseInt(chSel.value, 10) : NaN;
+    chSel.innerHTML = Array.from({ length: n }, (_, i) =>
+      `<option value="${i}">${i + 1}</option>`
+    ).join('');
+    const prefer = Number.isFinite(cur) ? cur : (Number.isFinite(+saved) ? +saved : 0);
+    chSel.value = String(Math.max(0, Math.min(n - 1, prefer)));
+  }
+  if (refSel) {
+    const savedRef = lsGet(LS_MIC_REF, null);
+    const curRef = refSel.value !== '' ? parseInt(refSel.value, 10) : NaN;
+    refSel.innerHTML = '<option value="">无</option>' + Array.from({ length: n }, (_, i) =>
+      `<option value="${i}">${i + 1}</option>`
+    ).join('');
+    if (Number.isFinite(curRef) && curRef >= 0 && curRef < n) {
+      refSel.value = String(curRef);
+    } else if (savedRef != null && savedRef !== '' && Number.isFinite(+savedRef)) {
+      const v = Math.max(0, Math.min(n - 1, +savedRef));
+      refSel.value = String(v);
+    } else {
+      refSel.value = '';
+    }
+  }
+}
+
 async function refreshMicDevices() {
   const sel = $('lshow-auto-mic-dev');
   if (!sel) return;
@@ -188,14 +232,17 @@ async function refreshMicDevices() {
     const list = await invoke('spl_list_inputs');
     const saved = lsGet(LS_MIC, null);
     const cur = sel.value;
-    sel.innerHTML = '<option value="">系统默认输入</option>' + (list || []).map((d) =>
-      `<option value="${d.index}">${esc(d.name)}${d.isDefault ? '（默认）' : ''}</option>`
-    ).join('');
+    sel.innerHTML = '<option value="" data-ch="1">系统默认输入</option>' + (list || []).map((d) => {
+      const ch = d.maxChannels || d.max_channels || 1;
+      return `<option value="${d.index}" data-ch="${ch}">${esc(d.name)}${d.isDefault ? '（默认）' : ''} · ${ch}ch</option>`;
+    }).join('');
     const prefer = cur !== '' ? cur : (saved != null ? String(saved) : '');
     if (prefer !== '' && [...sel.options].some((o) => o.value === prefer)) sel.value = prefer;
     else sel.value = '';
+    fillMicChannels(sel.selectedOptions[0]?.dataset?.ch || 1);
   } catch {
-    sel.innerHTML = '<option value="">系统默认输入</option>';
+    sel.innerHTML = '<option value="" data-ch="1">系统默认输入</option>';
+    fillMicChannels(1);
   }
 }
 
@@ -204,6 +251,32 @@ function selectedMicIndex() {
   if (v === '' || v == null) return null;
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : null;
+}
+
+function selectedMicChannel() {
+  const n = parseInt($('lshow-auto-mic-ch')?.value, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+/** @returns {number|null} 参考声道；无则 null */
+function selectedRefChannel() {
+  const v = $('lshow-auto-mic-ref')?.value;
+  if (v === '' || v == null) return null;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  // 与干声相同则视为关闭
+  if (n === selectedMicChannel()) return null;
+  return n;
+}
+
+async function restartAsrMic(msg) {
+  if (!(autoPlay && autoAsrMode)) return;
+  try {
+    await startAsrFollow();
+    if (msg) toast(msg);
+  } catch (err) {
+    toast('切换输入失败：' + (err?.message || err));
+  }
 }
 
 function paintAutoUi() {
@@ -226,9 +299,13 @@ function paintAutoUi() {
   }
   const pi = previewIndex();
   if (nxt) {
-    nxt.textContent = pi >= 0
-      ? (autoArmed ? sheet.lines[pi] : `（将预告）${sheet.lines[pi]}`)
-      : '（已到末句）';
+    if (pi >= 0) {
+      nxt.textContent = autoArmed ? sheet.lines[pi] : `（将预告）${sheet.lines[pi]}`;
+    } else if (autoPlay && sheet.lines.length) {
+      nxt.textContent = `（再唱 → ${sheet.lines[0] || '开头'}）`;
+    } else {
+      nxt.textContent = '（已到末句）';
+    }
   }
   paintMicUi();
   if (autoAsrMode) {
@@ -278,16 +355,16 @@ function autoTick() {
   }
   if (elapsed >= autoDwellMs) {
     const before = active;
-    if (previewIndex() < 0) {
-      setAutoPlay(false);
-      toast('自动播放已到末句');
-      paintAutoUi();
-      return;
-    }
+    const wrapping =
+      (isPage()
+        ? (sheet.secOf[active] | 0) >= sheet.sections.length - 1
+        : active + (style.step === 2 ? 2 : 1) >= sheet.lines.length);
     next({ fromAuto: true });
     if (active === before) {
       setAutoPlay(false);
       toast('自动播放已到末句');
+    } else if (wrapping && active < before) {
+      toast('再唱一遍：回到开头');
     }
   }
   paintAutoUi();
@@ -313,16 +390,20 @@ async function startAsrFollow() {
   await refreshMicDevices();
   let st = await invoke('lyric_asr_status');
   if (!st?.ready) {
-    toast('首次使用需下载流式 ASR 模型（约 200MB）…');
+    toast('首次使用需下载跟词模型（约 1GB+，混合实时+歌词纠偏）…');
     st = await invoke('lyric_asr_ensure_model');
   }
   if (!st?.ready) throw new Error(st?.message || '模型未就绪');
 
-  const lines = sheet.lines.map((text) => ({
-    text,
-    songId: 1,
-    isTitle: false,
-  }));
+  const lines = sheet.lines.map((text, i) => {
+    const sec = sheet.sections[sheet.secOf[i] | 0];
+    return {
+      text,
+      songId: 1,
+      isTitle: false,
+      sectionType: sec?.type || '',
+    };
+  });
   autoMicState = 'open';
   autoFollowUnlisten = await listen('sp-lyric-follow', (e) => {
     const p = e?.payload || e;
@@ -369,8 +450,13 @@ async function startAsrFollow() {
       if (isLive()) push();
     }
     if (p.kind === 'jump' && p.index != null) {
+      const prev = active;
       autoArmed = false;
       go(p.index | 0, { fromAuto: true });
+      // 末句循环回开头时给个轻提示
+      if ((p.index | 0) < prev && /循环回开头|再唱一遍|回到/.test(p.message || '')) {
+        toast(p.message || '再唱一遍：回到开头');
+      }
       paintAutoUi();
     }
     if (p.kind === 'error') {
@@ -389,12 +475,17 @@ async function startAsrFollow() {
   });
 
   const deviceIndex = selectedMicIndex();
+  const channel = selectedMicChannel();
+  const refChannel = selectedRefChannel();
   lsSet(LS_MIC, deviceIndex);
+  lsSet(LS_MIC_CH, channel);
+  lsSet(LS_MIC_REF, refChannel);
   await invoke('lyric_follow_start', {
     lines,
     startIndex: active,
     deviceIndex,
-    channel: 0,
+    channel,
+    refChannel,
   });
   autoAsrMode = true;
   autoArmed = false;
@@ -461,18 +552,25 @@ function secAt(i) { return sheet.sections[sheet.secOf[i] | 0]; }
 function next({ fromAuto = false } = {}) {
   if (!sheet.lines.length) return false;
   const opt = { fromAuto };
+  const wrapToStart = () => {
+    if (!fromAuto) return go(active, opt);
+    // 自动播放到末句：循环回开头，方便整首再唱一遍
+    if (isPage() && sheet.sections.length) return go(sheet.sections[0].start, opt);
+    return go(0, opt);
+  };
   if (isPage()) {
     const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
-    return ns ? go(ns.start, opt) : go(active, opt);
+    return ns ? go(ns.start, opt) : wrapToStart();
   }
   if (style.step === 2) {
     const sec = secAt(active);
     const n = active + 2;
     if (sec && n < sec.end) return go(n, opt);
     const ns = sheet.sections[(sheet.secOf[active] | 0) + 1];
-    return ns ? go(ns.start, opt) : go(active, opt);
+    return ns ? go(ns.start, opt) : wrapToStart();
   }
-  return go(active + 1, opt);
+  if (active + 1 < sheet.lines.length) return go(active + 1, opt);
+  return wrapToStart();
 }
 
 function prev() {
@@ -893,14 +991,18 @@ export function initLyricsShow() {
   $('lshow-auto-mic-dev')?.addEventListener('change', async () => {
     const v = $('lshow-auto-mic-dev')?.value;
     lsSet(LS_MIC, v === '' ? null : parseInt(v, 10));
-    if (autoPlay && autoAsrMode) {
-      try {
-        await startAsrFollow();
-        toast('已切换干声输入设备');
-      } catch (err) {
-        toast('切换输入失败：' + (err?.message || err));
-      }
-    }
+    fillMicChannels($('lshow-auto-mic-dev')?.selectedOptions?.[0]?.dataset?.ch || 1);
+    await restartAsrMic(`已切换干声设备 · ${micChLabel()}`);
+  });
+  $('lshow-auto-mic-ch')?.addEventListener('change', async () => {
+    const ch = selectedMicChannel();
+    lsSet(LS_MIC_CH, ch);
+    await restartAsrMic(`已切换干声声道 · Ch${ch + 1}`);
+  });
+  $('lshow-auto-mic-ref')?.addEventListener('change', async () => {
+    const ref = selectedRefChannel();
+    lsSet(LS_MIC_REF, ref);
+    await restartAsrMic(ref == null ? '已关闭参考声道' : `已切换参考声道 · Ch${ref + 1}`);
   });
   refreshMicDevices();
   $('lshow-to-program')?.addEventListener('click', addToProgram);

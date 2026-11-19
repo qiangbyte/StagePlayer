@@ -13,8 +13,9 @@ import { pushToOutput, clearOutput, getCurrentOutput, currentOutputSeq } from '.
 import { loadLyricsFor, activeLyricIndex } from './lyrics.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
-  assignPath, listFolders, getSelectedFolder, FOLDER_ALL, FOLDER_UNCAT,
-  getDisplayName, promptRenameMedia, bindViewZoom, getMediaNote, setMediaNote,
+  assignPath, listFolders, getSelectedFolder, getLib, folderOfPath, FOLDER_ALL, FOLDER_UNCAT,
+  getDisplayName, setDisplayName, promptRenameMedia, bindViewZoom, getViewSize, setViewSize,
+  getMediaNote, setMediaNote,
 } from './media-library.js';
 
 let pendingOutputSeq = null;
@@ -162,6 +163,8 @@ function currentEvent() {
  * 单曲设置（起播点 / 渐变 / 循环 / 伴奏 / 备注）各存各的
  */
 const LS_LIB = 'sp.audio.library';
+/** 全局默认推子（未设本曲音量的歌都用它；本曲预设绝不能写回这里） */
+const LS_VOL = 'sp.audio.volume';
 /** 当前这首由谁起播：节目单起播时，单曲设置与播完续播都按节目单 */
 let playSource = 'library';
 
@@ -214,6 +217,7 @@ function findItem(path) {
     startAt: primary.startAt != null ? primary.startAt : lib.startAt,
     fadeIn: primary.fadeIn != null ? primary.fadeIn : lib.fadeIn,
     fadeOut: primary.fadeOut != null ? primary.fadeOut : lib.fadeOut,
+    volume: primary.volume != null ? primary.volume : lib.volume,
     loop: primary.loop || lib.loop,
     vocalCancel: primary.vocalCancel != null ? primary.vocalCancel : lib.vocalCancel,
   };
@@ -308,6 +312,215 @@ function restoreLibrary(snap) {
     });
   });
   renderList();
+}
+
+/** 收集音频打包所需设置（换机导入后恢复） */
+function collectAudioPackSettings() {
+  const paths = new Set(libraryRaw().map((i) => i.path).filter(Boolean));
+  const allLabels = lsGet('sp.media.labels', {}) || {};
+  const allNotes = lsGet('sp.media.notes', {}) || {};
+  const labels = {};
+  const notes = {};
+  for (const p of paths) {
+    if (allLabels[p] != null) labels[p] = allLabels[p];
+    if (allNotes[p] != null) notes[p] = allNotes[p];
+  }
+  return {
+    volume: Number(lsGet(LS_VOL, 0.9)) || 0.9,
+    loopMode,
+    deviceName: lsGet(LS_DEVICE_NAME, null),
+    dockExtra: !!lsGet('sp.audio.dock.extra', false),
+    dockMonitor: lsGet('sp.audio.dock.monitor', true) !== false,
+    uiAudioSize: getViewSize('audio', 176),
+    lib: getLib('audio'),
+    labels,
+    notes,
+  };
+}
+
+async function exportAudioPack() {
+  const items = libraryRaw();
+  if (!items.length) return toast('曲库是空的，先导入几首歌');
+  if (!window.confirm(`打包导出当前音乐库（${items.length} 首）及设置？\n换电脑后可用「打包导入」恢复。`)) return;
+  const withStems = window.confirm('是否一并打包已缓存的「仅伴奏」音轨？\n（体积更大，换机可免再分离）');
+
+  const dest = await invoke('pick_save_path', {
+    defaultName: `演出音频库_${new Date().toISOString().slice(0, 10)}.spaudio`,
+    extensions: ['spaudio'],
+  });
+  if (!dest) return;
+
+  const library = items.map((it) => ({
+    ...it,
+    folderId: folderOfPath('audio', it.path) || null,
+    note: (it.note || getMediaNote(it.path) || '').trim() || undefined,
+    name: it.name || getDisplayName(it.path, fileName(it.path).replace(/\.[^.]+$/, '')),
+  }));
+
+  toast('正在打包，请稍候…');
+  try {
+    const msg = await invoke('audio_pack_export', {
+      req: {
+        dest,
+        library,
+        settings: collectAudioPackSettings(),
+        includeStems: withStems,
+      },
+    });
+    toast(msg || '打包完成');
+  } catch (err) {
+    toast('打包失败：' + (err?.message || err));
+  } finally {
+    restorePackTitle();
+  }
+}
+
+async function importAudioPack() {
+  const files = await pickFiles(
+    [{ name: '音频打包', extensions: ['spaudio', 'zip'] }],
+    '导入音频打包'
+  );
+  if (!files?.length) return;
+  const src = files[0];
+  if (!window.confirm('导入音频打包？\n将恢复曲库、目录、备注、起播/渐变等设置。')) return;
+  const replace = window.confirm(
+    '是否清空当前音乐库再导入？\n\n确定 = 清空后替换\n取消 = 合并进现有曲库'
+  );
+
+  toast('正在导入…');
+  try {
+    const res = await invoke('audio_pack_import', { path: src });
+    const incoming = Array.isArray(res?.library) ? res.library : [];
+    if (!incoming.length) return toast(res?.message || '包里没有可用音频');
+
+    const snap = libraryRaw().map((i) => ({ ...i }));
+    const snapLib = JSON.parse(JSON.stringify(getLib('audio')));
+    updateLibrary((items) => {
+      if (replace) items.length = 0;
+      for (const it of incoming) {
+        const row = { ...it, id: it.id || genId(), type: 'audio' };
+        const idx = items.findIndex((x) => x.path === row.path);
+        if (idx >= 0) items[idx] = { ...items[idx], ...row };
+        else items.push(row);
+      }
+    });
+    pushUndo(replace ? '替换音乐库（打包导入）' : '合并音乐库（打包导入）', () => {
+      updateLibrary((items) => {
+        items.length = 0;
+        for (const it of snap) items.push(it);
+      });
+      lsSet('sp.lib.audio', snapLib);
+      renderList();
+    });
+
+    applyAudioPackSettings(res.settings || {}, incoming, { replace });
+    renderList();
+    toast(res.message || `已导入 ${res.imported || incoming.length} 首`);
+    if (!currentPath && incoming[0]?.path) {
+      loadFile(incoming[0].path, false).catch(() => {});
+    }
+  } catch (err) {
+    toast('导入失败：' + (err?.message || err));
+  } finally {
+    restorePackTitle();
+  }
+}
+
+function restorePackTitle() {
+  const tip = $('list-title');
+  if (tip?.dataset?.packMsg) {
+    tip.textContent = tip.dataset.packMsg;
+    delete tip.dataset.packMsg;
+  }
+}
+
+/** 导入后恢复设置；目录按 folderId 挂回 */
+function applyAudioPackSettings(settings, items, opts = {}) {
+  if (!settings || typeof settings !== 'object') return;
+  const replace = !!opts.replace;
+  const pathMap = settings.pathMap || {};
+
+  if (settings.volume != null) {
+    const v = Math.max(0, Math.min(1, Number(settings.volume) || 0.9));
+    lsSet(LS_VOL, v);
+    const vol = $('audio-volume');
+    if (vol) vol.value = String(v);
+    if (!playing) setEngineVol(v);
+  }
+  if (['all', 'one', 'none'].includes(settings.loopMode)) {
+    loopMode = settings.loopMode;
+    lsSet(LS_LOOP, loopMode);
+    paintLoopMode();
+  }
+  if (settings.deviceName) {
+    lsSet(LS_DEVICE_NAME, settings.deviceName);
+  }
+  if (settings.dockExtra != null) lsSet('sp.audio.dock.extra', !!settings.dockExtra);
+  if (settings.dockMonitor != null) lsSet('sp.audio.dock.monitor', !!settings.dockMonitor);
+  if (settings.uiAudioSize != null) setViewSize('audio', settings.uiAudioSize, 176);
+  // 刷新底栏折叠状态
+  const extra = $('audio-extra');
+  const monitor = $('audio-monitor');
+  const btnExtra = $('audio-extra-toggle');
+  const btnMon = $('audio-monitor-toggle');
+  const showExtra = !!lsGet('sp.audio.dock.extra', false);
+  const showMon = lsGet('sp.audio.dock.monitor', true) !== false;
+  extra?.classList.toggle('hidden', !showExtra);
+  monitor?.classList.toggle('is-collapsed', !showMon);
+  btnExtra?.classList.toggle('is-on', showExtra);
+  btnMon?.classList.toggle('is-on', showMon);
+
+  // 目录结构：替换时整库覆盖；合并时补文件夹并按 folderId 挂回
+  const libIn = settings.lib;
+  if (libIn && Array.isArray(libIn.folders)) {
+    const cur = replace ? { folders: [], assign: {}, selected: FOLDER_ALL } : getLib('audio');
+    const folders = (cur.folders || []).map((f) => ({ ...f }));
+    for (const f of libIn.folders) {
+      if (!f?.id) continue;
+      if (!folders.some((x) => x.id === f.id)) folders.push({ ...f });
+    }
+    const assign = { ...(cur.assign || {}) };
+    if (replace) {
+      for (const k of Object.keys(assign)) delete assign[k];
+    }
+    for (const it of items) {
+      const fid = it.folderId;
+      if (fid && folders.some((f) => f.id === fid)) assign[it.path] = fid;
+    }
+    lsSet('sp.lib.audio', {
+      folders,
+      assign,
+      selected: replace ? (libIn.selected || FOLDER_ALL) : (cur.selected || FOLDER_ALL),
+    });
+  } else {
+    for (const it of items) {
+      if (it.folderId) assignPath('audio', it.path, it.folderId);
+    }
+  }
+
+  // 显示名 / 备注：按 pathMap 从原路径映射到新路径
+  const labels = settings.labels || {};
+  const notes = settings.notes || {};
+  for (const [oldKey, newPath] of Object.entries(pathMap)) {
+    const np = typeof newPath === 'string' ? newPath : '';
+    if (!np) continue;
+    if (labels[oldKey] != null) setDisplayName(np, labels[oldKey]);
+    if (notes[oldKey] != null) setMediaNote(np, notes[oldKey]);
+  }
+  for (const it of items) {
+    if (it.name) setDisplayName(it.path, it.name);
+    if (it.note) setMediaNote(it.path, it.note);
+  }
+
+  // 声卡按名称匹配（换机序号会变）
+  if (settings.deviceName) {
+    invoke('list_audio_output_devices')
+      .then((list) => {
+        const hit = (list || []).find((d) => d?.name === settings.deviceName);
+        if (hit && hit.index != null) lsSet(LS_DEVICE, hit.index);
+      })
+      .catch(() => {});
+  }
 }
 
 /** 卡片上的本曲循环：只读本曲字段，不跟底部全局（避免一点全变） */
@@ -608,13 +821,83 @@ function fadeTo(target, durationSec) {
   });
 }
 
-/** @returns {{ startAt:number, fadeIn:number, fadeOut:number }} */
+/** @returns {{ startAt:number, fadeIn:number, fadeOut:number, volume:number|null }} */
 function getItemCue(path) {
   const it = findItem(path) || {};
   const startAt = Math.max(0, Number(it.startAt) || 0);
   const fadeIn = Math.max(0, Math.min(60, Number(it.fadeIn) || 0));
   const fadeOut = Math.max(0, Math.min(60, Number(it.fadeOut) || 0));
-  return { startAt, fadeIn, fadeOut };
+  return { startAt, fadeIn, fadeOut, volume: getItemVolume(path) };
+}
+
+/** 本曲预设音量 0–1；未设置返回 null（用全局默认推子） */
+function getItemVolume(path) {
+  if (!path) return null;
+  const it = findItem(path);
+  if (!it || it.volume == null || it.volume === '') return null;
+  const v = Number(it.volume);
+  if (!Number.isFinite(v)) return null;
+  return Math.max(0, Math.min(1, v));
+}
+
+function globalDefaultVolume() {
+  const n = Number(lsGet(LS_VOL, 0.9));
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0.9;
+}
+
+function setGlobalDefaultVolume(v) {
+  lsSet(LS_VOL, Math.max(0, Math.min(1, Number(v) || 0)));
+}
+
+/**
+ * 按歌曲切换推子显示/引擎音量：
+ * - 有本曲预设 → 只用预设（不写全局）
+ * - 无预设 → 恢复全局默认
+ */
+function applySongVolumeToFader(path, { writeEngine = true } = {}) {
+  const vol = $('audio-volume');
+  if (!vol) return false;
+  const preset = path ? getItemVolume(path) : null;
+  const target = preset != null ? preset : globalDefaultVolume();
+  vol.value = String(target);
+  if (writeEngine) {
+    cancelFade();
+    setEngineVol(target);
+  }
+  syncVolReadout();
+  return true;
+}
+
+/** 清除本曲音量预设，推子回到全局默认 */
+function resetItemVolume(path) {
+  if (!path) return toast('请先选中一首歌');
+  const ok = updateItem(path, (item) => {
+    delete item.volume;
+  });
+  if (!ok) return toast('重置失败');
+  fillCueBar(path);
+  applySongVolumeToFader(path);
+  renderList();
+  toast(`已清除本曲音量 · 恢复默认 ${Math.round(globalDefaultVolume() * 100)}%`);
+}
+
+/** 卡片角标：有预设显示百分比；无预设固定显示「默认」，绝不跟当前推子跑 */
+function cardVolLabel(path) {
+  const preset = getItemVolume(path);
+  if (preset != null) {
+    const pct = Math.round(preset * 100);
+    return {
+      text: `🔊 ${pct}%`,
+      title: `本曲预设 ${pct}%`,
+      preset: true,
+    };
+  }
+  const defPct = Math.round(globalDefaultVolume() * 100);
+  return {
+    text: '🔊 默认',
+    title: `未设本曲音量 · 开播用全局默认 ${defPct}%`,
+    preset: false,
+  };
 }
 
 function cueBadgeText(cue) {
@@ -626,6 +909,7 @@ function cueBadgeText(cue) {
   }
   if (cue.fadeIn > 0) bits.push(`渐起${cue.fadeIn}s`);
   if (cue.fadeOut > 0) bits.push(`渐弱${cue.fadeOut}s`);
+  if (cue.volume != null) bits.push(`音量${Math.round(cue.volume * 100)}%`);
   return bits.join(' · ');
 }
 
@@ -638,17 +922,19 @@ function resolveItemNote(path) {
 }
 
 function fillCueBar(path) {
-  const cue = path ? getItemCue(path) : { startAt: 0, fadeIn: 0, fadeOut: 0 };
+  const cue = path ? getItemCue(path) : { startAt: 0, fadeIn: 0, fadeOut: 0, volume: null };
   const minEl = $('audio-start-min');
   const secEl = $('audio-start-sec');
   const inEl = $('audio-fade-in');
   const outEl = $('audio-fade-out');
+  const volEl = $('audio-item-vol');
   if (minEl) minEl.value = String(Math.floor(cue.startAt / 60));
   if (secEl) secEl.value = String(Math.floor(cue.startAt % 60));
   if (inEl) inEl.value = String(cue.fadeIn || 0);
   if (outEl) outEl.value = String(cue.fadeOut || 0);
+  if (volEl) volEl.value = cue.volume != null ? String(Math.round(cue.volume * 100)) : '';
   const tip = $('audio-cue-tip');
-  if (tip) tip.textContent = path ? (cueBadgeText(cue) || '未设置起播/渐变') : '先选一首歌';
+  if (tip) tip.textContent = path ? (cueBadgeText(cue) || '未设置起播/渐变/音量') : '先选一首歌';
   const noteEl = $('audio-note');
   if (noteEl) noteEl.value = path ? resolveItemNote(path) : '';
 }
@@ -680,19 +966,33 @@ function saveCueFromBar() {
   const fadeIn = Math.max(0, Math.min(60, Number($('audio-fade-in')?.value) || 0));
   const fadeOut = Math.max(0, Math.min(60, Number($('audio-fade-out')?.value) || 0));
   const startAt = min * 60 + sec;
+  const volRaw = ($('audio-item-vol')?.value ?? '').toString().trim();
+  let volume = null;
+  if (volRaw !== '') {
+    const pct = Number(volRaw);
+    if (Number.isFinite(pct)) volume = Math.max(0, Math.min(1, pct / 100));
+  }
   const ok = updateItem(path, (item) => {
     item.startAt = startAt;
     item.fadeIn = fadeIn;
     item.fadeOut = fadeOut;
+    if (volume == null) delete item.volume;
+    else item.volume = volume;
   });
   if (!ok) return toast('保存失败');
   fillCueBar(path);
+  // 正在看/播这首 → 立刻切到本曲预设或全局默认（不污染其它歌）
+  if (path === currentPath || path === selectedSongPath) {
+    applySongVolumeToFader(path);
+  }
   renderList();
   const parts = [];
   if (startAt > 0) parts.push(`从 ${min}:${String(sec).padStart(2, '0')} 起播`);
   if (fadeIn > 0) parts.push(`渐起 ${fadeIn}s`);
   if (fadeOut > 0) parts.push(`渐弱 ${fadeOut}s`);
-  toast(parts.length ? `已保存：${parts.join(' · ')}` : '已清除起播/渐变（从开头、无渐变）');
+  if (volume != null) parts.push(`本曲音量 ${Math.round(volume * 100)}%`);
+  else parts.push('音量用全局默认');
+  toast(parts.length ? `已保存：${parts.join(' · ')}` : '已清除本曲设置');
 }
 
 async function startPlayback(startAt = 0, opts = {}) {
@@ -726,7 +1026,9 @@ async function startPlayback(startAt = 0, opts = {}) {
 
   // audio_play 本身会换曲，无需先 stop（少一次 IPC）；起播音量随命令一起给，
   // 渐起时从 0 开始，不会先按旧音量响一下
-  const target = volume();
+  // 有本曲预设用预设；否则用全局默认（切歌时恢复，避免上一首预设粘住）
+  applySongVolumeToFader(currentPath, { writeEngine: false });
+  const target = cue.volume != null ? cue.volume : globalDefaultVolume();
   const withFade = cue.fadeIn > 0 && !opts.noFade;
   await invoke('audio_play', {
     path: playPath,
@@ -1008,9 +1310,44 @@ function step(d) {
   return true;
 }
 
-/** 键盘 ←/→ 切歌（main.js） */
+/** 键盘 ←/→ 直接切歌播放。 */
 export function audioStep(delta) {
   return step(delta);
+}
+
+/** A / D 只移动选中项；Enter 再确认播放。 */
+export function audioSelectStep(delta) {
+  const items = visibleAudioItems();
+  if (!items.length) return false;
+  let idx = items.findIndex((item) => item.path === selectedSongPath);
+  if (idx < 0) idx = items.findIndex((item) => item.path === currentPath);
+  if (idx < 0) idx = delta > 0 ? -1 : 0;
+  const next = items[(idx + delta + items.length) % items.length];
+  selectedSongPath = next.path;
+  paintSongActive();
+  const list = $('audio-song-list') || $('audio-list');
+  const row = Array.from(list?.querySelectorAll('[data-path]') ?? [])
+    .find((el) => el.dataset.path === next.path);
+  row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  toast(`预选：${cardLabel(next)}（Enter 播放）`, 1400);
+  return true;
+}
+
+/** Enter：播放当前选中歌曲。 */
+export async function playSelectedAudio() {
+  const items = visibleAudioItems();
+  if (!items.length) return false;
+  const path = items.some((item) => item.path === selectedSongPath)
+    ? selectedSongPath
+    : (items.some((item) => item.path === currentPath) ? currentPath : items[0].path);
+  selectedSongPath = path;
+  paintSongActive();
+  if (path === currentPath) {
+    if (!playing) await play();
+  } else {
+    await loadFile(path, true, { skipList: true });
+  }
+  return true;
 }
 
 function songTitleParts() {
@@ -1256,19 +1593,39 @@ function fillAudioMoveSelect() {
 function paintSongActive() {
   const list = $('audio-song-list') || $('audio-list');
   if (!list) return;
-  const volPct = Math.round(volume() * 100);
-  const volTip = `推子 ${volPct}%（${fmtDb(volToDb(volume()))} dB）`;
   list.querySelectorAll('.audio-card, .song-row, .file-item').forEach((row) => {
     const path = row.dataset.path;
     if (!path) return;
     const on = path === currentPath;
     const sel = path === selectedSongPath || on;
     row.classList.toggle('active', sel);
+    row.classList.toggle('keyboard-selected', path === selectedSongPath && !on);
+    // current=已加载本曲（暂停也保留高亮）；playing=正在出声
+    row.classList.toggle('current', on);
     row.classList.toggle('playing', on && playing);
+    const volInfo = cardVolLabel(path);
+    row.classList.toggle('has-vol-preset', volInfo.preset);
+    let stateBadge = row.querySelector('.audio-card-paused-badge, .audio-card-playing-badge');
+    if (on) {
+      const cls = playing ? 'audio-card-playing-badge' : 'audio-card-paused-badge';
+      const text = playing ? '播放中' : '已暂停';
+      if (!stateBadge || !stateBadge.classList.contains(cls)) {
+        stateBadge?.remove();
+        stateBadge = document.createElement('div');
+        stateBadge.className = cls;
+        stateBadge.textContent = text;
+        row.querySelector('.audio-card-body')?.appendChild(stateBadge);
+      } else {
+        stateBadge.textContent = text;
+      }
+    } else if (stateBadge) {
+      stateBadge.remove();
+    }
     const volEl = row.querySelector('.audio-card-vol');
     if (volEl) {
-      volEl.textContent = `🔊 ${volPct}%`;
-      volEl.title = volTip;
+      volEl.textContent = volInfo.text;
+      volEl.title = volInfo.title;
+      volEl.classList.toggle('is-preset', volInfo.preset);
     }
     const loopBtn = row.querySelector('[data-act="loop"]');
     if (loopBtn) {
@@ -1307,11 +1664,10 @@ function renderList() {
     list.innerHTML = `<div class="empty-tip">此目录暂无歌曲<br/><span style="font-size:12px;opacity:.75">导入音频，或切换左侧目录</span></div>`;
     return;
   }
-  const volPct = Math.round(volume() * 100);
-  const volTip = `推子 ${volPct}%（${fmtDb(volToDb(volume()))} dB）`;
   list.innerHTML = items.map((it) => {
     const on = it.path === currentPath;
     const sel = it.path === selectedSongPath || on;
+    const keyboardSel = it.path === selectedSongPath && !on;
     const dur = durationOf(it.path);
     const label = cardLabel(it);
     const mode = getItemLoopMode(it.path);
@@ -1321,11 +1677,12 @@ function renderList() {
     const cue = getItemCue(it.path);
     const badge = cueBadgeText(cue);
     const note = resolveItemNote(it.path);
+    const volInfo = cardVolLabel(it.path);
     const tipBits = [label, badge, note, vocalOn ? '仅伴奏' : ''].filter(Boolean).join(' · ');
     return `
-    <div class="audio-card ${sel ? 'active' : ''} ${on && playing ? 'playing' : ''} ${mode === 'one' ? 'loop-one' : ''} ${vocalOn ? 'vocal-on' : ''}" data-path="${esc(it.path)}" title="${esc(tipBits)}">
+    <div class="audio-card ${sel ? 'active' : ''} ${keyboardSel ? 'keyboard-selected' : ''} ${on ? 'current' : ''} ${on && playing ? 'playing' : ''} ${mode === 'one' ? 'loop-one' : ''} ${vocalOn ? 'vocal-on' : ''} ${volInfo.preset ? 'has-vol-preset' : ''}" data-path="${esc(it.path)}" title="${esc(tipBits)}">
       <div class="audio-card-body">
-        <span class="audio-card-vol" title="${esc(volTip)}">🔊 ${volPct}%</span>
+        <span class="audio-card-vol ${volInfo.preset ? 'is-preset' : ''}" title="${esc(volInfo.title)}">${esc(volInfo.text)}</span>
         <button type="button" class="audio-card-rename" data-act="rename" title="重命名显示名">✎</button>
         <button type="button" class="audio-card-note-btn" data-act="note" title="编辑备注">📝</button>
         <button type="button" class="audio-card-vocal ${vm.cls}" data-act="vocal" title="${esc(vm.title)}">${vm.icon}</button>
@@ -1334,6 +1691,8 @@ function renderList() {
         ${note ? `<div class="audio-card-note" title="${esc(note)}">${esc(note)}</div>` : ''}
         ${badge ? `<div class="audio-card-cue">${esc(badge)}</div>` : ''}
         ${vocalOn ? '<div class="audio-card-vocal-badge">仅伴奏</div>' : ''}
+        ${on && !playing ? '<div class="audio-card-paused-badge">已暂停</div>' : ''}
+        ${on && playing ? '<div class="audio-card-playing-badge">播放中</div>' : ''}
       </div>
       <div class="audio-card-foot">
         <span class="audio-card-dur mono">${fmtHms(dur)}</span>
@@ -1652,10 +2011,12 @@ export function initAudio() {
     }
     if (e.target.closest('[data-act="loop"]')) {
       toggleItemLoopMode(item.dataset.path);
+      e.target.closest('[data-act="loop"]')?.blur?.();
       return;
     }
     if (e.target.closest('[data-act="vocal"]')) {
       toggleItemVocalCancel(item.dataset.path);
+      e.target.closest('[data-act="vocal"]')?.blur?.();
       return;
     }
     // 同一张卡片 400ms 内的第二下当手抖忽略（否则刚开播就被暂停）
@@ -1811,14 +2172,12 @@ export function initAudio() {
   waveTarget.addEventListener('pointercancel', endWaveDrag);
 
   meta.addEventListener('loadedmetadata', () => updateTech());
-  // 推子：百分比 + dB 同步，并记住上次音量（开场前调好即可）
-  const LS_VOL = 'sp.audio.volume';
-  const savedVol = lsGet(LS_VOL, null);
-  if (vol && savedVol != null && Number.isFinite(+savedVol)) {
-    vol.value = Math.max(0, Math.min(1, +savedVol));
-  }
+  // 推子：百分比 + dB 同步；全局默认与本曲预设分开
+  if (vol) vol.value = String(globalDefaultVolume());
   engineVol = volume();
   syncVolReadout();
+  // 若当前已加载带预设的歌，推子显示本曲值（不改全局默认）
+  if (currentPath) applySongVolumeToFader(currentPath, { writeEngine: false });
   vol?.addEventListener('input', () => {
     const v = +vol.value;
     // 点在滑条轨道上会一下跳很多：大跳变用 0.15 秒滑过去，拖动时的小步照常即时跟手
@@ -1827,25 +2186,37 @@ export function initAudio() {
       cancelFade();
       setEngineVol(v);
     }
-    lsSet(LS_VOL, v);
+    // 仅当「当前曲没有本曲预设」时，才把推子记成全局默认；有预设时只临时改这一次出声
+    const path = currentPath || selectedSongPath;
+    if (!path || getItemVolume(path) == null) {
+      setGlobalDefaultVolume(v);
+    }
     paintSongActive();
   });
-  // 鼠标调完滑条 / 勾选框把焦点还给页面：否则空格不能暂停、←/→ 改的是音量而不是切歌
+  // 鼠标点完滑条 / 勾选 / 循环等按钮后清掉焦点：否则空格会点到「循环」而不是暂停
   $('panel-audio')?.addEventListener('pointerup', (e) => {
-    const el = e.target.closest?.('input[type="range"], input[type="checkbox"]');
+    const el = e.target.closest?.(
+      'input[type="range"], input[type="checkbox"], button, select'
+    );
     if (!el) return;
     setTimeout(() => {
       if (document.activeElement === el) el.blur();
     }, 0);
   });
+  initSystemVolume();
   $('audio-vol-unity')?.addEventListener('click', () => {
     if (!vol) return;
     cancelFade();
     vol.value = '1';
     setEngineVol(1);
-    lsSet(LS_VOL, 1);
+    const path = currentPath || selectedSongPath;
+    if (!path || getItemVolume(path) == null) {
+      setGlobalDefaultVolume(1);
+      toast('默认音量 100%（0 dB）');
+    } else {
+      toast('已临时调到 100%（本曲仍有预设，可用「重置音量」清除）');
+    }
     paintSongActive();
-    toast('音量 100%（0 dB）');
   });
   $('audio-clip')?.addEventListener('click', () => {
     resetClip();
@@ -1853,6 +2224,15 @@ export function initAudio() {
   });
 
   $('audio-cue-apply')?.addEventListener('click', () => saveCueFromBar());
+  $('audio-vol-from-fader')?.addEventListener('click', () => {
+    const volEl = $('audio-item-vol');
+    if (!volEl) return;
+    volEl.value = String(Math.round(volume() * 100));
+    toast(`已填入推子 ${volEl.value}% · 再点保存写入本曲`);
+  });
+  $('audio-vol-reset')?.addEventListener('click', () => {
+    resetItemVolume(selectedSongPath || currentPath);
+  });
   $('audio-note-save')?.addEventListener('click', () => saveAudioNote());
   $('audio-note')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -1860,7 +2240,7 @@ export function initAudio() {
       saveAudioNote();
     }
   });
-  ['audio-start-min', 'audio-start-sec', 'audio-fade-in', 'audio-fade-out'].forEach((id) => {
+  ['audio-start-min', 'audio-start-sec', 'audio-fade-in', 'audio-fade-out', 'audio-item-vol'].forEach((id) => {
     $(id)?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') saveCueFromBar();
     });
@@ -1869,6 +2249,7 @@ export function initAudio() {
 
   btnLoop.addEventListener('click', () => {
     cycleLoopMode();
+    btnLoop.blur();
   });
   // 记住上次的循环方式（重启后不再默默回到列表循环）
   paintLoopMode();
@@ -1898,6 +2279,18 @@ export function initAudio() {
     }
   });
 
+  $('audio-pack-export')?.addEventListener('click', () => exportAudioPack());
+  $('audio-pack-import')?.addEventListener('click', () => importAudioPack());
+  listen('sp-audio-pack', (e) => {
+    const p = e?.payload || e;
+    if (!p?.message) return;
+    const tip = $('list-title');
+    if (tip && currentModule() === 'audio') {
+      if (!tip.dataset.packMsg) tip.dataset.packMsg = tip.textContent;
+      tip.textContent = p.message;
+    }
+  });
+
   document.addEventListener('sp:clear-list', () => {
     if (currentModule() !== 'audio') return;
     // 只清音乐库，节目单里的歌不动
@@ -1919,6 +2312,80 @@ export function initAudio() {
   });
 
   window.addEventListener('resize', () => { draw(); drawSpectrum(); drawVU(); });
+}
+
+/**
+ * 「系统」音量条：Windows 系统总音量（键盘 Fn+音量键调的就是它）。
+ * 音乐页可见时每 0.4 秒读一次，按键改了系统音量这里跟着动；拖它则直接改系统音量。
+ */
+function initSystemVolume() {
+  const wrap = $('sys-vol-wrap');
+  const slider = $('sys-volume');
+  const label = $('sys-vol-label');
+  if (!wrap || !slider) return;
+  let dragging = false;
+  let setBusy = false;
+  let setPending = null;
+  let failCount = 0;
+
+  const paint = (st) => {
+    wrap.classList.remove('is-unavailable');
+    wrap.classList.toggle('is-muted', !!st.muted);
+    if (!dragging) slider.value = String(st.volume);
+    const pct = Math.round(st.volume * 100);
+    if (label) label.textContent = st.muted ? '静音' : `${pct}%`;
+  };
+  const unavailable = () => {
+    wrap.classList.add('is-unavailable');
+    if (label) label.textContent = '--';
+  };
+
+  async function refresh() {
+    if (dragging || setBusy) return;
+    try {
+      paint(await invoke('system_volume_get'));
+      failCount = 0;
+    } catch {
+      // 偶发失败（切换默认设备的瞬间）不立刻变灰
+      if (++failCount >= 3) unavailable();
+    }
+  }
+
+  // 拖动时只保留最新值，前一次设置完成再发下一次，不堆积
+  async function pushSet() {
+    if (setBusy || setPending == null) return;
+    setBusy = true;
+    const v = setPending;
+    setPending = null;
+    try {
+      paint(await invoke('system_volume_set', { v }));
+    } catch (err) {
+      toast('无法设置系统音量：' + err);
+    } finally {
+      setBusy = false;
+      if (setPending != null) pushSet();
+    }
+  }
+
+  slider.addEventListener('pointerdown', () => { dragging = true; });
+  const endDrag = () => { dragging = false; };
+  slider.addEventListener('pointerup', endDrag);
+  slider.addEventListener('pointercancel', endDrag);
+  slider.addEventListener('input', () => {
+    setPending = +slider.value;
+    if (label && !wrap.classList.contains('is-muted')) label.textContent = `${Math.round(setPending * 100)}%`;
+    pushSet();
+  });
+
+  refresh();
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    // Windows 音量键（Fn+音量）在系统层改变默认设备音量；持续读取，
+    // 保证切到其他页面期间改过音量，回到音乐页时软件滑条也已同步。
+    refresh();
+  }, 400);
+  // 切回音乐页时立刻刷新，不等下一拍
+  document.addEventListener('visibilitychange', refresh);
 }
 
 /** 节目单/外部调用；opts.stay=true 时不切换 Tab，并优先出声 */
@@ -1945,6 +2412,25 @@ export async function stopAudio() {
   pos = 0;
   updatePlayBtn();
   if (currentModule() === 'audio') renderList();
+}
+
+/**
+ * 键盘 ↑/↓ 调推子（main.js：音乐页，或节目单当前条是音乐时）。
+ * 滑条、百分比、dB 一起变；用很短的渐变过去，按住连发也不爆音。
+ * @returns {number|null} 调整后的音量 0~1
+ */
+export function nudgeAudioVolume(step) {
+  const vol = $('audio-volume');
+  if (!vol) return null;
+  const v = Math.round(Math.max(0, Math.min(1, volume() + step)) * 100) / 100;
+  vol.value = String(v);
+  fadeTo(v, 0.08);
+  const path = currentPath || selectedSongPath;
+  if (!path || getItemVolume(path) == null) {
+    setGlobalDefaultVolume(v);
+  }
+  paintSongActive();
+  return v;
 }
 
 /** 节目单进度条用 */
