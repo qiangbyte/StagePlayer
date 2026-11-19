@@ -829,14 +829,20 @@
             <div class="lib-toolbar">
               <div class="lib-title-wrap">
                 <span class="lib-kicker">录音转文字</span>
-                <span class="talk-status" id="tr-status">就绪</span>
+                <span class="tr-page-title">转写工作台 <span class="talk-status" id="tr-status">就绪</span></span>
+                <span class="tr-toolbar-hint">导入录音，生成文字，再校对或整理成总结</span>
               </div>
-              <button type="button" class="mini-btn accent" id="tr-pick" title="选择录音文件（m4a / mp3 / wav / flac / aac / ogg）">选择音频</button>
-              <button type="button" class="mini-btn primary" id="tr-start" title="本地模型转写，不上传音频">开始转写</button>
-              <button type="button" class="mini-btn danger hidden" id="tr-cancel">取消</button>
-              <button type="button" class="mini-btn" id="tr-copy" title="复制转写文字">复制文字</button>
-              <button type="button" class="mini-btn" id="tr-export" title="导出转写文字为 txt">导出文字</button>
-              <button type="button" class="mini-btn danger" id="tr-del" title="删除当前记录">删除</button>
+              <div class="tr-main-actions">
+                <button type="button" class="mini-btn accent" id="tr-pick" title="可多选录音文件；批量选择后会依次转写（m4a / mp3 / wav / flac / aac / ogg）">＋ 选择音频</button>
+                <button type="button" class="mini-btn primary" id="tr-start" title="本地模型转写，不上传音频">开始转写</button>
+                <button type="button" class="mini-btn danger hidden" id="tr-cancel">取消转写</button>
+              </div>
+              <div class="tr-secondary-actions" aria-label="文字操作">
+                <button type="button" class="mini-btn" id="tr-copy" title="复制转写文字">复制</button>
+                <button type="button" class="mini-btn" id="tr-export" title="导出转写文字为 txt">导出 TXT</button>
+                <button type="button" class="mini-btn" id="tr-export-md" title="导出带标题和音频信息的 Markdown 文稿">导出 MD</button>
+                <button type="button" class="mini-btn danger" id="tr-del" title="删除当前记录">删除记录</button>
+              </div>
             </div>
             <div class="tr-file-row">
               <input type="text" id="tr-path" spellcheck="false" placeholder="音频文件路径：可直接粘贴，或点「选择音频」" />
@@ -854,15 +860,32 @@
             <div class="tr-progress" id="tr-progress">
               <div class="tr-progress-fill" id="tr-fill"></div>
               <span class="tr-progress-text mono" id="tr-progress-text"></span>
+              <button type="button" class="tr-progress-stop hidden" id="tr-progress-stop" title="停止当前 AI 任务（已得到的结果会保留）">停止</button>
             </div>
             <div class="tr-split">
               <div class="tr-box">
                 <div class="tr-box-head">
                   <span class="talk-live-label">转写文字（可直接修改）</span>
-                  <button type="button" class="mini-btn" id="tr-text-zoom" title="放大查看，可滚动阅读">⤢ 放大</button>
+                  <span class="tr-box-tools">
+                    <button type="button" class="mini-btn" id="tr-proofread" title="AI 逐段往下检查全文，边查边把疑点标在原文里；每条建议由你决定是否采纳，随时可停止">AI 校对</button>
+                    <button type="button" class="mini-btn" id="tr-text-export" title="导出原文为 txt（含时间点）">导出</button>
+                    <button type="button" class="mini-btn" id="tr-text-zoom" title="放大查看，可滚动阅读">⤢ 放大</button>
+                  </span>
                 </div>
-                <textarea id="tr-text" class="tr-text" spellcheck="false"
-                  placeholder="转写结果会实时出现在这里，每段前面带时间点。&#10;首次使用会自动下载本地模型 SenseVoice（约 230MB）。"></textarea>
+                <div class="tr-text-wrap">
+                  <div id="tr-text-highlight" aria-hidden="true"></div>
+                  <textarea id="tr-text" class="tr-text" spellcheck="false"
+                    placeholder="转写结果会实时出现在这里，每段前面带时间点。&#10;首次使用会自动下载本地模型 SenseVoice（约 230MB）。"></textarea>
+                </div>
+                <div class="tr-proof-player hidden" id="tr-proof-player" aria-label="试听这一段原音">
+                  <button type="button" class="mini-btn primary" id="tr-pp-toggle" title="播放 / 暂停">▶</button>
+                  <span class="tr-pp-label" id="tr-pp-label"></span>
+                  <input type="range" id="tr-pp-seek" min="0" max="1" step="0.1" value="0" title="拖动定位" />
+                  <span class="tr-pp-time mono" id="tr-pp-time"></span>
+                  <button type="button" class="mini-btn" id="tr-pp-rate" title="切换播放速度">1×</button>
+                  <button type="button" class="mini-btn" id="tr-pp-close" title="关闭试听">✕</button>
+                </div>
+                <div class="tr-proofread-issues hidden" id="tr-proofread-issues" aria-label="逐条校对建议"></div>
               </div>
               <div class="tr-box">
                 <div class="tr-box-head">
@@ -907,6 +930,11 @@
                     </div>
                     <div class="hint" id="tr-hint">Key 只写入本机配置文件，不进入节目单/导出文件。</div>
                     <textarea id="tr-prompt" class="tr-prompt" rows="5" spellcheck="false" placeholder="总结要求（提示词）"></textarea>
+                    <div class="tr-prompt-actions">
+                      <button type="button" class="mini-btn" id="tr-prompt-save">保存为提示词</button>
+                      <button type="button" class="mini-btn" id="tr-prompt-delete" disabled>删除当前提示词</button>
+                      <button type="button" class="mini-btn" id="tr-prompt-improve">AI 改进提示词</button>
+                    </div>
                   </div>
                 </details>
                 <div id="tr-summary-view" class="tr-md" tabindex="0" aria-label="AI 总结（格式预览）"></div>
@@ -940,6 +968,8 @@
               <span class="tr-viewer-title" id="tr-viewer-title"></span>
               <span class="tr-vtabs" id="tr-viewer-tabs"></span>
               <span class="tr-viewer-spacer"></span>
+              <button type="button" class="mini-btn hidden" id="tr-viewer-copy" title="复制当前显示的内容">复制</button>
+              <button type="button" class="mini-btn hidden" id="tr-viewer-export" title="导出当前显示的内容（原文为 txt，总结为 md）">导出</button>
               <span class="tr-viewer-size" id="tr-viewer-size"></span>
               <button type="button" class="mini-btn" id="tr-viewer-smaller" title="缩小字号">A−</button>
               <button type="button" class="mini-btn" id="tr-viewer-bigger" title="放大字号">A＋</button>

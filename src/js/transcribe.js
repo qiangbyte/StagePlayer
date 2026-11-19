@@ -1,13 +1,14 @@
 // 录音转文字：本地 SenseVoice 离线转写（Rust 后端）+ DeepSeek / 千问总结（流式，可切换）
 // 记录存 localStorage（sp.transcribe.records）；DeepSeek Key 只在 Rust 侧保存，前端拿不到明文。
 
-import { esc, lsGet, lsSet, toast, invoke, listen, pickFiles } from './util.js';
+import { esc, lsGet, lsSet, toast, invoke, listen, pickFiles, convertFileSrc } from './util.js';
 import { renderMarkdown } from './markdown.js';
 
 const KEY = 'sp.transcribe.records';
 const LS_LANG = 'sp.transcribe.lang';
 const LS_PRESET = 'sp.transcribe.preset';
 const LS_PROMPT = 'sp.transcribe.prompt';
+const LS_PROMPT_LIBRARY = 'sp.transcribe.promptLibrary';
 const AUDIO_PICK_EXT = ['m4a', 'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4b', 'mp4', 'mka', 'webm'];
 const $ = (id) => document.getElementById(id);
 
@@ -60,9 +61,27 @@ let records = []; // 在 initTranscribe 里加载（loadRecords 依赖后面定�
 let curId = null;
 let running = false;
 let summarizing = false;
+let queuedPaths = [];
 let busyKind = ''; // summarizing 为 true 时：'summary'（总结）| 'refine'（精修）
 const HISTORY_MAX = 8; // 每条记录最多保留的可撤销版本数
 let saveTimer = 0;
+let auxiliaryAi = null;
+let proofIssues = [];
+let proofTextSnapshot = '';
+let proofScan = null; // 正在检查的字符范围 {start,end}
+let proofNote = ''; // 校对完成后的小结（显示在问题列表顶部）
+let proofFollow = true; // 文本框是否跟着检查进度自动滚动
+let proofCancel = false;
+let proofChunks = []; // 校对中尚未处理 / 正在处理的区块（随用户编辑实时平移）
+let proofSeq = 0;
+let proofResume = 0; // 已检查到的位置（校对被中断时，下次可从这里继续）
+let proofComplete = true; // 最近一次校对是否跑完
+const proofDrafts = new Map(); // 疑点 id → 用户在“听后自己填”框里写了一半的内容
+let proofPlay = null; // 正在试听的疑点 {id,start,end,label,ended}
+let proofAudio = null;
+let proofRate = 1;
+let ppDragging = false;
+const isProofing = () => summarizing && busyKind === 'proofread';
 
 function genId() {
   return 'tr' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -162,6 +181,35 @@ function sumName(s, i) {
   return `${LETTERS[i] || i + 1}${who ? ' · ' + who : ''}`;
 }
 
+/** 读回保存的 AI 校对状态：位置对不上当前文稿的疑点丢弃 */
+function cleanProof(p, text) {
+  if (!p || typeof p !== 'object') return null;
+  const issues = (Array.isArray(p.issues) ? p.issues : [])
+    .filter((x) => x && Number.isInteger(x.start) && Number.isInteger(x.end) && typeof x.text === 'string'
+      && x.start >= 0 && x.end > x.start && text.slice(x.start, x.end) === x.text)
+    .map((x) => ({
+      id: Number(x.id) || ++proofSeq,
+      start: x.start,
+      end: x.end,
+      text: x.text,
+      suggestion: String(x.suggestion || ''),
+      reason: String(x.reason || ''),
+      cands: (Array.isArray(x.cands) ? x.cands : [])
+        .filter((c) => c && typeof c.text === 'string' && c.text)
+        .slice(0, 3)
+        .map((c) => ({ text: c.text, reason: String(c.reason || '') })),
+      ok: x.ok === true,
+    }));
+  for (const x of issues) proofSeq = Math.max(proofSeq, x.id);
+  const drafts = {};
+  for (const [k, v] of Object.entries(p.drafts && typeof p.drafts === 'object' ? p.drafts : {})) {
+    if (issues.some((x) => x.id === Number(k)) && typeof v === 'string' && v) drafts[k] = v.slice(0, 200);
+  }
+  const resumeAt = Number.isInteger(p.resumeAt) && p.resumeAt > 0 && p.resumeAt < text.length ? p.resumeAt : 0;
+  if (!issues.length && !resumeAt && !p.note) return null;
+  return { issues, drafts, note: String(p.note || ''), complete: p.complete !== false, resumeAt, at: Number(p.at) || 0 };
+}
+
 function loadRecords() {
   const raw = lsGet(KEY, []);
   if (!Array.isArray(raw)) return [];
@@ -173,6 +221,7 @@ function loadRecords() {
       path: String(r.path || ''),
       language: String(r.language || 'auto'),
       text: String(r.text || ''),
+      proof: cleanProof(r.proof, String(r.text || '')),
       ...loadSums(r),
       durationSec: Number(r.durationSec) || 0,
       createdAt: Number(r.createdAt) || Date.now(),
@@ -206,15 +255,71 @@ function setStatus(text, on = false) {
   el.classList.toggle('is-on', on);
 }
 
-function setProgress(pct, text, state = '') {
+function setProgress(pct, text, state = '', wait = false) {
   const box = $('tr-progress');
   const fill = $('tr-fill');
   const t = $('tr-progress-text');
   if (!box || !fill || !t) return;
   box.classList.toggle('is-done', state === 'done');
   box.classList.toggle('is-error', state === 'error');
+  box.classList.toggle('is-wait', !!wait);
   fill.style.width = `${Math.max(0, Math.min(100, Number(pct) || 0))}%`;
   t.textContent = text || '';
+}
+
+// ───────── AI 流式反馈：阶段 + 用时 + 已生成字数 + 等待动画（不再是只会转圈的横条）─────────
+const fb = { timer: 0, active: false, t0: 0, waitSince: 0, stage: '', step: '', pct: 0, chars: 0, expected: 0, waiting: true };
+
+function fbRender() {
+  if (!fb.active) return;
+  const now = Date.now();
+  const parts = [fb.stage];
+  if (fb.step) parts.push(fb.step);
+  if (fb.chars) parts.push(`已生成 ${fb.chars.toLocaleString()} 字`);
+  parts.push(`用时 ${fmtTs((now - fb.t0) / 1000)}`);
+  if (fb.waiting && now - fb.waitSince >= 8000) parts.push('模型还在处理，可随时停止');
+  setProgress(fb.waiting ? Math.max(fb.pct, 6) : fb.pct, parts.join(' · '), '', fb.waiting);
+}
+
+function fbBegin(stage, expected = 0) {
+  clearInterval(fb.timer);
+  const now = Date.now();
+  Object.assign(fb, { active: true, t0: now, waitSince: now, stage, step: '', pct: 2, chars: 0, expected, waiting: true });
+  fb.timer = setInterval(fbRender, 500);
+  fbRender();
+}
+
+function fbSet(patch) {
+  if (!fb.active) return;
+  if (patch.waiting && !fb.waiting) fb.waitSince = Date.now();
+  Object.assign(fb, patch);
+  fbRender();
+}
+
+/** 收到一段增量：按“预计输出字数”估算进度，越接近越慢，不会卡在固定百分比 */
+function fbDelta(n) {
+  fbChars(fb.chars + n);
+}
+
+function fbChars(total) {
+  if (!fb.active) return;
+  fb.chars = total;
+  fb.waiting = false;
+  if (fb.expected > 0) fb.pct = Math.max(fb.pct, Math.min(95, 8 + 87 * (1 - Math.exp((-1.6 * fb.chars) / fb.expected))));
+  fbRender();
+}
+
+function fbEnd(state, text, pct) {
+  if (!fb.active) return;
+  clearInterval(fb.timer);
+  fb.active = false;
+  const used = fmtTs((Date.now() - fb.t0) / 1000);
+  setProgress(pct ?? (state === 'done' ? 100 : 0), `${text} · 用时 ${used}`, state, false);
+}
+
+function stopAi() {
+  proofCancel = true;
+  invoke('ai_cancel').catch(() => {});
 }
 
 function paintButtons() {
@@ -224,7 +329,10 @@ function paintButtons() {
   $('tr-cancel').classList.toggle('hidden', !running);
   $('tr-sum').disabled = busy;
   $('tr-sum-stop').classList.toggle('hidden', !summarizing);
-  $('tr-text').readOnly = running;
+  $('tr-progress-stop')?.classList.toggle('hidden', !summarizing);
+  $('tr-progress')?.classList.toggle('has-stop', summarizing);
+  if ($('tr-proofread')) $('tr-proofread').disabled = busy;
+  $('tr-text').readOnly = running; // 校对期间也可以边查边改：区块和疑点位置会跟着编辑实时平移
   $('tr-summary').readOnly = summarizing;
   const n = curSum()?.history?.length || 0;
   const go = $('tr-refine-go');
@@ -233,7 +341,7 @@ function paintButtons() {
   if (undo) undo.disabled = busy || !n;
   const ver = $('tr-ver');
   if (ver) ver.textContent = n ? `可撤销 ${n} 步` : '';
-  const doing = busyKind === 'refine' ? '精修中…' : '总结中…';
+  const doing = { refine: '精修中…', proofread: '校对中…', aux: 'AI 处理中…' }[busyKind] || '总结中…';
   setStatus(running ? '转写中…' : summarizing ? doing : '就绪', busy);
   paintTabs();
 }
@@ -393,7 +501,7 @@ function buildViewer() {
       if (!pane.firstChild) {
         pane.className = 'tr-vcol';
         pane.dataset.key = c.key;
-        pane.innerHTML = `<header class="tr-vcol-head"><span class="tr-vcol-title"></span><button type="button" class="mini-btn" data-copy="1">复制</button></header>
+        pane.innerHTML = `<header class="tr-vcol-head"><span class="tr-vcol-title"></span><span class="tr-vcol-btns"><button type="button" class="mini-btn" data-copy="1">复制</button><button type="button" class="mini-btn" data-export="1" title="导出这一列">导出</button></span></header>
           <div class="tr-vscroll" tabindex="0"><div class="tr-viewer-content"></div></div>`;
       }
       pane.querySelector('.tr-vcol-title').textContent = c.title;
@@ -401,7 +509,34 @@ function buildViewer() {
       wrap.appendChild(pane);
     });
   wrap.dataset.n = String(wrap.children.length);
+  // 只显示一列时列头是隐藏的，复制 / 导出放到顶栏
+  const single = wrap.children.length === 1;
+  $('tr-viewer-copy').classList.toggle('hidden', !single);
+  $('tr-viewer-export').classList.toggle('hidden', !single);
   refreshViewer();
+}
+
+function viewerCol(key) {
+  return viewerColumns().find((c) => c.key === key) || null;
+}
+
+function copyViewerCol(col) {
+  if (!col) return;
+  if (col.md) copyText(colSource(col), '已复制总结');
+  else copyText(stripStamps(colSource(col)), '已复制转写文字（不含时间点）');
+}
+
+function exportViewerCol(col) {
+  if (!col) return;
+  const r = cur();
+  const base = safeName(r?.title || '转写');
+  if (col.md) {
+    const idx = (r?.sums || []).findIndex((s) => s === col.sum);
+    const tag = r?.sums?.length > 1 ? `_总结${LETTERS[idx]}${col.sum?.label ? '_' + col.sum.label : ''}` : '_总结';
+    exportTo(colSource(col), `${base}${tag}.md`, 'md');
+  } else {
+    exportTo(colSource(col), `${base}_转写.txt`, 'txt');
+  }
 }
 
 function setViewerFont(n) {
@@ -452,6 +587,8 @@ function paintEditor() {
   const r = cur();
   $('tr-path').value = r?.path || '';
   $('tr-text').value = r?.text || '';
+  stopProofAudio();
+  loadProofFrom(r);
   setSummary(curSum(r)?.text || '');
   paintTabs();
   if (r?.language) $('tr-lang').value = r.language;
@@ -473,7 +610,40 @@ function readEditorInto(r) {
   const p = $('tr-path').value.trim();
   if (p) r.path = p;
   r.language = $('tr-lang').value || 'auto';
+  if (r.id === curId) r.proof = proofSnapshot(); // AI 校对的结果、进度、没填完的内容一并存本地
   r.updatedAt = Date.now();
+}
+
+/** 当前这条记录的 AI 校对状态（存进记录，关掉程序再打开还在） */
+function proofSnapshot() {
+  if (!proofIssues.length && !proofNote && !proofResume) return null;
+  return {
+    issues: proofIssues.map((p) => ({
+      id: p.id, start: p.start, end: p.end, text: p.text, suggestion: p.suggestion, reason: p.reason,
+      cands: p.cands || [], ok: p.ok === true,
+    })),
+    drafts: Object.fromEntries([...proofDrafts].filter(([, v]) => v)),
+    note: proofNote,
+    complete: proofComplete && !isProofing(),
+    resumeAt: proofResume,
+    at: Date.now(),
+  };
+}
+
+/** 切换 / 打开记录时，把它保存的校对状态读回来 */
+function loadProofFrom(r) {
+  const p = r?.proof;
+  proofIssues = p ? p.issues.map((x) => ({ ...x })) : [];
+  proofDrafts.clear();
+  for (const [k, v] of Object.entries(p?.drafts || {})) proofDrafts.set(Number(k), v);
+  proofComplete = p ? p.complete !== false : true;
+  proofResume = p?.resumeAt || 0;
+  const len = Math.max(1, (r?.text || '').length);
+  proofNote = !p ? '' : proofComplete ? p.note : `上次校对没跑完（已检查约 ${Math.round((proofResume / len) * 100)}%），可点「AI 校对」选择从中断处继续`;
+  proofScan = null;
+  proofChunks = [];
+  proofTextSnapshot = $('tr-text')?.value || '';
+  renderProofread();
 }
 
 function newRecord(path = '') {
@@ -563,7 +733,15 @@ function cleanPath(p) {
 
 async function pickAudio() {
   const files = await pickFiles(AUDIO_PICK_EXT, '选择要转写的录音');
-  if (files?.length) {
+  if (files?.length > 1) {
+    if (running || summarizing) return toast('正在处理中，请完成或取消后再选择文件');
+    const r = cur();
+    if (r) { readEditorInto(r); persist(); }
+    queuedPaths = [...files];
+    $('tr-path').value = `已选 ${files.length} 个音频文件，点击「开始转写」依次识别`;
+    toast(`已加入 ${files.length} 个音频，将按顺序逐个识别`);
+  } else if (files?.length) {
+    queuedPaths = [];
     $('tr-path').value = files[0];
     const r = cur();
     if (r && !r.text.trim()) {
@@ -577,6 +755,26 @@ async function pickAudio() {
 
 async function startTranscribe() {
   if (running || summarizing) return;
+  if (queuedPaths.length) {
+    const paths = [...queuedPaths];
+    queuedPaths = [];
+    const failed = [];
+    for (let i = 0; i < paths.length; i++) {
+      const r = newRecord(paths[i]);
+      $('tr-path').value = paths[i];
+      const result = await transcribeOne(paths[i], r, `${i + 1}/${paths.length}`);
+      if (result === 'cancelled') {
+        queuedPaths = paths.slice(i + 1);
+        if (queuedPaths.length) toast(`已停止，剩余 ${queuedPaths.length} 个文件未处理；点击「开始转写」可继续`);
+        return;
+      }
+      if (result === 'failed') failed.push(baseName(paths[i]));
+    }
+    toast(failed.length
+      ? `批量转写结束：成功 ${paths.length - failed.length} 个，失败 ${failed.length} 个（${failed.slice(0, 4).join('、')}${failed.length > 4 ? '…' : ''}；失败项已保留记录）`
+      : `批量转写完成：${paths.length} 个文件`);
+    return;
+  }
   const path = cleanPath($('tr-path').value);
   if (!path) return toast('先选择录音文件，或粘贴文件路径');
   $('tr-path').value = path;
@@ -592,6 +790,11 @@ async function startTranscribe() {
     r.path = path;
     if (!r.title || r.title === '新转写') r.title = baseName(path);
   }
+  await transcribeOne(path, r);
+}
+
+async function transcribeOne(path, r, batchProgress = '') {
+  r.path = path;
   r.language = $('tr-lang').value || 'auto';
   lsSet(LS_LANG, r.language);
   $('tr-text').value = '';
@@ -605,7 +808,7 @@ async function startTranscribe() {
 
   running = true;
   paintButtons();
-  setProgress(0, '准备中…');
+  setProgress(0, batchProgress ? `批量转写 ${batchProgress}：准备中…` : '准备中…');
   try {
     const res = await invoke('transcribe_file', { path, language: r.language });
     const rec = records.find((x) => x.id === r.id);
@@ -616,10 +819,11 @@ async function startTranscribe() {
     }
     persist();
     if (!res?.paragraphs?.length) {
-      toast('没有识别到语音内容（可能是静音或语种不对）');
+      if (!batchProgress) toast('没有识别到语音内容（可能是静音或语种不对）');
     } else {
-      toast(`转写完成：音频 ${fmtDur(res.durationSec)}，用时 ${fmtDur(res.elapsedSec)}`, 6000);
+      if (!batchProgress) toast(`转写完成：音频 ${fmtDur(res.durationSec)}，用时 ${fmtDur(res.elapsedSec)}`, 6000);
     }
+    return 'done';
   } catch (err) {
     const msg = String(err?.message || err);
     const rec = records.find((x) => x.id === r.id);
@@ -627,7 +831,11 @@ async function startTranscribe() {
       rec.text = $('tr-text').value.trim();
       persist();
     }
-    if (msg !== '已取消') toast('转写失败：' + msg, 8000);
+    if (msg !== '已取消') {
+      if (!batchProgress) toast('转写失败：' + msg, 8000);
+      return 'failed';
+    }
+    return 'cancelled';
   } finally {
     running = false;
     paintButtons();
@@ -896,7 +1104,7 @@ async function summarize(addVendor = '') {
   busyKind = 'summary';
   paintTabs();
   paintButtons();
-  setProgress(2, `连接 ${label}…`);
+  fbBegin(`连接 ${label}…`, Math.min(6000, Math.max(1500, Math.round(text.length * 0.22))));
   let ok = false;
   try {
     const full = await invoke('ai_summarize', { text, prompt, vendor });
@@ -906,6 +1114,7 @@ async function summarize(addVendor = '') {
   } catch (err) {
     const msg = String(err?.message || err);
     if (msg !== '已取消') toast('总结失败：' + msg, 9000);
+    fbEnd('error', msg === '已取消' ? '已停止' : msg);
   } finally {
     summarizing = false;
     busyKind = '';
@@ -966,7 +1175,7 @@ async function refine() {
   busyKind = 'refine';
   paintTabs();
   paintButtons();
-  setProgress(2, `连接 ${label}…`);
+  fbBegin(`连接 ${label}…`, Math.min(8000, Math.max(800, Math.round(before.length * 1.05))));
   let ok = false;
   try {
     const full = await invoke('ai_refine', { text, summary: before, instruction, vendor });
@@ -976,6 +1185,7 @@ async function refine() {
   } catch (err) {
     const msg = String(err?.message || err);
     if (msg !== '已取消') toast('精修失败：' + msg, 9000);
+    fbEnd('error', msg === '已取消' ? '已停止' : msg);
     setSummary(before); // 失败 / 停止：保持精修前的内容不变
   } finally {
     summarizing = false;
@@ -1014,23 +1224,36 @@ function undoRefine() {
 }
 
 function onSummaryEvent(p) {
-  if (!summarizing || !p) return;
+  if (!p) return;
+  if (auxiliaryAi) {
+    // 校对 / 改进提示词：进度由调用方自己的循环掌控，这里只收文本并通知“已开始出字”
+    if (p.kind === 'delta') {
+      auxiliaryAi.text += p.text || '';
+      auxiliaryAi.onDelta?.(auxiliaryAi.text.length);
+    }
+    return;
+  }
+  if (!summarizing) return;
   switch (p.kind) {
     case 'delta':
       appendSummary(p.text || '');
+      fbDelta((p.text || '').length);
       break;
     case 'start':
+      fbSet({ stage: p.message || fb.stage });
+      break;
     case 'progress':
-      setProgress(p.percent || 0, p.message || '');
+      // 分段提炼等“还没出字”的阶段：显示阶段名 + 等待动画
+      fbSet({ stage: p.message || fb.stage, pct: Math.max(fb.pct, p.percent || 0), waiting: true });
       break;
     case 'done':
-      setProgress(100, p.message || '完成', 'done');
+      fbEnd('done', p.message || '完成');
       break;
     case 'error':
-      setProgress(0, p.message || '失败', 'error');
+      fbEnd('error', p.message || '失败');
       break;
     case 'cancelled':
-      setProgress(0, '已停止', 'error');
+      fbEnd('error', '已停止');
       break;
     default:
       break;
@@ -1041,10 +1264,712 @@ function applyPreset(name) {
   const sel = $('tr-preset');
   if (sel) sel.value = name;
   lsSet(LS_PRESET, name);
-  if (name === 'custom') {
+  const saved = name.startsWith('saved:') ? promptLibrary().find((p) => p.id === name.slice(6)) : null;
+  if (saved) {
+    $('tr-prompt').value = saved.text;
+  } else if (name === 'custom') {
     $('tr-prompt').value = lsGet(LS_PROMPT, '') || PRESETS.sermon;
   } else {
     $('tr-prompt').value = PRESETS[name] || PRESETS.sermon;
+  }
+  $('tr-prompt-delete').disabled = !saved;
+}
+
+function promptLibrary() {
+  const a = lsGet(LS_PROMPT_LIBRARY, []);
+  return Array.isArray(a) ? a.filter((p) => p && typeof p.text === 'string').map((p) => ({ id: String(p.id), name: String(p.name || '自定义提示词'), text: p.text })) : [];
+}
+
+function renderPromptOptions() {
+  const sel = $('tr-preset');
+  const selected = lsGet(LS_PRESET, 'sermon');
+  sel.querySelectorAll('option[data-saved]').forEach((o) => o.remove());
+  const before = sel.querySelector('option[value="custom"]');
+  for (const p of promptLibrary()) {
+    const o = document.createElement('option'); o.value = `saved:${p.id}`; o.textContent = p.name; o.dataset.saved = '1';
+    sel.insertBefore(o, before);
+  }
+  if ([...sel.options].some((o) => o.value === selected)) sel.value = selected;
+}
+
+/**
+ * 渲染校对标记：文本框背后的镜像层画“正在检查的区块”（scan）和疑点波浪线（mark），
+ * 下方是逐条问题列表。follow=true 时让文本框滚到正在检查的位置。
+ */
+function renderProofread(follow = false) {
+  const ta = $('tr-text');
+  const text = ta.value;
+  const overlay = $('tr-text-highlight');
+  const panel = $('tr-proofread-issues');
+  if (!overlay || !panel) return;
+  const live = isProofing();
+  const spans = proofIssues
+    .filter((p) => Number.isInteger(p.start) && Number.isInteger(p.end) && text.slice(p.start, p.end) === p.text)
+    .map((p) => ({ start: p.start, end: p.end }))
+    .sort((a, b) => a.start - b.start);
+  const scan = proofScan && proofScan.end <= text.length ? proofScan : null;
+
+  // 镜像层要和文本框同宽换行：补上滚动条占的宽度
+  overlay.style.paddingRight = `${14 + Math.max(0, ta.offsetWidth - ta.clientWidth)}px`;
+
+  const cuts = new Set([0, text.length]);
+  if (scan) { cuts.add(scan.start); cuts.add(scan.end); }
+  for (const s of spans) { cuts.add(s.start); cuts.add(s.end); }
+  const pts = [...cuts].sort((a, b) => a - b);
+  let html = '';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    let seg = esc(text.slice(a, b));
+    const hit = spans.find((s) => s.start <= a && s.end >= b);
+    if (hit) seg = `<mark${hit.start === a ? ` data-s="${a}"` : ''}>${seg}</mark>`;
+    if (scan && a >= scan.start && b <= scan.end) seg = `<span class="scan">${seg}</span>`;
+    html += seg;
+  }
+  overlay.innerHTML = html + (text.endsWith('\n') ? ' ' : '');
+  overlay.scrollTop = ta.scrollTop;
+
+  if (follow && proofFollow && scan) {
+    const el = overlay.querySelector('.scan');
+    if (el) ta.scrollTo({ top: Math.max(0, el.offsetTop - ta.clientHeight * 0.2), behavior: 'smooth' });
+  }
+
+  if (!proofIssues.length && !proofNote && !live) { panel.classList.add('hidden'); panel.innerHTML = ''; return; }
+  const keep = panel.scrollTop;
+  // 重绘前记住“自己填”框的焦点和光标，重绘后还原（校对进行中每查完一块都会重绘）
+  const act = document.activeElement;
+  const focusId = act?.classList?.contains('tr-manual') && panel.contains(act) ? act.dataset.id : null;
+  const caret = focusId ? [act.selectionStart, act.selectionEnd] : null;
+  panel.classList.remove('hidden');
+  const head = live
+    ? `<span class="tr-proofread-status is-live">${esc(proofNote || '正在逐段检查…')}</span><span class="tr-proofread-count">待处理 ${proofIssues.length} 处</span>`
+    : `<span class="tr-proofread-status">${proofIssues.length ? `${proofIssues.length} 处待确认` : '没有待确认的疑点'}${proofNote ? ' · ' + esc(proofNote) : ''}</span>
+       ${proofIssues.length ? '<button class="mini-btn" type="button" data-head="export" title="把待确认的疑点（含时间点）导出成 Markdown 清单，方便对着音频慢慢核">导出清单</button>' : ''}
+       <button class="mini-btn" type="button" data-head="clear">清除标记</button>`;
+  const hasAudio = !!(cur()?.path || cleanPath($('tr-path').value));
+  const recOff = summarizing ? ' disabled' : '';
+  panel.innerHTML = `<div class="tr-proofread-head">${head}</div>` + proofIssues.map((p, i) => {
+    const before = text.slice(Math.max(0, p.start - 24), p.start);
+    const after = text.slice(p.end, Math.min(text.length, p.end + 24));
+    const needCheck = !p.suggestion || p.suggestion === '请听原音核实';
+    const seg = proofSegmentOf(text, p.start);
+    const playing = proofPlay?.id === p.id && proofAudio && !proofAudio.paused;
+    let extra = '';
+    if (p.loading) {
+      extra = '<div class="tr-proofread-cands"><span class="tr-proofread-wait">AI 正在重新推荐…</span></div>';
+    } else if (p.ok) {
+      extra = '<div class="tr-proofread-cands"><span class="tr-proofread-wait">AI 重新判断后认为这里没有问题，可以直接忽略。</span></div>';
+    } else if (p.cands?.length) {
+      extra = '<div class="tr-proofread-cands"><span class="tr-proofread-arrow">AI 推荐，点一个直接替换：</span>'
+        + p.cands.map((c, k) => `<button class="tr-cand" type="button" data-action="cand" data-k="${k}" title="${esc(c.reason || '')}"><b>${esc(c.text)}</b>${c.reason ? `<small>${esc(c.reason)}</small>` : ''}</button>`).join('')
+        + '</div>';
+    }
+    const listen = `<button class="mini-btn tr-listen${playing ? ' is-on' : ''}" type="button" data-action="listen"${hasAudio && seg ? '' : ' disabled'} title="${hasAudio ? (seg ? '播放这一段原音（可拖动、调速），听完再决定怎么改' : '这一段前面没有时间点，无法定位') : '这条记录没有关联的音频文件'}">${playing ? '⏸ 暂停' : '▶ 听这段'}${seg ? ` ${esc(seg.label)}` : ''}</button>`;
+    return `<div class="tr-proofread-issue" data-i="${i}">
+      <div class="tr-proofread-context" title="点击定位到原文">…${esc(before)}<b>${esc(p.text)}</b>${esc(after)}…</div>
+      <div class="tr-proofread-choice"><span class="tr-proofread-arrow">${needCheck ? '建议' : '建议改为'}</span><strong>${esc(p.suggestion || '待核对')}</strong>
+        <span class="tr-proofread-reason">${esc(p.reason || '')}</span>
+      </div>
+      <div class="tr-proofread-choice">
+        ${listen}
+        ${needCheck ? '' : '<button class="mini-btn primary" type="button" data-action="apply">采纳</button>'}
+        <button class="mini-btn" type="button" data-action="recommend"${recOff} title="觉得这个建议不对？让 AI 结合上下文再推荐几种改法">${p.cands?.length || p.ok ? '再推荐' : 'AI 推荐'}</button>
+        <button class="mini-btn" type="button" data-action="ignore">忽略</button>
+        <input class="tr-manual" type="text" data-id="${p.id}" spellcheck="false" placeholder="听后自己填正确写法" value="${esc(proofDrafts.get(p.id) || '')}" />
+        <button class="mini-btn" type="button" data-action="manual">替换</button>
+      </div>${extra}
+    </div>`;
+  }).join('');
+  panel.scrollTop = keep;
+  if (focusId) {
+    const el = panel.querySelector(`.tr-manual[data-id="${focusId}"]`);
+    if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(caret[0], caret[1]); } catch { /* ignore */ } }
+  }
+}
+
+function scrollEditorTo(pos) {
+  const el = $('tr-text-highlight')?.querySelector(`[data-s="${pos}"]`);
+  const ta = $('tr-text');
+  if (el) ta.scrollTo({ top: Math.max(0, el.offsetTop - ta.clientHeight * 0.35), behavior: 'smooth' });
+}
+
+function clearProofread() {
+  proofIssues = [];
+  proofNote = '';
+  proofScan = null;
+  proofResume = 0;
+  proofComplete = true;
+  proofDrafts.clear();
+  proofTextSnapshot = $('tr-text')?.value || '';
+  renderProofread();
+  schedulePersist();
+}
+
+// ───────── 校对中边查边改：文稿被改动后，把待检查区块、疑点位置一起平移 ─────────
+
+function shiftPos(pos, prefix, oldEnd, delta, isEnd) {
+  if (pos <= prefix) return pos;
+  if (pos >= oldEnd) return pos + delta;
+  return isEnd ? oldEnd + delta : prefix; // 落在被改写区域内：区块起点退到改动前、终点推到改动后（这块会被重新检查）
+}
+
+/** 文稿里 [prefix, oldEnd) 被替换成了长度差为 delta 的内容 */
+function shiftProofState(prefix, oldEnd, delta) {
+  for (const c of proofChunks) {
+    c.start = shiftPos(c.start, prefix, oldEnd, delta, false);
+    c.end = shiftPos(c.end, prefix, oldEnd, delta, true);
+  }
+  if (proofResume > 0) proofResume = Math.min(shiftPos(proofResume, prefix, oldEnd, delta, false), $('tr-text').value.length);
+  proofIssues = proofIssues
+    .filter((x) => x.end <= prefix || x.start >= oldEnd)
+    .map((x) => (x.start >= oldEnd ? { ...x, start: x.start + delta, end: x.end + delta } : x));
+}
+
+function reconcileProofreadAfterEdit() {
+  const next = $('tr-text').value;
+  const prev = proofTextSnapshot;
+  if (prev !== next) {
+    let prefix = 0;
+    while (prefix < prev.length && prefix < next.length && prev[prefix] === next[prefix]) prefix++;
+    let suffix = 0;
+    while (suffix < prev.length - prefix && suffix < next.length - prefix && prev[prev.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+    const oldEnd = prev.length - suffix;
+    const delta = next.length - suffix - oldEnd;
+    shiftProofState(prefix, oldEnd, delta);
+  }
+  proofTextSnapshot = next;
+  if (proofIssues.length || proofScan) renderProofread();
+  schedulePersist();
+}
+
+/** 校对 / 改进提示词等“一次性 AI 调用”：只收文本，不动总结框。onDelta(n) 在模型开始出字时回调 */
+async function runAuxAi(text, instruction, vendor, onDelta) {
+  auxiliaryAi = { text: '', onDelta };
+  const own = !summarizing;
+  if (own) { summarizing = true; busyKind = 'aux'; paintButtons(); }
+  try { return await invoke('ai_summarize', { text, prompt: instruction, vendor }); }
+  finally {
+    auxiliaryAi = null;
+    if (own) { summarizing = false; busyKind = ''; paintButtons(); }
+  }
+}
+
+const PROOF_PROMPT = '你是中文语音转写校对助手。下面是一小段语音识别文稿（行首的 [mm:ss] 是时间点，不是正文）。'
+  + '只找有上下文依据的明显错别字、同音误识、人名/术语/经文名称错误、断句错误；不要润色正常表达，没有问题就返回空数组。'
+  + '每条问题的 quote 必须是文稿里原样存在的一小段连续文字（2–20 字，不要含时间点和换行），context 是包含 quote 的原样上下文（前后各约 15 字）。'
+  + '无法确定时 suggestion 写“请听原音核实”，不要猜。只返回 JSON，不要任何解释：'
+  + '{"issues":[{"quote":"…","context":"…","suggestion":"建议改法","reason":"依据上下文的简短理由"}]}';
+const PROOF_CHUNK_CHARS = 1000; // 每次只检查约 1000 字（3–6 段），结果马上出来，可看到“一条一条”往下扫
+
+/** 按段落（行）聚合成约 target 字的小块；优先在换行 / 句末处断开 */
+function splitProofChunks(text, target = PROOF_CHUNK_CHARS) {
+  const spans = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(text.length, start + target);
+    if (end < text.length) {
+      const nl = text.lastIndexOf('\n', end - 1);
+      if (nl >= start + target * 0.4) {
+        end = nl + 1;
+      } else {
+        const nextNl = text.indexOf('\n', end);
+        if (nextNl >= 0 && nextNl - start <= target * 1.5) {
+          end = nextNl + 1;
+        } else {
+          const m = text.slice(start + Math.floor(target * 0.5), end).match(/[\s\S]*[。！？；!?;]/);
+          if (m) end = start + Math.floor(target * 0.5) + m[0].length;
+        }
+      }
+    }
+    spans.push({ start, end });
+    start = end;
+  }
+  // 结尾太短的碎片并入前一块
+  if (spans.length > 1 && text.slice(spans[spans.length - 1].start).trim().length < 40) {
+    const last = spans.pop();
+    spans[spans.length - 1].end = last.end;
+  }
+  return spans.map((c) => ({ ...c, text: text.slice(c.start, c.end) })).filter((c) => c.text.trim().length >= 20);
+}
+
+function parseProofItems(raw) {
+  const s = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const tryParse = (t) => { try { return JSON.parse(t); } catch { return undefined; } };
+  const a = s.indexOf('{');
+  const b = s.lastIndexOf('}');
+  let obj = a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : undefined;
+  if (obj === undefined) {
+    const x = s.indexOf('[');
+    const y = s.lastIndexOf(']');
+    obj = x >= 0 && y > x ? tryParse(s.slice(x, y + 1)) : undefined;
+  }
+  if (Array.isArray(obj)) return obj;
+  if (obj && Array.isArray(obj.issues)) return obj.issues;
+  return null; // 解析失败
+}
+
+/** 把模型给的 quote 定位回这一块文稿里的精确位置；定位不上的丢弃（宁缺毋滥） */
+function locateProofItem(chunk, item) {
+  const quote = typeof item?.quote === 'string' ? item.quote : item?.text;
+  if (typeof quote !== 'string' || quote.trim().length < 2 || /^[\s\d:\[\]]+$/.test(quote)) return null;
+  const context = typeof item.context === 'string' ? item.context : '';
+  let at = -1;
+  if (context.includes(quote)) {
+    const c = chunk.text.indexOf(context);
+    if (c >= 0) at = c + context.indexOf(quote);
+  }
+  if (at < 0 || chunk.text.slice(at, at + quote.length) !== quote) at = chunk.text.indexOf(quote);
+  if (at < 0) return null;
+  const suggestion = String(item.suggestion || '请听原音核实').trim();
+  if (suggestion === quote) return null;
+  return {
+    start: chunk.start + at,
+    end: chunk.start + at + quote.length,
+    text: quote,
+    suggestion,
+    reason: String(item.reason || '').trim(),
+  };
+}
+
+/**
+ * 逐段校对：每检查完一小块立刻标出疑点并滚到下一块；检查期间可以照常改文稿、采纳 / 忽略 / 试听，
+ * 待检查的区块和已标出的疑点会随编辑实时平移。可随时停止，已标出的保留。
+ */
+async function proofreadTranscript() {
+  if (running || summarizing) return;
+  const ta = $('tr-text');
+  const text = ta.value;
+  if (text.trim().length < 20) return toast('转写内容太短，无法校对');
+  await loadKeyState();
+  const vendor = curVendor();
+  if (!(await ensureKey(vendor))) return;
+  const label = aiState?.[vendor]?.label || VENDOR_LABEL[vendor] || 'AI';
+  // 上次没校对完：可以从中断处继续，已标出的疑点保留
+  let from = 0;
+  if (proofResume > 0 && proofResume < text.length - 20) {
+    const pct = Math.round((proofResume / text.length) * 100);
+    if (window.confirm(`上次校对在约 ${pct}% 处中断了（已标出 ${proofIssues.length} 处）。\n\n确定 = 从中断处继续\n取消 = 全部重新校对`)) from = proofResume;
+  }
+  if (!from && proofIssues.length && !window.confirm(`重新校对会清掉当前还没处理的 ${proofIssues.length} 处疑点。继续？`)) return;
+  const chunks = splitProofChunks(text.slice(from)).map((c) => ({ start: c.start + from, end: c.end + from }));
+  const total = chunks.length;
+  if (!total) return toast('没有可校对的内容');
+  if (total > 60 && !window.confirm(`文稿较长，将分 ${total} 段依次调用 ${label}，耗时和费用都会增加。继续？`)) return;
+
+  proofCancel = false;
+  proofFollow = true;
+  if (!from) {
+    proofIssues = [];
+    proofDrafts.clear();
+  }
+  proofNote = '';
+  proofComplete = false;
+  proofResume = from;
+  proofChunks = chunks;
+  proofTextSnapshot = text;
+  summarizing = true;
+  busyKind = 'proofread';
+  paintButtons();
+  fbBegin(`${label} 校对 1/${total} 段`);
+  const costs = [];
+  let checked = 0;
+  let foundCount = 0;
+  let unparsed = 0;
+  let failure = '';
+  try {
+    for (let c = 0; c < total; c++) {
+      if (proofCancel) break;
+      const chunk = chunks[c];
+      const sent = ta.value.slice(chunk.start, chunk.end); // 取最新文稿（用户可能已改动）
+      if (sent.trim().length < 20) { checked = c + 1; continue; }
+      const avg = costs.length ? costs.reduce((x, y) => x + y, 0) / costs.length : 0;
+      const eta = avg ? ` · 约剩 ${fmtTs(avg * (total - c))}` : '';
+      proofScan = chunk; // 同一个对象：文稿被改动时跟着平移
+      proofNote = `正在检查第 ${c + 1}/${total} 段${eta}`;
+      fbSet({
+        stage: `${label} 校对 ${c + 1}/${total} 段`,
+        step: `已发现 ${foundCount} 处${eta}`,
+        pct: (c / total) * 100,
+        waiting: true,
+      });
+      renderProofread(true);
+      const t0 = Date.now();
+      let raw;
+      try {
+        raw = await runAuxAi(sent, PROOF_PROMPT, vendor, (n) => {
+          fbSet({ waiting: false, pct: ((c + Math.min(0.9, n / 500)) / total) * 100 });
+        });
+      } catch (err) {
+        if (proofCancel || String(err?.message || err) === '已取消') break;
+        throw err;
+      }
+      costs.push((Date.now() - t0) / 1000);
+      const items = parseProofItems(raw);
+      if (!items) {
+        unparsed++;
+      } else {
+        // 等待期间文稿可能被改过：对着“现在”的这个区块重新定位，对不上的丢弃
+        const now = { start: chunk.start, end: chunk.end, text: ta.value.slice(chunk.start, chunk.end) };
+        for (const item of items.slice(0, 15)) {
+          const issue = locateProofItem(now, item);
+          if (issue && !proofIssues.some((x) => issue.start < x.end && issue.end > x.start)) {
+            issue.id = ++proofSeq;
+            proofIssues.push(issue);
+            foundCount++;
+          }
+        }
+        proofIssues.sort((a, b) => a.start - b.start);
+      }
+      checked = c + 1;
+      proofResume = chunk.end;
+      renderProofread();
+      schedulePersist(); // 每查完一块就存本地：中途关掉程序也不会丢
+    }
+  } catch (err) {
+    failure = String(err?.message || err);
+    toast('校对失败：' + failure, 8000);
+  } finally {
+    proofScan = null;
+    proofChunks = [];
+    summarizing = false;
+    busyKind = '';
+    const stopped = proofCancel;
+    const tail = unparsed ? ` · ${unparsed} 段结果无法解析` : '';
+    proofNote = failure
+      ? `中断于第 ${checked + 1} 段：${failure}`
+      : stopped
+        ? `已停止，检查了 ${checked}/${total} 段，共发现 ${foundCount} 处${tail}`
+        : `已检查全部 ${total} 段，共发现 ${foundCount} 处${tail}`;
+    proofComplete = !failure && !stopped;
+    if (proofComplete) proofResume = 0;
+    paintButtons();
+    renderProofread();
+    schedulePersist();
+    if (failure) fbEnd('error', `校对中断：${failure}`, (checked / total) * 100);
+    else if (stopped) fbEnd('error', `已停止 · 检查 ${checked}/${total} 段 · 发现 ${foundCount} 处`, (checked / total) * 100);
+    else {
+      fbEnd('done', `校对完成 · ${total} 段 · ${foundCount ? `发现 ${foundCount} 处` : '没有发现明显疑点'}`);
+      toast(foundCount ? `校对完成：发现 ${foundCount} 处，请在下方逐条确认` : '校对完成，没有找到明显疑点');
+    }
+  }
+}
+
+/** 只替换这一处（其他同词位置不动），其余疑点和待检查区块整体平移 */
+function applyProofIssue(index, replacement) {
+  const issue = proofIssues[index];
+  if (!issue) return;
+  const editor = $('tr-text');
+  const current = editor.value;
+  if (current.slice(issue.start, issue.end) !== issue.text) return toast('这处原文已变化，请重新运行校对');
+  const delta = replacement.length - issue.text.length;
+  editor.value = current.slice(0, issue.start) + replacement + current.slice(issue.end);
+  proofDrafts.delete(issue.id);
+  shiftProofState(issue.start, issue.end, delta);
+  proofTextSnapshot = editor.value;
+  schedulePersist();
+  renderProofread();
+  toast(`已改为「${replacement}」；其他同词位置保持不变`);
+}
+
+const RECOMMEND_PROMPT = '你是中文语音转写校对助手。下面给出一段语音识别文稿里被标为“疑点”的位置：前文、疑点原文、后文，'
+  + '以及此前已被用户否决的建议。请结合上下文重新判断，给出最多 3 个更合理的“替换疑点原文”的写法（按可能性从高到低，只写替换后的那几个字，不要带前后文）。'
+  + '人名、术语、经文名称要符合通行写法；拿不准就少给，不要硬凑。若你认为疑点原文其实没有问题，ok 设为 true，candidates 为空数组。'
+  + '只返回 JSON，不要任何解释：{"ok":false,"candidates":[{"text":"替换后的文字","reason":"简短理由"}]}';
+
+/** 用户觉得建议不对：让 AI 结合上下文再推荐几种改法，点哪个就换成哪个 */
+async function recommendProofIssue(issue) {
+  if (running || summarizing) return toast('AI 正在处理别的任务，等它结束后再点');
+  await loadKeyState();
+  const vendor = curVendor();
+  if (!(await ensureKey(vendor))) return;
+  const text = $('tr-text').value;
+  if (text.slice(issue.start, issue.end) !== issue.text) return toast('这处原文已变化，请重新运行校对');
+  const label = aiState?.[vendor]?.label || VENDOR_LABEL[vendor] || 'AI';
+  const id = issue.id;
+  const find = () => proofIssues.find((x) => x.id === id); // 等待期间用户可能改了别处，对象会被平移复制，所以按 id 找
+  const rejected = [...new Set([issue.suggestion, ...(issue.cands || []).map((c) => c.text)].filter((s) => s && s !== '请听原音核实'))];
+  const user = [
+    `前文：${text.slice(Math.max(0, issue.start - 120), issue.start)}`,
+    `疑点原文：「${issue.text}」`,
+    `后文：${text.slice(issue.end, issue.end + 120)}`,
+    issue.reason ? `之前标为疑点的理由：${issue.reason}` : '',
+    rejected.length ? `已被否决的建议：${rejected.map((s) => `「${s}」`).join('、')}` : '',
+  ].filter(Boolean).join('\n');
+  issue.loading = true;
+  issue.ok = false;
+  fbBegin(`${label} 正在推荐改法…`);
+  const task = runAuxAi(user, RECOMMEND_PROMPT, vendor, () => fbSet({ waiting: false, pct: 60 }));
+  renderProofread(); // runAuxAi 已同步置忙：推荐按钮先置灰
+  try {
+    const raw = await task;
+    const s = String(raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const a = s.indexOf('{');
+    const b = s.lastIndexOf('}');
+    let obj = null;
+    try { obj = a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null; } catch { obj = null; }
+    if (!obj) throw new Error('AI 返回的格式无法解析，请再点一次');
+    const seen = new Set(rejected.concat([issue.text]));
+    const cands = [];
+    for (const c of Array.isArray(obj.candidates) ? obj.candidates : []) {
+      const t = String(typeof c === 'string' ? c : c?.text || '').trim();
+      if (!t || t.length > 80 || seen.has(t)) continue;
+      seen.add(t);
+      cands.push({ text: t, reason: String(c?.reason || '').trim() });
+      if (cands.length >= 3) break;
+    }
+    const it = find();
+    if (it) {
+      it.cands = cands;
+      it.ok = !cands.length && obj.ok === true;
+    }
+    fbEnd('done', cands.length ? `已推荐 ${cands.length} 种改法` : obj.ok === true ? 'AI 认为原文没问题' : 'AI 没有更好的建议');
+    if (!cands.length && obj.ok !== true) toast('AI 没有给出新的改法，可以听原音后自己填，或忽略这条');
+  } catch (err) {
+    const msg = String(err?.message || err);
+    fbEnd('error', msg === '已取消' ? '已停止' : msg);
+    if (msg !== '已取消') toast('推荐失败：' + msg, 7000);
+  } finally {
+    const it = find();
+    if (it) it.loading = false;
+    renderProofread();
+    schedulePersist();
+  }
+}
+
+// ───────── 听原音：定位疑点所在的那一段并试听 ─────────
+
+function parseStamp(line) {
+  const m = String(line).match(/^\s*\[(?:(\d+):)?(\d{1,2}):(\d{2})\]/);
+  return m ? (m[1] ? Number(m[1]) * 3600 : 0) + Number(m[2]) * 60 + Number(m[3]) : null;
+}
+
+function lineStartAt(text, i) {
+  return i <= 0 ? 0 : text.lastIndexOf('\n', i - 1) + 1;
+}
+
+/** 疑点所在段落的起止秒数：起点 = 本行（或往上最近一行）的 [mm:ss]，终点 = 下一行时间点（没有就按 +30 秒） */
+function proofSegmentOf(text, pos) {
+  let cursor = lineStartAt(text, pos);
+  let stamp = null;
+  for (;;) {
+    const le = text.indexOf('\n', cursor);
+    stamp = parseStamp(text.slice(cursor, le < 0 ? text.length : le));
+    if (stamp !== null || cursor === 0) break;
+    cursor = lineStartAt(text, cursor - 1);
+  }
+  if (stamp === null) return null;
+  let end = stamp + 30;
+  let next = text.indexOf('\n', lineStartAt(text, pos));
+  while (next >= 0 && next < text.length) {
+    const from = next + 1;
+    const le = text.indexOf('\n', from);
+    const s = parseStamp(text.slice(from, le < 0 ? text.length : le));
+    if (s !== null && s > stamp) { end = s; break; }
+    next = le;
+    if (le < 0) break;
+  }
+  return { start: stamp, end: Math.max(end, stamp + 2), label: fmtTs(stamp) };
+}
+
+function ppPaint() {
+  const box = $('tr-proof-player');
+  if (!box) return;
+  if (!proofPlay || !proofAudio) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  const a = proofAudio;
+  $('tr-pp-label').textContent = `${proofPlay.label} 这一段`;
+  const seek = $('tr-pp-seek');
+  seek.min = String(proofPlay.start);
+  seek.max = String(proofPlay.end);
+  if (!ppDragging) seek.value = String(Math.min(proofPlay.end, Math.max(proofPlay.start, a.currentTime)));
+  const pos = Math.max(0, a.currentTime - proofPlay.start);
+  $('tr-pp-time').textContent = `${fmtTs(Math.min(pos, proofPlay.end - proofPlay.start))} / ${fmtTs(proofPlay.end - proofPlay.start)}`;
+  $('tr-pp-toggle').textContent = proofPlay.ended ? '↺' : a.paused ? '▶' : '⏸';
+  $('tr-pp-rate').textContent = `${proofRate}×`;
+}
+
+function ensureProofAudio() {
+  if (proofAudio) return proofAudio;
+  const a = new Audio();
+  a.preload = 'auto';
+  a.addEventListener('timeupdate', () => {
+    if (proofPlay && !proofPlay.ended && a.currentTime >= proofPlay.end) {
+      a.pause();
+      proofPlay.ended = true;
+      renderProofread();
+    }
+    ppPaint();
+  });
+  a.addEventListener('pause', () => { ppPaint(); });
+  a.addEventListener('play', () => { if (proofPlay) proofPlay.ended = false; ppPaint(); });
+  a.addEventListener('error', () => {
+    if (!proofPlay) return;
+    toast('无法播放这个音频：文件可能已被移动、删除，或格式不支持', 6000);
+    stopProofAudio();
+  });
+  proofAudio = a;
+  return a;
+}
+
+function stopProofAudio() {
+  if (proofAudio) proofAudio.pause();
+  proofPlay = null;
+  ppPaint();
+  if (!$('tr-proofread-issues')?.classList.contains('hidden')) renderProofread();
+}
+
+/** 播放（再点一次暂停）疑点所在的整段原音；播到这一段结束自动停下 */
+function listenProofIssue(issue) {
+  if (proofPlay?.id === issue.id && proofAudio) {
+    if (proofAudio.paused) proofAudio.play().catch(() => {});
+    else proofAudio.pause();
+    renderProofread();
+    return;
+  }
+  const path = cur()?.path || cleanPath($('tr-path').value);
+  if (!path) return toast('这条记录没有关联的音频文件');
+  const seg = proofSegmentOf($('tr-text').value, issue.start);
+  if (!seg) return toast('这一段前面没有时间点，无法定位音频位置');
+  const a = ensureProofAudio();
+  const src = convertFileSrc(path);
+  if (a.dataset.src !== src) { a.src = src; a.dataset.src = src; }
+  a.playbackRate = proofRate;
+  proofPlay = { id: issue.id, start: seg.start, end: seg.end, label: seg.label, ended: false };
+  const begin = Math.max(0, seg.start - 0.3);
+  const go = () => {
+    a.currentTime = begin;
+    a.play().catch((err) => { toast('播放失败：' + (err?.message || err)); stopProofAudio(); });
+  };
+  if (a.readyState >= 1) go();
+  else a.addEventListener('loadedmetadata', go, { once: true });
+  ppPaint();
+  renderProofread();
+}
+
+function initProofPlayer() {
+  $('tr-pp-toggle').addEventListener('click', () => {
+    if (!proofPlay || !proofAudio) return;
+    if (proofPlay.ended) {
+      proofPlay.ended = false;
+      proofAudio.currentTime = Math.max(0, proofPlay.start - 0.3);
+      proofAudio.play().catch(() => {});
+    } else if (proofAudio.paused) proofAudio.play().catch(() => {});
+    else proofAudio.pause();
+    renderProofread();
+  });
+  $('tr-pp-rate').addEventListener('click', () => {
+    proofRate = proofRate === 1 ? 0.75 : proofRate === 0.75 ? 0.5 : 1;
+    if (proofAudio) proofAudio.playbackRate = proofRate;
+    ppPaint();
+  });
+  $('tr-pp-close').addEventListener('click', stopProofAudio);
+  const seek = $('tr-pp-seek');
+  seek.addEventListener('pointerdown', () => { ppDragging = true; });
+  seek.addEventListener('pointerup', () => { ppDragging = false; });
+  seek.addEventListener('input', () => {
+    if (!proofAudio || !proofPlay) return;
+    proofPlay.ended = false;
+    proofAudio.currentTime = Number(seek.value);
+  });
+}
+
+/** 把待确认的疑点（含时间点）导出成 Markdown 清单 */
+function exportProofList() {
+  if (!proofIssues.length) return toast('没有待确认的疑点');
+  const text = $('tr-text').value;
+  const r = cur();
+  const lines = [`# ${r?.title || '转写'} · 校对清单`, '', `共 ${proofIssues.length} 处待确认（时间点对应音频位置，可对着原音核对）`, ''];
+  proofIssues.forEach((p, i) => {
+    const seg = proofSegmentOf(text, p.start);
+    const before = text.slice(Math.max(0, p.start - 20), p.start).replace(/\s+/g, ' ');
+    const after = text.slice(p.end, p.end + 20).replace(/\s+/g, ' ');
+    lines.push(`## ${i + 1}. ${seg ? `[${seg.label}] ` : ''}${p.text}`);
+    lines.push(`- 原文：…${before}**${p.text}**${after}…`);
+    lines.push(`- 建议：${p.suggestion || '请听原音核实'}${p.reason ? `（${p.reason}）` : ''}`);
+    if (p.cands?.length) lines.push(`- AI 另外推荐：${p.cands.map((c) => c.text).join(' / ')}`);
+    lines.push('- 处理：☐ 采纳　☐ 另改为＿＿＿＿　☐ 忽略', '');
+  });
+  exportTo(lines.join('\n'), `${safeName(r?.title || '转写')}_校对清单.md`, 'md');
+}
+
+function handleProofreadChoice(e) {
+  const head = e.target.closest('[data-head]')?.dataset.head;
+  if (head === 'clear') {
+    clearProofread();
+    return;
+  }
+  if (head === 'export') {
+    exportProofList();
+    return;
+  }
+  const card = e.target.closest('.tr-proofread-issue');
+  if (!card) return;
+  const index = Number(card.dataset.i);
+  const issue = proofIssues[index];
+  if (!issue) return;
+  const actionEl = e.target.closest('[data-action]');
+  const action = actionEl?.dataset.action;
+  if (action === 'ignore') {
+    proofDrafts.delete(issue.id);
+    proofIssues.splice(index, 1);
+    renderProofread();
+    schedulePersist();
+    return;
+  }
+  if (action === 'apply') {
+    if (!issue.suggestion || issue.suggestion === '请听原音核实') return toast('这条需要先听原音核实，未自动替换');
+    applyProofIssue(index, issue.suggestion);
+    return;
+  }
+  if (action === 'cand') {
+    const c = issue.cands?.[Number(actionEl.dataset.k)];
+    if (c?.text) applyProofIssue(index, c.text);
+    return;
+  }
+  if (action === 'manual') {
+    const v = (card.querySelector('.tr-manual')?.value || '').trim();
+    if (!v) return toast('先在框里填上你听到的正确写法');
+    if (v === issue.text) return toast('和原文一样，无需替换；没问题就点「忽略」');
+    applyProofIssue(index, v);
+    return;
+  }
+  if (action === 'listen') {
+    listenProofIssue(issue);
+    return;
+  }
+  if (action === 'recommend') {
+    recommendProofIssue(issue);
+    return;
+  }
+  // 点击上下文：定位到原文
+  proofFollow = false;
+  scrollEditorTo(issue.start);
+  if (!isProofing()) {
+    $('tr-text').focus({ preventScroll: true });
+    $('tr-text').setSelectionRange(issue.start, issue.end);
+  }
+}
+
+async function improvePrompt() {
+  if (running || summarizing) return;
+  const original = $('tr-prompt').value.trim();
+  if (original.length < 20) return toast('提示词太短，请先写清楚用途和要求');
+  await loadKeyState(); const vendor = curVendor();
+  if (!(await ensureKey(vendor))) return;
+  fbBegin('AI 正在改进提示词…', Math.max(300, Math.round(original.length * 1.3)));
+  try {
+    const improved = (await runAuxAi(original, '请改进下面这段 AI 提示词，让任务目标、输出结构、事实边界和格式要求更清楚、可执行。保留原意，只输出改进后的完整提示词，不要解释。', vendor, (n) => fbChars(n))).trim();
+    fbEnd('done', '提示词已改进');
+    if (!improved) return toast('AI 没有返回改进后的提示词');
+    if (window.confirm('AI 已生成改进版。确定替换当前提示词吗？原版不会被覆盖，可先取消并另存。')) {
+      $('tr-prompt').value = improved;
+      $('tr-preset').value = 'custom'; lsSet(LS_PRESET, 'custom'); lsSet(LS_PROMPT, improved);
+      toast('提示词已更新；需要长期保留请点“保存为提示词”');
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    fbEnd('error', msg === '已取消' ? '已停止' : msg);
+    if (msg !== '已取消') toast('提示词改进失败：' + msg, 7000);
   }
 }
 
@@ -1054,8 +1979,9 @@ export function initTranscribe() {
   if (!$('panel-transcribe')) return;
 
   $('tr-lang').value = lsGet(LS_LANG, 'auto') || 'auto';
+  renderPromptOptions();
   const preset = lsGet(LS_PRESET, 'sermon');
-  applyPreset(PRESETS[preset] || preset === 'custom' ? preset : 'sermon');
+  applyPreset(PRESETS[preset] || preset === 'custom' || [...$('tr-preset').options].some(o => o.value === preset) ? preset : 'sermon');
 
   records = loadRecords();
   curId = records[0]?.id || null;
@@ -1077,6 +2003,15 @@ export function initTranscribe() {
     const name = `${safeName(r?.title || '转写')}_转写.txt`;
     exportTo($('tr-text').value, name, 'txt');
   });
+  $('tr-export-md').addEventListener('click', () => {
+    const r = cur();
+    const body = $('tr-text').value.trim();
+    if (!body) return toast('没有转写正文可导出');
+    const title = r?.title || '转写';
+    const audio = String(r?.path || '').split(/[\\/]/).pop() || '未记录';
+    const md = `# ${title}\n\n- 音频：${audio}\n- 转写时间：${new Date().toLocaleString('zh-CN')}\n\n## 转写正文\n\n${body}`;
+    exportTo(md, `${safeName(title)}_转写.md`, 'md');
+  });
   $('tr-del').addEventListener('click', () => deleteCurrent());
   $('tr-new').addEventListener('click', () => {
     if (running || summarizing) return toast('正在处理中，请先等待或取消');
@@ -1094,7 +2029,52 @@ export function initTranscribe() {
     if (item?.dataset.id) selectRecord(item.dataset.id);
   });
 
-  $('tr-text').addEventListener('input', schedulePersist);
+  $('tr-text').addEventListener('input', reconcileProofreadAfterEdit);
+  $('tr-text').addEventListener('scroll', () => { $('tr-text-highlight').scrollTop = $('tr-text').scrollTop; });
+  // 用户自己滚动 / 点击文本时，不再强行跟随检查进度
+  for (const ev of ['wheel', 'mousedown', 'touchstart', 'keydown']) {
+    $('tr-text').addEventListener(ev, () => { if (isProofing()) proofFollow = false; }, { passive: true });
+  }
+  $('tr-proofread').addEventListener('click', proofreadTranscript);
+  $('tr-proofread-issues').addEventListener('click', handleProofreadChoice);
+  // “听后自己填”：记住写了一半的内容（校对进行中面板会重绘），回车直接替换
+  $('tr-proofread-issues').addEventListener('input', (e) => {
+    const el = e.target.closest?.('.tr-manual');
+    if (el) { proofDrafts.set(Number(el.dataset.id), el.value); schedulePersist(); }
+  });
+  // 关闭程序前把还没落盘的改动（含校对状态）立刻存下
+  const flush = () => {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = 0;
+    const r = cur();
+    if (r) readEditorInto(r);
+    persist();
+  };
+  window.addEventListener('beforeunload', flush);
+  window.addEventListener('pagehide', flush);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
+  $('tr-proofread-issues').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.classList?.contains('tr-manual')) return;
+    e.preventDefault();
+    e.target.closest('.tr-proofread-issue')?.querySelector('[data-action="manual"]')?.click();
+  });
+  initProofPlayer();
+  $('tr-text-export').addEventListener('click', () => $('tr-export').click());
+  $('tr-preset').addEventListener('change', () => applyPreset($('tr-preset').value));
+  $('tr-prompt-save').addEventListener('click', () => {
+    const text = $('tr-prompt').value.trim(); if (!text) return toast('先填写提示词');
+    const name = window.prompt('给这套提示词起个名字'); if (!name?.trim()) return;
+    const list = promptLibrary(); const id = genId();
+    list.push({ id, name: name.trim().slice(0,40), text });
+    lsSet(LS_PROMPT_LIBRARY, list); renderPromptOptions(); applyPreset(`saved:${id}`); toast('提示词已保存');
+  });
+  $('tr-prompt-delete').addEventListener('click', () => {
+    const val = $('tr-preset').value; if (!val.startsWith('saved:')) return;
+    lsSet(LS_PROMPT_LIBRARY, promptLibrary().filter(p => `saved:${p.id}` !== val));
+    lsSet(LS_PRESET, 'sermon'); renderPromptOptions(); applyPreset('sermon'); toast('已删除这套提示词');
+  });
+  $('tr-prompt-improve').addEventListener('click', improvePrompt);
   $('tr-summary').addEventListener('input', () => {
     renderSummary();
     schedulePersist();
@@ -1130,13 +2110,13 @@ export function initTranscribe() {
   });
   // 每一列自己的「复制」
   $('tr-viewer-cols').addEventListener('click', (e) => {
-    if (!e.target.closest('[data-copy]')) return;
     const key = e.target.closest('.tr-vcol')?.dataset.key;
-    const col = viewerColumns().find((c) => c.key === key);
-    if (!col) return;
-    if (col.md) copyText(colSource(col), '已复制总结');
-    else copyText(stripStamps(colSource(col)), '已复制转写文字（不含时间点）');
+    if (e.target.closest('[data-copy]')) copyViewerCol(viewerCol(key));
+    else if (e.target.closest('[data-export]')) exportViewerCol(viewerCol(key));
   });
+  const soleKey = () => $('tr-viewer-cols').querySelector('.tr-vcol')?.dataset.key;
+  $('tr-viewer-copy').addEventListener('click', () => copyViewerCol(viewerCol(soleKey())));
+  $('tr-viewer-export').addEventListener('click', () => exportViewerCol(viewerCol(soleKey())));
 
   // 总结标签：切换 / 删除 / 加一份对比
   $('tr-sum-tabs').addEventListener('click', (e) => {
@@ -1178,7 +2158,8 @@ export function initTranscribe() {
   });
 
   $('tr-sum').addEventListener('click', () => summarize());
-  $('tr-sum-stop').addEventListener('click', () => invoke('ai_cancel').catch(() => {}));
+  $('tr-sum-stop').addEventListener('click', stopAi);
+  $('tr-progress-stop').addEventListener('click', stopAi);
   $('tr-sum-copy').addEventListener('click', () => copyText($('tr-summary').value, '已复制总结'));
   $('tr-sum-export').addEventListener('click', () => {
     const r = cur();
@@ -1193,12 +2174,12 @@ export function initTranscribe() {
   $('tr-key').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') saveKey();
   });
-  $('tr-preset').addEventListener('change', () => applyPreset($('tr-preset').value));
   $('tr-prompt').addEventListener('input', () => {
     // 改了提示词就视为自定义，下次打开仍是这份
     lsSet(LS_PROMPT, $('tr-prompt').value);
     lsSet(LS_PRESET, 'custom');
     $('tr-preset').value = 'custom';
+    $('tr-prompt-delete').disabled = true;
   });
 
   listen('sp-transcribe', (e) => onTranscribeEvent(e?.payload || e));

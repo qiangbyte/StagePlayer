@@ -1,6 +1,6 @@
 {
   "name": "stage-player",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "演出播放器：音频 / 视频 / PPT / PDF 一体化演出播放",
   "private": true,
   "scripts": {

@@ -341,7 +341,7 @@ fn chat_stream(
 ) -> Result<(String, bool), String> {
   // 讲道笔记模板较长，统一放宽输出上限（deepseek-chat 最大 8K）
   let max_tokens: u32 = 8192;
-  let body = json!({
+  let mut body = json!({
     "model": model,
     "messages": [
       { "role": "system", "content": SYSTEM_PROMPT },
@@ -351,10 +351,17 @@ fn chat_stream(
     "max_tokens": max_tokens,
     "temperature": 0.3,
   });
+  // Qwen3.8-flash 默认开启深度思考；思考阶段只回传 reasoning_content，
+  // 用户看不到逐字总结。总结场景关闭思考，保留标准增量 content 流。
+  if v == Vendor::Qwen {
+    body["enable_thinking"] = json!(false);
+    body["incremental_output"] = json!(true);
+  }
   let resp = client
     .post(v.url())
     .bearer_auth(key)
     .header("Content-Type", "application/json")
+    .header("Accept", "text/event-stream")
     .body(body.to_string())
     .send()
     .map_err(|e| format!("连接{}失败：{e}", v.label()))?;
