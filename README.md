@@ -1,105 +1,315 @@
 # StagePlayer 演出播放器
 
-一个软件搞定 **音频播放、视频播放、PPT 播放、PDF 播放** 的演出/晚会专用播放器。
+一个软件搞定演出 / 晚会现场的 **音频、视频、PPT、PDF、圣经经文、歌词投屏** 播放与输出。主控窗口在电脑上操作，输出窗口拖到投影仪或副屏全屏显示，观众只看到画面。
 
-技术栈：**Tauri 2 + Rust 后端**，前端为原生 HTML/CSS/JS（无需 Node 构建步骤，pdf.js 已本地内置，完全离线可用）。
+同时提供 **录音转文字**（本地离线识别）和 **AI 总结**（DeepSeek / 千问），方便把讲道、会议录音整理成笔记。
 
-## 功能
+- 技术栈：Tauri 2 + Rust 后端，前端为原生 HTML / CSS / JavaScript（无前端框架，无打包步骤）
+- 平台：Windows 10 / 11（主要测试平台）；macOS 为实验性支持，见文末
+- 当前版本：0.1.11
 
-| 模块 | 说明 |
+## 目录
+
+- [功能总览](#功能总览)
+- [功能详解](#功能详解)
+- [快速开始](#快速开始)
+- [快捷键](#快捷键)
+- [支持格式](#支持格式)
+- [数据与隐私](#数据与隐私)
+- [项目结构](#项目结构)
+- [打包发布](#打包发布)
+- [调试与测试](#调试与测试)
+- [常见问题](#常见问题)
+- [macOS（实验性）](#macos实验性)
+- [许可证](#许可证)
+
+## 功能总览
+
+主控窗口顶部是模块页签，左侧是当前模块的列表，中间是操作区，右侧是输出预览和演出备忘。
+
+| 页签 | 说明 |
 |------|------|
-| 📋 节目单 | 一场演出的时间轴：音频/视频/图片/PPT 页/PDF 页/圣经经文/空白歌词页混排，逐条走台（启动默认进入） |
-| 🎵 音频 | 播放列表、上一首/下一首、进度/音量、列表循环/单曲循环、可推送歌曲标题卡到输出窗口 |
-| 🎬 视频 | 本地静音预览 + 一键推送到输出窗口播放；以输出窗口为准回报进度，视频面板预览自动对时，切走面板时预览暂停解码，右侧预览只显示缩略图 + 进度 |
-| 📊 PPT | Rust 后端解析 `.pptx`（文本+图片+背景+布局），幻灯片缩略图网格，点击即输出，←/→ 翻页 |
-| 📄 PDF | pdf.js 渲染缩略图，点击页面输出高清图到输出窗口，←/→ 翻页 |
-| 🖥 输出窗口 | 独立无边框窗口，可拖到投影/副屏，F 全屏、B 黑屏、双击切换全屏 |
-| ⏱ 计时器 | 正计时（秒表）+ 倒计时，LED 风格大屏显示 |
-| 📖 圣经投屏 | 内置和合本，经文大字投屏，一页装不下自动分页 |
-| 🎤 伴奏 | 「仅伴奏」实时消人声；AI 人声分离（HTDemucs ONNX，需模型，见 `src-tauri/resources/models/README.txt`）；伴奏导出 WAV |
-| 📝 歌词 | 自动读取同目录同名 `.lrc` / `.txt` |
-| 🎶 歌词投屏 | 独立歌词库：粘贴歌词用 `[主歌1]` `[副歌]` `[桥段]` 标段落（不标则按空行分段、重复段落自动认作副歌）；大屏当前行居中滚动、上下渐隐，或整段显示；一键跳副歌；背景可选流动渐变（6 套配色 / 自选主色 / 随机）、图片（可从图片取色）、循环视频；可加入节目单 |
-| 🔊 声压 | 实时 A/C/Z 计权声压级、Fast/Slow、RTA 频谱、曲线快照 |
-| 💾 数据 | 节目单与设置自动保存到 `%APPDATA%\com.stageplayer.app\store.json`，每 10 分钟轮转备份到 `backups/`（保留 20 份）；节目单面板「导出 / 导入」可把单场演出存为 `.json`，换电脑时会提示本机缺失的媒体 |
+| 节目单 | 一场演出的时间轴，音频 / 视频 / 图片 / PPT 页 / PDF 页 / 圣经经文 / 空白歌词页混排，逐条走台。启动默认进入这里 |
+| 歌词 | 读取同目录同名的 `.lrc` / `.txt`，并可手动编辑歌词 |
+| 音频 | 曲库与播放列表、单曲设置、人声消除导出、曲库打包导出 / 导入 |
+| 视频 | 本地静音预览，一键推送到输出窗口播放 |
+| PPT | 解析 `.pptx`，幻灯片缩略图网格，点击即输出，左右键翻页 |
+| PDF | 渲染缩略图，点击页面输出高清图，左右键翻页 |
+| 声压 | 实时 A / C / Z 计权声压级、Fast / Slow、频谱与曲线快照 |
+| 讲话记录 | 记录日期、主题、姓名，支持实时听写，结束后定稿 |
+| 转写 | 录音文件本地转文字，AI 总结（可多份对比、精修、撤销） |
 
-## 运行
+## 功能详解
+
+### 节目单
+
+- 按演出顺序排列条目，按 `Enter` 逐条走台，`G` 播放当前条目。
+- **定时开播**：设定开播时刻，列表显示倒计时，到点自动播放第一条。
+- **大厅页**：开场前在输出屏显示倒计时画面，到点自动开演。
+- **空白页**：临时插入一页文字（标题、副标题、底部说明、背景色或背景图）。
+- **圣经经文**：内置和合本，可按书卷、章、节快速定位，或按关键字搜索；经文一页放不下会自动分页。
+- 节目单可 **导出 / 导入** 为 `.json`，换电脑时会提示本机缺失的媒体文件。
+- 支持撤销：删除或清空后底部会弹出撤销条，`Ctrl+Z` 最多撤回 20 步。
+
+### 音频
+
+- 播放列表、上一首 / 下一首、进度与音量、列表循环 / 单曲循环。
+- 每首歌可单独设置起播点、渐起、渐弱、本曲音量。
+- 可把歌曲标题卡推送到输出窗口。
+- **消除人声导出**：利用立体声中置人声的特点消除人声，保留低频贝斯，导出 WAV 伴奏。
+- **AI 人声分离**（可选）：使用 HTDemucs 模型分离出伴奏，结果缓存到本地，需要先放置模型，见 [可选模型](#可选模型)。
+- **曲库打包**：把媒体文件、单曲设置、目录和备注打成一个 `.spaudio` 包，换电脑后可整体导入，设置一并恢复。
+- Windows 上会显示系统音量条，可以直接拖动调整系统音量。
+
+### 视频
+
+- 本地静音预览，右侧只显示缩略图和进度，不占用解码资源。
+- 推送到输出窗口后以输出窗口的进度为准，预览自动对时。
+- 视频缩略图使用 Windows 系统缩略图，格式不支持时显示占位图。
+
+### PPT 与 PDF
+
+- **PPT**：由 Rust 后端解析 `.pptx`（文本、图片、背景、布局），生成幻灯片缩略图；点击即输出。
+- **PDF**：使用内置的 pdf.js 渲染，离线可用。
+- 翻页用左右方向键，需要先点击过某一页。
+
+### 输出窗口
+
+- 独立的无边框窗口，可拖到投影仪或副屏。
+- 「全屏输出」会默认投到扩展屏并全屏；可在设置里改选显示器和画面适配方式（留黑边 / 拉伸 / 填充裁切）。
+- **黑屏**：临时让输出画面变黑。
+- **冻结**：输出画面保持不动，主控可以继续切换内容而不影响观众看到的画面。
+- 可设为置顶，防止被其他窗口遮挡。
+
+### 歌词与歌词投屏
+
+- 歌词页读取同名 `.lrc` / `.txt`。
+- **歌词投屏**：独立歌词库，粘贴歌词即可使用。
+  - 用 `[主歌1]` `[副歌]` `[桥段]` 等标记段落；不标记时按空行分段，重复出现的段落自动认作副歌。
+  - 大屏显示为当前行居中滚动、上下行渐隐，也可以整段显示。
+  - 一键跳到副歌，按数字键直接跳到第几段。
+  - 背景可选：流动渐变（6 套配色、自选主色或随机）、图片（可从图片取色）、循环视频。
+  - 可加入节目单。
+- **语音跟词**：麦克风实时识别正在演唱的歌词，经过拼音模糊匹配后自动翻页，唱到一半就预告下一行。首次使用需要麦克风授权，并会下载识别模型。
+- **.pect 诗歌演示文件**：可直接导入，歌词与背景素材会一并导入到歌词库和节目单。
+
+### 声压计
+
+- 实时显示 A / C / Z 计权声压级，支持 Fast / Slow 时间常数。
+- RTA 频谱，以及曲线快照，方便现场检查音响。
+- 支持设置校准偏移（`calOffset`），用于对齐测量值。
+
+### 演出备忘
+
+- 主控界面右侧的备忘区，适合记录临场要点（例如「第三首换麦」）。
+- 每条可设颜色，一键清除；数据随节目单一起保存。
+
+### 讲话记录
+
+- 每条记录包含日期、主题、姓名。
+- 录音时实时显示听写文字，结束后可以 **定稿**：做热词替换、补标点，并用 SenseVoice 再识别一遍提高准确率。
+- 内容自动保存。
+
+### 转写与 AI 总结
+
+- **录音转文字（完全本地）**：支持 m4a、mp3、wav、flac、ogg 等常见格式，使用 SenseVoice 离线识别，音频不会离开电脑。长录音按静音切段，结果按时间点分段显示。
+- **AI 总结（只发送文字）**：转写文字可以发送给 DeepSeek 或千问生成总结，音频永远不发送。
+  - 总结风格可选：讲道 / 讲座、会议纪要、200 字摘要，或自定义提示词。
+  - 最多可以保留 3 份总结（A / B / C），例如同一段文字分别用 DeepSeek 和千问生成，放在一起对比。
+  - **放大对比**：同时显示原文和多份总结，每列单独滚动，可隐藏某一列。
+  - **精修**：写下哪里有问题（比如「第三节太啰嗦」「这句不是原话，请对照文稿改正」），AI 只改你提到的部分；提供快捷按钮。每次精修都保留上一版，可以撤销；失败或停止时保持原内容。
+  - 总结内容渲染为 Markdown（标题、列表、表格、引用、代码块等）。
+- API Key 在转写页的「AI 设置」里填写并保存，只保存在本机。
+
+### 界面主题
+
+- 设置里可选：跟随系统、深色（默认）、浅色、护眼（米黄底）、深蓝。
+- 强调色可选蓝、青绿、紫、橙、玫红。
+- 只改变主控界面。输出窗口和投屏画面保持原样，不受影响。
+
+## 快速开始
+
+### 直接使用安装包（Windows）
+
+1. 到 Release 页面下载最新的 `演出播放器_x.y.z_x64-setup.exe`。
+2. 双击安装。Windows 可能弹出 SmartScreen 提示（安装包没有代码签名），点「更多信息」→「仍要运行」。
+3. 首次启动如果提示缺少 WebView2，安装包会自动下载安装。
+
+### 从源码运行（开发者）
+
+环境要求：
+
+- Windows 10 / 11，已安装 **WebView2**（Win11 自带）
+- **Node.js 20+**
+- **Rust**（stable，MSVC 工具链，可通过 [rustup](https://rustup.rs) 安装）
+- **Visual Studio Build Tools**（勾选「使用 C++ 的桌面开发」）
+
+步骤：
 
 ```powershell
-npm install       # 安装 Tauri CLI 与 pdfjs-dist
-npm run dev       # 开发运行
-npm run build     # 打包 NSIS 安装包
+npm install        # 安装 Tauri CLI 与 pdfjs-dist
+npm run dev        # 编译语音识别辅助进程 sidecar，并启动开发版
 ```
 
-## 快捷键（主控窗口）
+**sherpa-onnx 预编译库**：语音相关功能依赖 sherpa-onnx。`src-tauri/.cargo/config.toml` 指定了本地压缩包目录，请把 `sherpa-onnx-v2.0.1-win-x64-static-MT-Release-lib.tar.bz2` 放到 `src-tauri/native/sherpa/` 下（国内直连 GitHub 常失败，所以用本地包）。缺少这个文件时构建会失败。
 
-- 音频页 `←` / `→`：直接切换上一首 / 下一首；`A` / `D`：预选上一首 / 下一首，`Enter` 确认播放（鼠标单击歌曲仍可直接播放）
-- `←` / `→`：PPT / PDF 上下页（需先点击过某一页）
-- `空格`：音频播放/暂停
-- `F`：打开并全屏输出窗口
-- `B`：黑屏 / 恢复
-- 歌词投屏：`↑` `↓` / `空格` 换行，`C` 副歌（连按轮换）、`V` 主歌、`Q` 桥段、`P` 预副歌、`E` 尾声，`1`–`9` 第几段，`Home` 回开头，`Enter` 投屏；节目单里当前条是歌词时 `↑` `↓` 与字母键同样可用（`←` `→` / `Enter` 仍是走台）
+开发版也可以直接双击 `run-dev.bat`（运行已编译的调试版）。
+
+### 可选模型
+
+| 功能 | 模型 | 放置方式 |
+|------|------|----------|
+| AI 人声分离 | HTDemucs（`htdemucs.ort`，约 200MB） | 放到 `src-tauri/resources/models/`，说明见同目录的 `README.txt` |
+| 录音转文字 / 讲话记录定稿 | SenseVoice int8（约 230MB） | 首次使用自动下载到应用缓存目录的 `asr-models` 文件夹 |
+| 语音跟词 | 流式中文 ASR 模型 | 首次使用自动下载，或按 `src-tauri/resources/models/asr/README.txt` 手动放置 |
+
+不使用某个功能就不需要对应模型，其余功能照常可用。
+
+## 快捷键
+
+主控窗口：
+
+- **音频页**：`←` / `→` 切换上一首 / 下一首；`A` / `D` 预选上一首 / 下一首，`Enter` 确认播放（鼠标单击歌曲仍可直接播放）；`空格` 播放 / 暂停
+- **PPT / PDF**：`←` / `→` 上一页 / 下一页（需先点击过某一页）
+- **输出**：`F` 打开并全屏输出窗口；`B` 黑屏 / 恢复；`Esc` 关闭输出
+- **节目单**：`Enter` 下一条；`G` 播放当前
+- **歌词投屏**：`↑` `↓` / `空格` 换行；`C` 副歌（连按轮换）、`V` 主歌、`Q` 桥段、`P` 预副歌、`E` 尾声；`1`–`9` 跳到第几段；`Home` 回开头；`Enter` 投屏。节目单里当前条是歌词时，`↑` `↓` 与字母键同样可用
+- **撤销**：`Ctrl+Z`
+- 打开「放大查看」时，`Esc` 只关闭放大层，不会关闭输出
 
 ## 支持格式
 
-- 音频：mp3 / wav / ogg / flac / m4a / aac / wma / opus
-- 视频：mp4 / webm / mov（mkv、avi 依赖系统解码器，Windows 上部分格式可能不支持）
-- 演示：pptx（*.ppt 老格式请先另存为 pptx*）
-- 文档：pdf
+- **音频**：mp3、wav、ogg、flac、m4a、aac、wma、opus（转写支持 m4a、mp3、wav、flac、ogg 等）
+- **视频**：mp4、webm、mov；mkv、avi 依赖系统解码器，部分格式在 Windows 上可能无法播放
+- **演示文稿**：pptx（老的 `.ppt` 请先在 PowerPoint 里另存为 `.pptx`）
+- **文档**：pdf
+- **诗歌演示**：`.pect`
+- **曲库包**：`.spaudio`
+- **节目单**：`.json`
 
-## 数据存储
+## 数据与隐私
 
-- 运行时仍读写 localStorage（快），每次修改后约 0.8 秒合并写入 `store.json`（先写临时文件再替换，断电不留半截文件）
-- 启动时 `js/boot.js` 先恢复数据再加载主程序：
-  - 上次有未落盘的改动（异常退出）→ 以本地为准
-  - 旧版本留下的本地数据 → 自动迁移进 `store.json`，原文件先备份，**不删除任何旧数据**
-  - `store.json` 比本地新（例如 WebView 数据被清掉）→ 用存档恢复，被覆盖的本地数据先另存一份备份
-- 只允许运行一个实例：再次双击会把已打开的主窗口唤到前台
+| 内容 | 位置 |
+|------|------|
+| 节目单、设置等主数据 | `%APPDATA%\com.stageplayer.app\store.json` |
+| 主数据备份 | `%APPDATA%\com.stageplayer.app\backups\`（每 10 分钟轮转，保留 20 份） |
+| AI 设置与 API Key | `%APPDATA%\com.stageplayer.app\ai.json`（Key 只在本机读写，不回传前端，不进导出文件） |
+| 语音识别模型 | 应用缓存目录下的 `asr-models\` |
+| 伴奏缓存、人声分离结果 | 应用数据目录下 |
 
-## 架构
+说明：
+
+- 运行时数据先写入浏览器本地存储（速度快），修改后约 0.8 秒合并写入 `store.json`（先写临时文件再替换，断电也不会留下半截文件）。
+- 启动时会自动判断以哪一份数据为准：上次异常退出时以本地为准；`store.json` 比本地新（例如本地数据被清掉）时用存档恢复，被覆盖的本地数据先另存备份。
+- 旧版本的数据会自动迁移进 `store.json`，原文件先备份，**不会删除任何旧数据**。
+- 只允许同时运行一个实例，重复启动会唤起已打开的主窗口。
+- **隐私**：录音转文字完全在本机完成；只有你主动点击「AI 总结」或「精修」时，转写文字才会发送给你所选的 DeepSeek 或千问。
+
+## 项目结构
 
 ```
-src/                  前端（主控窗口 + 输出窗口）
-  index.html          主控界面（顶栏计时器/输出控制、侧栏列表、四模块面板、输出预览）
-  output.html         独立输出窗口（全屏播放画面）
-  js/output-core.js   输出渲染核心（主控预览与输出窗口共用）
-  js/slide-render.js  PPT 幻灯片 HTML 渲染器
-  js/{audio,video,ppt,pdf}.js   四大功能模块
-  js/audio-meters.js  频谱 + VU 表；audio-wave.js 波形解码；audio-stem-ui.js AI 分离进度
-  js/program.js       节目单主流程（走台/定时开播/大厅倒计时）
-  js/program-store.js 节目数据规范化与存储；program-thumbs.js 网格缩略图
-  js/program-blank.js 空白歌曲页面板；program-bible.js 圣经经文面板
-  js/program-lobby.js 大厅页（开场倒计时）；program-cue.js 定时开播
-  js/program-io.js    单场演出导出 / 导入
-  js/lyrics-show.js   歌词投屏（歌词库、逐行控制、段落跳转）；lyrics-show-render.js 段落解析 + 扩展屏渲染
-  js/boot.js          入口：先恢复存档再加载 main.js；store-sync.js 负责 localStorage ⇄ store.json
-src-tauri/
-  src/pptx.rs         PPTX 解析（zip + roxmltree，提取文本/图片/背景/坐标，图片转 dataURL；后台线程执行）
-  src/audio.rs        原生音频播放（rodio，可选声卡、消人声；音频线程异常自动重启）
-  src/stem.rs         AI 人声分离与伴奏缓存
-  src/spl.rs          声压计
-  src/fileio.rs       保存对话框 / 伴奏导出 / 图片与视频缩略图（视频用 Windows 系统缩略图；只允许写入用户在保存对话框中确认的路径）
-  src/wave.rs         波形与频谱数据的原生解码
-  src/store.rs        store.json 读写、原子替换与轮转备份
-  src/output.rs       输出窗口创建/全屏/关闭
-  通信方式            Tauri 事件 output:set（内容推送）、output:video（视频控制）、output:video-time（输出窗口回报视频进度）
+src/                      前端（主控窗口 + 输出窗口）
+  index.html              主控界面
+  output.html             独立输出窗口
+  css/app.css             界面样式；css/themes.css 为主题变量（由 scripts/themeify.mjs 生成）
+  js/boot.js              入口：先恢复存档，再加载主程序
+  js/main.js              页签、快捷键与各模块的初始化
+  js/store-sync.js        localStorage ⇄ store.json 同步
+  js/output-core.js       输出渲染核心（主控预览与输出窗口共用）
+  js/audio*.js            音频模块与频谱、波形、人声分离界面
+  js/video.js / ppt.js / pdf.js
+  js/program*.js          节目单（走台、定时开播、大厅、空白页、圣经、导入导出）
+  js/lyrics*.js           歌词与歌词投屏
+  js/talk-notes.js        讲话记录
+  js/transcribe.js        转写与 AI 总结（多份总结、精修、放大对比）
+  js/markdown.js          总结的安全 Markdown 渲染
+  js/stage-notes.js       演出备忘
+  js/theme.js             界面主题
+  js/undo.js              撤销
+  data/bible-cuv.json     圣经经文数据
+
+src-tauri/                Rust 后端
+  src/store.rs            store.json 读写、原子替换与轮转备份
+  src/output.rs           输出窗口的创建、全屏与关闭
+  src/audio.rs            原生音频播放（rodio），音频线程异常自动重启
+  src/audio_pack.rs       曲库打包导出 / 导入（.spaudio）
+  src/karaoke.rs          消除人声导出
+  src/stem.rs             AI 人声分离与伴奏缓存
+  src/wave.rs             波形与频谱的原生解码
+  src/spl.rs              声压计
+  src/pptx.rs             PPTX 解析
+  src/pect.rs             .pect 诗歌文件导入
+  src/fileio.rs           保存对话框、伴奏导出、图片与视频缩略图
+  src/sysvol.rs           Windows 系统音量
+  src/transcribe.rs       录音转文字（本地 SenseVoice）
+  src/dictation_polish.rs 讲话记录定稿
+  src/llm.rs              AI 总结与精修（DeepSeek / 千问）
+  src/lyric_follow*.rs    语音跟词
+  lyric-asr-sidecar/      语音识别辅助进程（独立进程，避免运行库冲突）
+  resources/models/       模型清单与放置说明
+
+scripts/                  构建辅助、界面主题生成、调试脚本
 ```
 
-## 调试
+通信方式：前后端通过 Tauri 命令（`invoke`）和事件通信，例如 `output:set`（推送内容到输出窗口）、`output:video`（视频控制）、`output:video-time`（输出窗口回报视频进度）、`sp-summary` / `sp-transcribe`（总结与转写进度）。
 
-- 冒烟测试：设置 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后 `npm run dev`，再运行 `node scripts/cdp-smoke.mjs`
-- 内存/状态探针：`scripts/diag/`
-- 正式版测速：以同样的环境变量直接运行 `src-tauri/target/release/stage-player.exe`，再 `node scripts/diag/bench-release.mjs <音频> <视频> [pptx]`
-- 注意：开发版（`127.0.0.1:1430`）与正式版（`tauri.localhost`）的 localStorage 互不共享，但两者读写同一个 `store.json`，启动时较新的一方会恢复到另一方（被覆盖的数据在 `backups/` 里）
-- `node scripts/diag/eval.mjs [--output] "<表达式>"` 或 `--file <脚本>`：在主控 / 输出窗口里执行一段 JS
+## 打包发布
 
-## macOS（Apple 芯片 M1/M2/M3…）安装包
+Windows 安装包：
 
-Windows 电脑编不出 Mac 的包，有两种办法（都需要真正的 macOS 环境）：
+```powershell
+npm run build      # 编译 release 版 sidecar，并打包 NSIS 安装包
+```
 
-1. **GitHub 自动打包（不需要自己有 Mac）**：把项目推到 GitHub，仓库页 `Actions → build-mac → Run workflow`，约 20–40 分钟后在页面底部 Artifacts 下载 `StagePlayer-macOS-arm64`（里面是 `.dmg`）。配置在 `.github/workflows/build-mac.yml`。
-2. **在自己的 Mac 上打包**：装好 Xcode 命令行工具、Node 20+、Rust 后执行 `bash scripts/build-mac.sh`，安装包在 `src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/`。
+完成后安装包在 `src-tauri\target\release\bundle\nsis\`。也可以双击 `build-installer.bat`，它会打包完成后自动打开输出目录。
 
-注意：
-- 安装包没有 Apple 开发者签名。第一次打开如果提示“已损坏 / 无法验证开发者”，在终端执行 `xattr -cr /Applications/演出播放器.app`，或右键 → 打开。
-- 语音跟词首次使用会弹出麦克风授权，请点允许。
-- Mac 上没有 Windows 的两个系统接口：视频缩略图在 Mac 上不生成（显示占位图），系统音量联动不可用；其余功能（音频 / 视频 / PPT / PDF / 转写 / 总结 / 主题）同 Windows。
+发布新版本时，请同步修改以下三处的版本号：
+
+- `package.json`
+- `src-tauri/tauri.conf.json`
+- `src-tauri/Cargo.toml`
+
+## 调试与测试
+
+- **冒烟测试**：设置 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后执行 `npm run dev`，再运行 `node scripts/cdp-smoke.mjs`。
+- **正式版测速**：用同样的环境变量启动 `src-tauri/target/release/stage-player.exe`，再运行 `node scripts/diag/bench-release.mjs <音频> <视频> [pptx]`。
+- **在主控或输出窗口执行 JS**：`node scripts/diag/eval.mjs [--output] "<表达式>"`，或 `--file <脚本>`。
+- **Rust 单元测试**：`cargo test --manifest-path src-tauri/Cargo.toml`（部分需要模型或音频文件的测试默认跳过）。
+- 注意：开发版（`127.0.0.1:1430`）与安装版（`tauri.localhost`）的浏览器本地存储互不共享，但两者读写同一个 `store.json`，启动时较新的一方会恢复到另一方，被覆盖的数据在 `backups/` 里。
+
+## 常见问题
+
+**Q：点「AI 总结」提示缺少 API Key？**
+在「转写」页的「AI 设置与提示词」里选择服务商，填写 Key 后点保存。Key 只保存在本机。
+
+**Q：第一次转写很慢或失败？**
+首次使用会下载约 230MB 的 SenseVoice 模型，需要网络。下载失败可以稍后重试，或按上文手动放置模型。转写本身在本机进行，时间取决于音频长度和电脑性能。
+
+**Q：视频放不出来或没有画面？**
+检查格式是否为 mp4 / webm / mov。mkv、avi 等格式依赖系统解码器，可能不支持。
+
+**Q：输出窗口没有出现在扩展屏上？**
+在设置里选择「输出显示器」，然后点「投屏到所选显示器并全屏」。
+
+**Q：语音跟词没有反应？**
+检查系统是否允许应用使用麦克风，并确认识别模型已下载完成。
+
+**Q：安装时 Windows 提示未知发布者？**
+安装包没有代码签名，属于正常现象，点「更多信息」→「仍要运行」即可。
+
+**Q：换电脑后怎么迁移？**
+- 节目单：在节目单面板点「导出」，到新电脑上「导入」，缺失的媒体会有提示。
+- 音频曲库：在音频页点「打包导出」生成 `.spaudio`，到新电脑「打包导入」，设置一并恢复。
+- 或直接复制 `%APPDATA%\com.stageplayer.app\` 整个文件夹（注意其中包含 API Key）。
+
+## macOS（实验性）
+
+仓库里已经包含 macOS 的打包配置（`scripts/build-mac.sh`、`.github/workflows/build-mac.yml`、`src-tauri/tauri.macos.conf.json`），用于生成 Apple 芯片（arm64）的 `.dmg`。目前 **尚未在 macOS 上完整验证**，以下情况需要注意：
+
+- 安装包没有 Apple 开发者签名。若提示“已损坏”，在终端执行 `xattr -cr /Applications/演出播放器.app`，或右键 → 打开。
+- 视频缩略图在 Mac 上不生成，显示占位图；系统音量联动不可用。
+- 语音跟词需要麦克风授权（已在 `Info.plist` 中声明用途）。
+
+## 许可证
+
+尚未确定。在添加正式许可证之前，本项目的代码默认保留所有权利。第三方组件（如 Tauri、pdf.js、sherpa-onnx）各自遵循其原有许可证。
