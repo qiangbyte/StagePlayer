@@ -1,8 +1,10 @@
 // 录音转文字：本地 SenseVoice 离线转写（Rust 后端）+ DeepSeek / 千问总结（流式，可切换）
 // 记录存 localStorage（sp.transcribe.records）；DeepSeek Key 只在 Rust 侧保存，前端拿不到明文。
 
-import { esc, lsGet, lsSet, toast, invoke, listen, pickFiles, convertFileSrc } from './util.js';
+import { esc, lsGet, lsSet, toast, invoke, listen, pickFiles, convertFileSrc, fileExt } from './util.js';
 import { renderMarkdown } from './markdown.js';
+import { extractPdfText, cancelPdfExtract } from './pdf-text.js';
+import { BUILTIN_PRESETS as PRESETS, BUILTIN_LABELS } from './prompt-templates.js';
 
 const KEY = 'sp.transcribe.records';
 const LS_LANG = 'sp.transcribe.lang';
@@ -10,52 +12,12 @@ const LS_PRESET = 'sp.transcribe.preset';
 const LS_PROMPT = 'sp.transcribe.prompt';
 const LS_PROMPT_LIBRARY = 'sp.transcribe.promptLibrary';
 const AUDIO_PICK_EXT = ['m4a', 'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4b', 'mp4', 'mka', 'webm'];
+const PDF_PICK_EXT = ['pdf'];
 const $ = (id) => document.getElementById(id);
 
-const PRESETS = {
-  sermon: [
-    '请把文稿整理成「讲道/讲座笔记」，严格按下面的结构和格式输出（Markdown）：',
-    '',
-    '# 〈用一个短语概括本次主题〉',
-    '',
-    '> 〈一句话概括本次内容的核心〉',
-    '',
-    '## 一、📌 基本信息',
-    '- **主题**：……',
-    '- **时间**：使用下方「本次记录时间」；若文稿中明确提到日期则以文稿为准',
-    '- **参与者推测**：讲道者 / 主持人 / 听众等（只依据文稿推测）',
-    '',
-    '## 二、🎙️ 讲道背景与目的',
-    '说明本次内容面向谁、针对什么问题、要达到什么目的（一段话）。',
-    '',
-    '## 三、📝 内容解读',
-    '按讲述的逻辑划分为若干主题，每个主题用 `### 1. 标题` 开头，下设 `#### 1.1 小标题`。',
-    '每个小节用要点列表写清论证过程，关键结论用 **加粗**；做对比时用 Markdown 表格；',
-    '重要的金句或结论用引用块 `>` 单独列出。',
-    '',
-    '## 四、✅ 待办事项',
-    '列出文稿中明确提到的行动或作业；没有则写“暂无明确待办事项”。',
-    '',
-    '## 五、💡 洞察',
-    '1. **💎 核心发现**：2–3 条，提炼最有说服力的论点或最值得记住的判断。',
-    '2. **🛠 实用价值**：2–3 条，说明如何在实际中应用、如何回应常见质疑。',
-    '3. **💭 延伸思考**：1–2 条，指出论证中可能的跳跃、未展开之处或值得留意的风险。',
-    '',
-    '要求：',
-    '- 只依据文稿，不添加文稿之外的事实、经文或数据；文稿没有提到的内容不要写。',
-    '- 人名、经文出处、术语若明显是语音识别错误，按上下文更正；无法确定时保持原样。',
-    '- 保持原意，表达精炼；“基本信息”“待办事项”等固定栏目即使内容较少也要保留。',
-  ].join('\n'),
-  meeting: [
-    '请把下面的录音整理成会议纪要，使用 Markdown：',
-    '1. **会议主题与参与者**（能识别则写）',
-    '2. **讨论要点**（按议题分条）',
-    '3. **决议事项**',
-    '4. **待办事项**（负责人 / 事项 / 时间，未提及的留空）',
-    '5. **待确认问题**',
-  ].join('\n'),
-  brief: '请用不超过 200 字概括这段内容的主旨和最重要的 3 个要点。',
-};
+function isPdfPath(path) {
+  return fileExt(path) === 'pdf';
+}
 
 let records = []; // 在 initTranscribe 里加载（loadRecords 依赖后面定义的常量）
 let curId = null;
@@ -91,6 +53,10 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
+function fmtPage(n) {
+  return `第${Math.max(1, Math.floor(n || 1))}页`;
+}
+
 function fmtTs(sec) {
   const s = Math.max(0, Math.floor(sec || 0));
   const h = Math.floor(s / 3600);
@@ -120,7 +86,7 @@ function dateStr(ts) {
 // 记录里的 sums：[{ id, vendor, model, label, text, history[], at }]，active 是当前在编辑的那份。
 // 旧版本的单份 summary / history 在读取时迁移成 sums[0]。
 
-const VENDOR_LABEL = { deepseek: 'DeepSeek', qwen: '千问' };
+const VENDOR_LABEL = { deepseek: 'DeepSeek', qwen: '千问', chatgpt: 'ChatGPT' };
 const SUMS_MAX = 3;
 const LETTERS = 'ABC';
 
@@ -326,6 +292,7 @@ function paintButtons() {
   const busy = running || summarizing;
   $('tr-start').disabled = busy;
   $('tr-pick').disabled = busy;
+  if ($('tr-pick-pdf')) $('tr-pick-pdf').disabled = busy;
   $('tr-cancel').classList.toggle('hidden', !running);
   $('tr-sum').disabled = busy;
   $('tr-sum-stop').classList.toggle('hidden', !summarizing);
@@ -731,26 +698,36 @@ function cleanPath(p) {
   return String(p || '').trim().replace(/^["']+|["']+$/g, '');
 }
 
-async function pickAudio() {
-  const files = await pickFiles(AUDIO_PICK_EXT, '选择要转写的录音');
-  if (files?.length > 1) {
+function assignPickedFiles(files, kindLabel) {
+  if (!files?.length) return;
+  if (files.length > 1) {
     if (running || summarizing) return toast('正在处理中，请完成或取消后再选择文件');
     const r = cur();
     if (r) { readEditorInto(r); persist(); }
     queuedPaths = [...files];
-    $('tr-path').value = `已选 ${files.length} 个音频文件，点击「开始转写」依次识别`;
-    toast(`已加入 ${files.length} 个音频，将按顺序逐个识别`);
-  } else if (files?.length) {
-    queuedPaths = [];
-    $('tr-path').value = files[0];
-    const r = cur();
-    if (r && !r.text.trim()) {
-      r.path = files[0];
-      if (!r.title || r.title === '新转写') r.title = baseName(files[0]);
-      persist();
-      paintList();
-    }
+    $('tr-path').value = `已选 ${files.length} 个${kindLabel}，点击「开始转写」依次处理`;
+    toast(`已加入 ${files.length} 个${kindLabel}，将按顺序逐个处理`);
+    return;
   }
+  queuedPaths = [];
+  $('tr-path').value = files[0];
+  const r = cur();
+  if (r && !r.text.trim()) {
+    r.path = files[0];
+    if (!r.title || r.title === '新转写') r.title = baseName(files[0]);
+    persist();
+    paintList();
+  }
+}
+
+async function pickAudio() {
+  const files = await pickFiles(AUDIO_PICK_EXT, '选择要转写的录音');
+  assignPickedFiles(files, '音频');
+}
+
+async function pickPdf() {
+  const files = await pickFiles(PDF_PICK_EXT, '选择要转成文字的 PDF');
+  assignPickedFiles(files, 'PDF');
 }
 
 async function startTranscribe() {
@@ -776,7 +753,7 @@ async function startTranscribe() {
     return;
   }
   const path = cleanPath($('tr-path').value);
-  if (!path) return toast('先选择录音文件，或粘贴文件路径');
+  if (!path) return toast('先选择录音或 PDF，或粘贴文件路径');
   $('tr-path').value = path;
 
   let r = cur();
@@ -794,6 +771,7 @@ async function startTranscribe() {
 }
 
 async function transcribeOne(path, r, batchProgress = '') {
+  if (isPdfPath(path)) return transcribePdfOne(path, r, batchProgress);
   r.path = path;
   r.language = $('tr-lang').value || 'auto';
   lsSet(LS_LANG, r.language);
@@ -843,6 +821,79 @@ async function transcribeOne(path, r, batchProgress = '') {
   }
 }
 
+async function transcribePdfOne(path, r, batchProgress = '') {
+  r.path = path;
+  r.language = $('tr-lang').value || 'auto';
+  lsSet(LS_LANG, r.language);
+  $('tr-text').value = '';
+  setSummary('');
+  r.text = '';
+  r.sums = [];
+  r.active = 0;
+  paintTabs();
+  persist();
+  paintList();
+
+  running = true;
+  paintButtons();
+  setProgress(0, batchProgress ? `批量 PDF ${batchProgress}：准备中…` : '正在打开 PDF…');
+  const t0 = Date.now();
+  try {
+    const res = await extractPdfText(path, {
+      onProgress: (p) => {
+        if (!running || !p) return;
+        if (p.phase === 'para' && p.text) {
+          const ta = $('tr-text');
+          ta.value += `[${fmtPage(p.start)}] ${p.text}\n\n`;
+          ta.scrollTop = ta.scrollHeight;
+          if (viewerOpen) refreshViewer('text');
+        }
+        if (p.phase === 'para' || p.phase === 'progress' || p.phase === 'prepare' || p.phase === 'done') {
+          setProgress(
+            p.percent || 0,
+            p.message || (batchProgress ? `批量 PDF ${batchProgress}` : 'PDF 转文字中…'),
+            p.phase === 'done' ? 'done' : undefined,
+          );
+        }
+      },
+    });
+    const rec = records.find((x) => x.id === r.id);
+    if (rec) {
+      rec.text = $('tr-text').value.trim();
+      rec.durationSec = res?.pages || 0;
+      rec.updatedAt = Date.now();
+    }
+    persist();
+    const elapsed = (Date.now() - t0) / 1000;
+    if (!res?.paragraphs?.length) {
+      if (!batchProgress) toast('没有抽出文字（可能是空页，或系统 OCR 语言包未安装）', 7000);
+    } else if (!batchProgress) {
+      toast(
+        `PDF 完成：${res.pages} 页（文字层 ${res.textPages} / OCR ${res.ocrPages}），用时 ${fmtDur(elapsed)}`,
+        7000,
+      );
+    }
+    return 'done';
+  } catch (err) {
+    const msg = String(err?.message || err);
+    const rec = records.find((x) => x.id === r.id);
+    if (rec) {
+      rec.text = $('tr-text').value.trim();
+      persist();
+    }
+    if (msg === '已取消' || err?.code === 'cancelled') {
+      setProgress(0, '已取消', 'error');
+      return 'cancelled';
+    }
+    if (!batchProgress) toast('PDF 转文字失败：' + msg, 8000);
+    return 'failed';
+  } finally {
+    running = false;
+    paintButtons();
+    paintList();
+  }
+}
+
 function onTranscribeEvent(p) {
   if (!running || !p) return;
   switch (p.phase) {
@@ -881,6 +932,7 @@ let aiState = null;
 const VENDOR_MODELS = {
   deepseek: ['deepseek-chat', 'deepseek-reasoner'],
   qwen: ['qwen3.8-flash', 'qwen3.8-max', 'qwen3.7-plus'],
+  chatgpt: ['gpt-6-luna', 'GPT-6-Luna', 'GPT-5.6-Terra'],
 };
 
 function curVendor() {
@@ -1027,7 +1079,7 @@ function showAddMenu() {
   const menu = document.createElement('div');
   menu.className = 'tr-menu';
   menu.id = 'tr-add-menu';
-  menu.innerHTML = ['deepseek', 'qwen']
+  menu.innerHTML = ['deepseek', 'qwen', 'chatgpt']
     .map((v) => {
       const st = aiState?.[v];
       const model = st?.model || st?.defaultModel || '';
@@ -1268,11 +1320,12 @@ function applyPreset(name) {
   if (saved) {
     $('tr-prompt').value = saved.text;
   } else if (name === 'custom') {
-    $('tr-prompt').value = lsGet(LS_PROMPT, '') || PRESETS.sermon;
+    $('tr-prompt').value = lsGet(LS_PROMPT, '') || PRESETS.deep || PRESETS.sermon;
   } else {
-    $('tr-prompt').value = PRESETS[name] || PRESETS.sermon;
+    $('tr-prompt').value = PRESETS[name] || PRESETS.deep || PRESETS.sermon;
   }
   $('tr-prompt-delete').disabled = !saved;
+  lsSet(LS_PROMPT, $('tr-prompt').value);
 }
 
 function promptLibrary() {
@@ -1282,14 +1335,254 @@ function promptLibrary() {
 
 function renderPromptOptions() {
   const sel = $('tr-preset');
-  const selected = lsGet(LS_PRESET, 'sermon');
+  if (!sel) return;
+  const selected = lsGet(LS_PRESET, 'deep');
   sel.querySelectorAll('option[data-saved]').forEach((o) => o.remove());
   const before = sel.querySelector('option[value="custom"]');
   for (const p of promptLibrary()) {
-    const o = document.createElement('option'); o.value = `saved:${p.id}`; o.textContent = p.name; o.dataset.saved = '1';
+    const o = document.createElement('option');
+    o.value = `saved:${p.id}`;
+    o.textContent = p.name;
+    o.dataset.saved = '1';
     sel.insertBefore(o, before);
   }
   if ([...sel.options].some((o) => o.value === selected)) sel.value = selected;
+}
+
+/** 模板维护弹窗当前选中：builtin:deep | saved:id | custom:draft */
+let pmKey = 'builtin:deep';
+let pmDirty = false;
+
+function pmIsBuiltin() {
+  return pmKey.startsWith('builtin:');
+}
+function pmIsSaved() {
+  return pmKey.startsWith('saved:');
+}
+function pmBuiltinId() {
+  return pmKey.slice('builtin:'.length);
+}
+function pmSavedId() {
+  return pmKey.slice('saved:'.length);
+}
+
+function openPromptModal(focusKey) {
+  const modal = $('tr-prompt-modal');
+  if (!modal) return;
+  document.body.appendChild(modal);
+  const cur = $('tr-preset')?.value || lsGet(LS_PRESET, 'deep');
+  if (focusKey) pmKey = focusKey;
+  else if (cur.startsWith('saved:')) pmKey = cur;
+  else if (cur === 'custom') pmKey = 'custom:draft';
+  else pmKey = `builtin:${PRESETS[cur] ? cur : 'deep'}`;
+  pmDirty = false;
+  paintPromptModal();
+  modal.classList.remove('hidden');
+  $('tr-pm-text')?.focus();
+}
+
+function closePromptModal() {
+  if (pmDirty && !window.confirm('有未保存的修改，确定关闭？')) return;
+  $('tr-prompt-modal')?.classList.add('hidden');
+  pmDirty = false;
+}
+
+function paintPromptModalList() {
+  const box = $('tr-pm-list');
+  if (!box) return;
+  const rows = [];
+  for (const id of Object.keys(PRESETS)) {
+    rows.push({
+      key: `builtin:${id}`,
+      title: BUILTIN_LABELS[id] || id,
+      sub: '内置',
+    });
+  }
+  for (const p of promptLibrary()) {
+    rows.push({
+      key: `saved:${p.id}`,
+      title: p.name,
+      sub: '自定义',
+    });
+  }
+  if (pmKey === 'custom:draft' || pmKey.startsWith('draft:')) {
+    rows.push({ key: pmKey, title: $('tr-pm-name')?.value?.trim() || '未命名草稿', sub: '草稿' });
+  }
+  box.innerHTML = rows.map((r) => `
+    <button type="button" class="tr-pm-item${r.key === pmKey ? ' active' : ''}" data-key="${esc(r.key)}">
+      ${esc(r.title)}<small>${esc(r.sub)}</small>
+    </button>`).join('');
+}
+
+function loadPromptModalEntry(key) {
+  pmKey = key;
+  const nameEl = $('tr-pm-name');
+  const textEl = $('tr-pm-text');
+  const badge = $('tr-pm-badge');
+  const del = $('tr-pm-delete');
+  if (key.startsWith('builtin:')) {
+    const id = key.slice('builtin:'.length);
+    nameEl.value = BUILTIN_LABELS[id] || id;
+    nameEl.readOnly = true;
+    textEl.value = PRESETS[id] || '';
+    badge.textContent = '内置';
+    badge.classList.remove('is-custom');
+    del.disabled = true;
+  } else if (key.startsWith('saved:')) {
+    const p = promptLibrary().find((x) => x.id === key.slice(6));
+    nameEl.value = p?.name || '';
+    nameEl.readOnly = false;
+    textEl.value = p?.text || '';
+    badge.textContent = '自定义';
+    badge.classList.add('is-custom');
+    del.disabled = !p;
+  } else {
+    nameEl.readOnly = false;
+    if (!nameEl.value) nameEl.value = '我的模板';
+    badge.textContent = '草稿';
+    badge.classList.add('is-custom');
+    del.disabled = true;
+  }
+  pmDirty = false;
+  paintPromptModalList();
+}
+
+function paintPromptModal() {
+  loadPromptModalEntry(pmKey);
+}
+
+function savePromptLibrary(list) {
+  lsSet(LS_PROMPT_LIBRARY, list);
+  renderPromptOptions();
+}
+
+function pmSaveCurrent({ asNew } = {}) {
+  const text = $('tr-pm-text').value.trim();
+  if (!text) return toast('提示词不能为空');
+  let name = $('tr-pm-name').value.trim() || '自定义模板';
+  name = name.slice(0, 40);
+  const list = promptLibrary();
+  if (!asNew && pmIsSaved()) {
+    const id = pmSavedId();
+    const i = list.findIndex((p) => p.id === id);
+    if (i < 0) return toast('找不到要保存的模板');
+    list[i] = { ...list[i], name, text };
+    savePromptLibrary(list);
+    pmDirty = false;
+    paintPromptModal();
+    toast('已保存');
+    return list[i];
+  }
+  // 内置 / 草稿 / 另存为 → 新建自定义
+  if (asNew || pmIsBuiltin() || !pmIsSaved()) {
+    const asked = window.prompt('给这套模板起个名字', name);
+    if (!asked?.trim()) return null;
+    name = asked.trim().slice(0, 40);
+  }
+  const id = genId();
+  const item = { id, name, text };
+  list.push(item);
+  savePromptLibrary(list);
+  pmKey = `saved:${id}`;
+  pmDirty = false;
+  paintPromptModal();
+  toast('已保存为自定义模板');
+  return item;
+}
+
+function pmApplyAndClose() {
+  const text = $('tr-pm-text').value.trim();
+  if (!text) return toast('提示词不能为空');
+  $('tr-prompt').value = text;
+  lsSet(LS_PROMPT, text);
+  if (pmIsSaved()) {
+    applyPreset(`saved:${pmSavedId()}`);
+  } else if (pmIsBuiltin()) {
+    applyPreset(pmBuiltinId());
+    // 若用户改过内置正文，落到 custom，避免下次切回内置丢改动
+    if (text !== (PRESETS[pmBuiltinId()] || '')) {
+      $('tr-preset').value = 'custom';
+      lsSet(LS_PRESET, 'custom');
+      $('tr-prompt-delete').disabled = true;
+    }
+  } else {
+    applyPreset('custom');
+  }
+  pmDirty = false;
+  closePromptModal();
+  toast('已应用当前模板');
+}
+
+function initPromptModal() {
+  const modal = $('tr-prompt-modal');
+  if (!modal) return;
+  document.body.appendChild(modal);
+  $('tr-prompt-manage')?.addEventListener('click', () => openPromptModal());
+  $('tr-prompt-open')?.addEventListener('click', () => openPromptModal());
+  $('tr-pm-close')?.addEventListener('click', () => closePromptModal());
+  $('tr-pm-list')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-key]');
+    if (!btn) return;
+    if (pmDirty && !window.confirm('有未保存的修改，切换将丢弃，继续？')) return;
+    loadPromptModalEntry(btn.dataset.key);
+  });
+  $('tr-pm-new')?.addEventListener('click', () => {
+    if (pmDirty && !window.confirm('有未保存的修改，新建将丢弃，继续？')) return;
+    pmKey = `draft:${Date.now().toString(36)}`;
+    $('tr-pm-name').value = '我的模板';
+    $('tr-pm-name').readOnly = false;
+    $('tr-pm-text').value = '';
+    $('tr-pm-badge').textContent = '草稿';
+    $('tr-pm-badge').classList.add('is-custom');
+    $('tr-pm-delete').disabled = true;
+    pmDirty = false;
+    paintPromptModalList();
+    $('tr-pm-text').focus();
+  });
+  $('tr-pm-save')?.addEventListener('click', () => pmSaveCurrent({ asNew: false }));
+  $('tr-pm-saveas')?.addEventListener('click', () => pmSaveCurrent({ asNew: true }));
+  $('tr-pm-apply')?.addEventListener('click', () => pmApplyAndClose());
+  $('tr-pm-delete')?.addEventListener('click', () => {
+    if (!pmIsSaved()) return;
+    if (!window.confirm('删除这套自定义模板？')) return;
+    const id = pmSavedId();
+    savePromptLibrary(promptLibrary().filter((p) => p.id !== id));
+    if (($('tr-preset')?.value || '') === `saved:${id}`) {
+      lsSet(LS_PRESET, 'deep');
+      applyPreset('deep');
+    }
+    pmKey = 'builtin:deep';
+    pmDirty = false;
+    paintPromptModal();
+    toast('已删除');
+  });
+  $('tr-pm-improve')?.addEventListener('click', async () => {
+    const original = $('tr-pm-text').value.trim();
+    if (!original) return toast('先填写提示词');
+    // 临时同步到主框，复用 improvePrompt
+    const prev = $('tr-prompt').value;
+    $('tr-prompt').value = original;
+    try {
+      await improvePrompt();
+      if ($('tr-prompt').value !== original) {
+        $('tr-pm-text').value = $('tr-prompt').value;
+        pmDirty = true;
+      }
+    } finally {
+      // improvePrompt 已写入 tr-prompt；保持与弹窗一致
+      $('tr-prompt').value = $('tr-pm-text').value;
+      void prev;
+    }
+  });
+  $('tr-pm-name')?.addEventListener('input', () => { pmDirty = true; });
+  $('tr-pm-text')?.addEventListener('input', () => { pmDirty = true; });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!$('tr-prompt-modal') || $('tr-prompt-modal').classList.contains('hidden')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    closePromptModal();
+  }, true);
 }
 
 /**
@@ -1980,8 +2273,11 @@ export function initTranscribe() {
 
   $('tr-lang').value = lsGet(LS_LANG, 'auto') || 'auto';
   renderPromptOptions();
-  const preset = lsGet(LS_PRESET, 'sermon');
-  applyPreset(PRESETS[preset] || preset === 'custom' || [...$('tr-preset').options].some(o => o.value === preset) ? preset : 'sermon');
+  initPromptModal();
+  const preset = lsGet(LS_PRESET, 'deep');
+  const okPreset = PRESETS[preset] || preset === 'custom' || String(preset).startsWith('saved:')
+    || [...($('tr-preset')?.options || [])].some((o) => o.value === preset);
+  applyPreset(okPreset ? preset : 'deep');
 
   records = loadRecords();
   curId = records[0]?.id || null;
@@ -1989,8 +2285,10 @@ export function initTranscribe() {
   paintEditor();
 
   $('tr-pick').addEventListener('click', () => pickAudio());
+  $('tr-pick-pdf')?.addEventListener('click', () => pickPdf());
   $('tr-start').addEventListener('click', () => startTranscribe());
   $('tr-cancel').addEventListener('click', () => {
+    cancelPdfExtract();
     invoke('transcribe_cancel').catch(() => {});
     setProgress(0, '正在取消…', 'error');
   });
@@ -2064,15 +2362,19 @@ export function initTranscribe() {
   $('tr-preset').addEventListener('change', () => applyPreset($('tr-preset').value));
   $('tr-prompt-save').addEventListener('click', () => {
     const text = $('tr-prompt').value.trim(); if (!text) return toast('先填写提示词');
-    const name = window.prompt('给这套提示词起个名字'); if (!name?.trim()) return;
-    const list = promptLibrary(); const id = genId();
-    list.push({ id, name: name.trim().slice(0,40), text });
-    lsSet(LS_PROMPT_LIBRARY, list); renderPromptOptions(); applyPreset(`saved:${id}`); toast('提示词已保存');
+    const name = window.prompt('给这套模板起个名字', '我的模板');
+    if (!name?.trim()) return;
+    const list = promptLibrary();
+    const id = genId();
+    list.push({ id, name: name.trim().slice(0, 40), text });
+    savePromptLibrary(list);
+    applyPreset(`saved:${id}`);
+    toast('已保存为自定义模板');
   });
   $('tr-prompt-delete').addEventListener('click', () => {
     const val = $('tr-preset').value; if (!val.startsWith('saved:')) return;
     lsSet(LS_PROMPT_LIBRARY, promptLibrary().filter(p => `saved:${p.id}` !== val));
-    lsSet(LS_PRESET, 'sermon'); renderPromptOptions(); applyPreset('sermon'); toast('已删除这套提示词');
+    lsSet(LS_PRESET, 'deep'); renderPromptOptions(); applyPreset('deep'); toast('已删除这套提示词');
   });
   $('tr-prompt-improve').addEventListener('click', improvePrompt);
   $('tr-summary').addEventListener('input', () => {

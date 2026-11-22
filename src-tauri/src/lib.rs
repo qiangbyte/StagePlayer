@@ -6,6 +6,7 @@ mod dictation_polish;
 mod fileio;
 mod karaoke;
 mod lyric_follow;
+mod ocr;
 mod output;
 mod pect;
 mod pptx;
@@ -123,6 +124,8 @@ pub fn run() {
             dialog::pick_files,
             fileio::pick_save_path,
             fileio::copy_file,
+            fileio::import_media,
+            fileio::media_library_dir,
             fileio::make_image_thumb,
             fileio::make_video_thumb,
             fileio::existing_files,
@@ -134,6 +137,7 @@ pub fn run() {
             store::store_dir,
             karaoke::vocal_cancel_export,
             pptx::parse_pptx,
+            pptx::ensure_pptx,
             pect::import_pect,
             output::open_output_window,
             output::set_output_fullscreen,
@@ -176,6 +180,8 @@ pub fn run() {
             dictation_polish::dictation_polish_text,
             transcribe::transcribe_file,
             transcribe::transcribe_cancel,
+            ocr::ocr_status,
+            ocr::ocr_image,
             llm::ai_settings_get,
             llm::ai_settings_set,
             llm::ai_summarize,

@@ -1,6 +1,6 @@
 // PPT 播放模块：解析 pptx → 幻灯片网格 → 输出同步
 
-import { pickFiles, esc, fileName, invoke, lsGet, lsSet, toast } from './util.js';
+import { pickFiles, esc, fileName, fileExt, invoke, lsGet, lsSet, toast } from './util.js';
 import { pushToOutput, clearOutput } from './output-main.js';
 import { renderSlide, makeSlideCanvas } from './slide-render.js';
 import {
@@ -9,6 +9,9 @@ import {
   getDisplayName, promptRenameMedia, setDisplayName, bindViewZoom,
 } from './media-library.js';
 import { pushUndo } from './undo.js';
+import { showCtxMenu } from './ctx-menu.js';
+import { requestAddToProgram } from './program-bridge.js';
+import { ensureLocalMediaMany } from './media-vault.js';
 
 const LS_KEY = 'sp.ppt.paths';
 
@@ -299,6 +302,17 @@ export function initPpt() {
     if (item && e.target.closest('[data-act="del"]')) return removeDoc(+item.dataset.i);
     if (item) selectDoc(+item.dataset.i).catch(() => {});
   });
+  docList?.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.file-item');
+    if (!item) return;
+    const i = +item.dataset.i;
+    const d = docs[i];
+    if (!d?.path) return;
+    showCtxMenu(e, [
+      { label: '加入节目单（按页展开）', action: () => requestAddToProgram([d.path], 'ppt') },
+      { label: '从列表移除', danger: true, action: () => removeDoc(i) },
+    ]);
+  });
   $('ppt-doc-select')?.addEventListener('change', (e) => {
     const i = +e.target.value;
     if (Number.isFinite(i) && i >= 0) selectDoc(i).catch(() => {});
@@ -340,19 +354,41 @@ export function initPpt() {
     if (cell) goto(+cell.dataset.i);
   });
 
+  async function importPptPaths(paths) {
+    const raw = (paths || []).filter((p) => fileExt(p) === 'pptx');
+    const skipped = (paths || []).length - raw.length;
+    if (!raw.length) {
+      toast(skipped ? '当前是 PPT 页，请拖入 .pptx（旧版 .ppt 请先另存为 pptx，或到「歌词」页导入敬拜 PPT）' : '没有可导入的 PPT');
+      return 0;
+    }
+    const files = await ensureLocalMediaMany(raw, 'ppt');
+    if (!files.length) return 0;
+    let added = 0;
+    for (const f of files) {
+      if (docs.some((d) => d.path === f)) continue;
+      registerStub(f);
+      added++;
+    }
+    persistPaths();
+    renderDocs();
+    if (currentDoc < 0 && docs.length) {
+      const grid = $('ppt-grid');
+      if (grid) grid.innerHTML = '<div class="empty-tip big">点击左侧文稿列表打开预览</div>';
+    }
+    const tip = added ? `已添加 ${added} 个到 PPT 库（已存应用目录）` : '这些文稿已在库里';
+    toast(skipped ? `${tip}（跳过 ${skipped} 个非 pptx）` : tip);
+    return added;
+  }
+
   document.addEventListener('sp:import-ppt', async () => {
     const files = await pickFiles([{ name: 'PowerPoint', extensions: ['pptx'] }], '导入 PPT');
     if (!files.length) return;
-    for (const f of files) {
-      try {
-        const di = await loadDoc(f);
-        if (currentDoc < 0) selectDoc(di);
-      } catch (err) {
-        toast(`解析失败：${fileName(f)} — ${err}`, 6000);
-      }
-    }
-    renderDocs();
-    renderGrid();
+    await importPptPaths(files);
+  });
+
+  document.addEventListener('sp:drop-files', (e) => {
+    if (e.detail?.module !== 'ppt') return;
+    importPptPaths(e.detail.paths || []);
   });
 
   document.addEventListener('sp:clear-list', () => {

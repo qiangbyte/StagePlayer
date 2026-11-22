@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "stage-player"
-version = "0.1.12"
+version = "0.1.13"
 description = "演出播放器：音频 / 视频 / PPT / PDF 一体化演出播放"
 authors = ["you"]
 edition = "2021"
@@ -66,7 +66,13 @@ windows = { version = "0.62", features = [
   "Win32_System_Variant",
   "Win32_System_Com",
   "Win32_UI_Shell",
+  "Foundation",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ] }
+windows-future = { version = "0.3", features = ["std"] }
 
 # macOS（Apple 芯片）：AI 人声分离只开 CoreML；DirectML / OneDNN / CUDA 在 Mac 上不存在，不能带进来
 [target.'cfg(target_os = "macos")'.dependencies]

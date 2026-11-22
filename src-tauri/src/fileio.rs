@@ -125,6 +125,104 @@ pub async fn existing_files(paths: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// 把外部文件复制进应用数据目录 media/{kind}/，避免源文件被误删后播不了。
+/// 已在本库里的路径直接返回；同一份源文件（路径+大小+修改时间）只复制一次。
+#[tauri::command]
+pub async fn import_media(app: AppHandle, path: String, kind: String) -> Result<String, String> {
+  tauri::async_runtime::spawn_blocking(move || import_media_blocking(&app, &path, &kind))
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn import_media_blocking(app: &AppHandle, path: &str, kind: &str) -> Result<String, String> {
+  use sha2::{Digest, Sha256};
+  use std::fs;
+  use std::io::Read;
+  use std::path::PathBuf;
+  use std::time::UNIX_EPOCH;
+
+  let kind = kind.trim().to_ascii_lowercase();
+  let kind = match kind.as_str() {
+    "audio" | "video" | "ppt" | "pdf" | "image" | "lyrics" | "other" => kind,
+    _ => "other".into(),
+  };
+  let src = PathBuf::from(path.trim().trim_matches('"'));
+  if !src.is_file() {
+    return Err(format!("找不到文件：{}", src.display()));
+  }
+  let media_root = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| e.to_string())?
+    .join("media");
+  let canon_src = fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+  // 已经在应用库里：不再复制
+  if let Ok(root) = fs::canonicalize(&media_root) {
+    if canon_src.starts_with(&root) {
+      return Ok(canon_src.to_string_lossy().into_owned());
+    }
+  }
+  let meta = fs::metadata(&src).map_err(|e| format!("读取文件信息失败：{e}"))?;
+  let mut hasher = Sha256::new();
+  hasher.update(canon_src.to_string_lossy().as_bytes());
+  hasher.update(meta.len().to_le_bytes());
+  if let Ok(t) = meta.modified() {
+    if let Ok(d) = t.duration_since(UNIX_EPOCH) {
+      hasher.update(d.as_secs().to_le_bytes());
+    }
+  }
+  let key = format!("{:x}", hasher.finalize());
+  let short = &key[..16];
+  let raw_name = src
+    .file_name()
+    .map(|n| n.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "file".into());
+  let safe: String = raw_name
+    .chars()
+    .map(|c| match c {
+      '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+      c if c.is_control() => '_',
+      c => c,
+    })
+    .collect();
+  let safe = if safe.trim().is_empty() { "file".into() } else { safe };
+  let dir = media_root.join(&kind);
+  fs::create_dir_all(&dir).map_err(|e| format!("创建素材目录失败：{e}"))?;
+  let dest = dir.join(format!("{short}_{safe}"));
+  if dest.is_file() {
+    if dest.metadata().map(|m| m.len() == meta.len()).unwrap_or(false) {
+      return Ok(dest.to_string_lossy().into_owned());
+    }
+  }
+  // 大文件边读边写，避免一次性读进内存
+  {
+    let mut from = fs::File::open(&src).map_err(|e| format!("打开源文件失败：{e}"))?;
+    let mut to = fs::File::create(&dest).map_err(|e| format!("写入应用库失败：{e}"))?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+      let n = from.read(&mut buf).map_err(|e| format!("读取源文件失败：{e}"))?;
+      if n == 0 {
+        break;
+      }
+      use std::io::Write;
+      to.write_all(&buf[..n]).map_err(|e| format!("写入应用库失败：{e}"))?;
+    }
+  }
+  Ok(dest.to_string_lossy().into_owned())
+}
+
+/// 应用素材库根目录（%APPDATA%/…/media），方便设置页提示
+#[tauri::command]
+pub fn media_library_dir(app: AppHandle) -> Result<String, String> {
+  let dir = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| e.to_string())?
+    .join("media");
+  std::fs::create_dir_all(&dir).ok();
+  Ok(dir.to_string_lossy().into_owned())
+}
+
 /// 原生生成图片缩略图（最长边 320px 的 JPEG dataURL）
 /// 在 Rust 侧解码，避免 WebView 渲染进程解码高清原图导致 OOM；失败返回 None
 #[tauri::command]

@@ -36,6 +36,7 @@ import {
 import { exportEvent, importEvent } from './program-io.js';
 import { playLyricsItem } from './lyrics-show.js';
 import { pushUndo } from './undo.js';
+import { ensureLocalMedia } from './media-vault.js';
 
 const LS_EVENTS = 'sp.program.events';
 const LS_CURRENT = 'sp.program.current';
@@ -303,6 +304,14 @@ export function initProgram() {
       detail.ok = false;
       toast(`更新节目失败：${err}`, 5000);
     }
+  });
+
+  // 各模块「右键 → 加入节目单」：detail.paths / detail.type，完成后写 detail.count
+  document.addEventListener('sp:add-to-program', (e) => {
+    const detail = e.detail || {};
+    detail.promise = addFilesToProgram(detail.paths || [], detail.type || null)
+      .then((n) => { detail.count = n; detail.ok = true; return n; })
+      .catch((err) => { detail.ok = false; detail.error = err; throw err; });
   });
 
   $('pg-new').addEventListener('click', () => {
@@ -846,34 +855,30 @@ function initProgramDragDrop() {
   };
   const clearDropStyle = () => setActive(false);
 
+  /** 节目单接收拖入的文件（只有当前在节目单页时才走这里） */
   const ingestPaths = async (paths) => {
     const list = (paths || []).filter(Boolean);
     clearDropStyle();
     if (!list.length) return;
-    const tab = document.querySelector('.tab.active')?.dataset.module;
-    if (tab && tab !== 'program') {
-      document.dispatchEvent(new CustomEvent('sp:switch-module', { detail: 'program' }));
+    const n = await addFilesToProgram(list);
+    if (n) toast(`拖拽导入 ${n} 条节目 · 双击左上角序号可改顺序`);
+  };
+
+  /** 按当前所在页分流：节目单收全部；音频/视频/PPT/PDF/歌词各进自己的库 */
+  const routeDrop = (paths) => {
+    const list = (paths || []).filter(Boolean);
+    clearDropStyle();
+    if (!list.length) return;
+    const tab = document.querySelector('.tab.active')?.dataset.module || 'program';
+    if (tab === 'program') {
+      ingestPaths(list);
+      return;
     }
-    const ev = curEvent();
-    if (!ev) return;
-    toast('正在导入拖入的文件…');
-    let n = 0;
-    try {
-      for (const p of list) {
-        const type = detectMediaType(p);
-        if (!type) {
-          toast(`跳过：${fileName(p)}`);
-          continue;
-        }
-        n += await pushMedia(ev, p, type);
-      }
-      save();
-      renderItems();
-      updateNowBar();
-      toast(n ? `拖拽导入 ${n} 条节目 · 双击左上角序号可改顺序` : '没有可导入的文件');
-    } finally {
-      clearDropStyle();
+    if (!['audio', 'video', 'ppt', 'pdf', 'lyrics'].includes(tab)) {
+      toast('请先切到「节目单」或对应素材页（音频/视频/PPT/PDF/歌词）再拖入');
+      return;
     }
+    document.dispatchEvent(new CustomEvent('sp:drop-files', { detail: { module: tab, paths: list } }));
   };
 
   ['dragenter', 'dragover'].forEach((type) => {
@@ -896,7 +901,7 @@ function initProgramDragDrop() {
     const files = [...(e.dataTransfer?.files || [])];
     const paths = files.map((f) => f.path || f.name).filter((p) => p && /[\\/]/.test(p));
     // Tauri WebView 的 File 带 path；若只有文件名则等 tauri://drag-drop
-    if (paths.length) await ingestPaths(paths);
+    if (paths.length) routeDrop(paths);
   });
   // 系统拖放取消 / 失焦时也清掉高亮
   window.addEventListener('dragend', clearDropStyle);
@@ -908,7 +913,7 @@ function initProgramDragDrop() {
   listen('tauri://drag-drop', (e) => {
     clearDropStyle();
     const paths = e.payload?.paths || [];
-    if (paths.length) ingestPaths(paths);
+    if (paths.length) routeDrop(paths);
   }).catch(() => {});
   listen('tauri://drag-enter', () => {
     if (document.querySelector('.tab.active')?.dataset.module === 'program') setActive(true);
@@ -917,6 +922,44 @@ function initProgramDragDrop() {
   listen('tauri://drag-over', () => {
     if (document.querySelector('.tab.active')?.dataset.module === 'program') setActive(true);
   }).catch(() => {});
+}
+
+/**
+ * 把本地文件加入当前节目单（音频会带上曲库设置；PPT/PDF 按页展开）。
+ * 供各模块「右键 → 加入节目单」和节目单拖放共用。
+ * @returns {Promise<number>} 实际加入的条目数
+ */
+export async function addFilesToProgram(paths, forcedType = null) {
+  const ev = curEvent();
+  if (!ev) {
+    toast('请先在「节目单」新建一个活动');
+    return 0;
+  }
+  const list = (paths || []).filter(Boolean);
+  if (!list.length) return 0;
+  toast(list.some((p) => (forcedType || detectMediaType(p)) === 'ppt' || (forcedType || detectMediaType(p)) === 'pdf')
+    ? '正在复制并按页展开加入节目单…'
+    : '正在复制到应用库并加入节目单…');
+  let n = 0;
+  for (const p of list) {
+    const type = forcedType || detectMediaType(p);
+    if (!type) {
+      toast(`跳过不支持的格式：${fileName(p)}`);
+      continue;
+    }
+    let local = p;
+    try {
+      local = await ensureLocalMedia(p, type === 'image' ? 'image' : type);
+    } catch (err) {
+      toast(`复制失败：${fileName(p)}（${err?.message || err}）`, 6000);
+      continue;
+    }
+    n += await pushMedia(ev, local, type);
+  }
+  save();
+  renderItems();
+  updateNowBar();
+  return n;
 }
 
 /** 只更新高亮，避免整表重绘 + 重刷缩略图（切换卡顿主因） */
@@ -1016,7 +1059,7 @@ function syncPlayGoBtn() {
   const snap = getAudioSnapshot();
   const live = item?.type === 'audio' && snap.path === item.path && snap.playing;
   go.textContent = live ? '⏸' : '▶';
-  go.title = live ? '暂停（G / 空格）' : '播放当前（G）';
+  go.title = live ? '暂停（G / 空格）；连按 G 两次重新播放' : '播放当前（G）；连按两次重新播放';
   go.classList.toggle('is-pause', live);
 }
 

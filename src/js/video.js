@@ -1,6 +1,9 @@
 // 视频播放模块：目录 + 卡片网格 + 紧凑预览
 
-import { pickFiles, esc, fileName, lsGet, lsSet, fmtTime, fmtTimeLong, toast, VIDEO_EXT } from './util.js';
+import { pickFiles, esc, fileName, fileExt, lsGet, lsSet, fmtTime, fmtTimeLong, toast, VIDEO_EXT } from './util.js';
+import { showCtxMenu } from './ctx-menu.js';
+import { requestAddToProgram } from './program-bridge.js';
+import { ensureLocalMediaMany } from './media-vault.js';
 import {
   pushToOutput, clearOutput, sendVideoControl, getCurrentOutput, getOutputVideoReport,
 } from './output-main.js';
@@ -381,6 +384,16 @@ export function initVideo() {
     }
   });
 
+  list?.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.audio-card, .video-card, .file-item');
+    if (!item?.dataset.path) return;
+    const path = item.dataset.path;
+    showCtxMenu(e, [
+      { label: '加入节目单', action: () => requestAddToProgram([path], 'video') },
+      { label: '从视频库移除', danger: true, action: () => removeVideoItem(path) },
+    ]);
+  });
+
   list?.addEventListener('click', (e) => {
     const pushBtn = e.target.closest('[data-push]');
     if (pushBtn) {
@@ -505,13 +518,38 @@ export function initVideo() {
     if (getCurrentOutput().kind === 'video') sendVideoControl('seek', t);
   });
 
+  async function importVideoPaths(paths) {
+    const raw = (paths || []).filter((p) => VIDEO_EXT.includes(fileExt(p)));
+    const skipped = (paths || []).length - raw.length;
+    if (!raw.length) {
+      toast(skipped ? '当前是视频页，请拖入视频文件' : '没有可导入的视频');
+      return 0;
+    }
+    const files = await ensureLocalMediaMany(raw, 'video');
+    if (!files.length) return 0;
+    let added = 0;
+    for (const f of files) {
+      if (videos.includes(f)) continue;
+      videos.push(f);
+      added++;
+    }
+    lsSet(LS_KEY, videos);
+    renderList();
+    if (current < 0 && videos.length) loadInPreview(0, false);
+    const tip = added ? `已添加 ${added} 个到视频库（已存应用目录）` : '这些视频已在库里';
+    toast(skipped ? `${tip}（跳过 ${skipped} 个非视频）` : tip);
+    return added;
+  }
+
   document.addEventListener('sp:import-video', async () => {
     const files = await pickFiles([{ name: '视频', extensions: VIDEO_EXT }], '导入视频');
     if (!files.length) return;
-    videos.push(...files);
-    lsSet(LS_KEY, videos);
-    renderList();
-    if (current < 0) loadInPreview(0, false);
+    await importVideoPaths(files);
+  });
+
+  document.addEventListener('sp:drop-files', (e) => {
+    if (e.detail?.module !== 'video') return;
+    importVideoPaths(e.detail.paths || []);
   });
 
   document.addEventListener('sp:clear-list', () => {
@@ -534,6 +572,30 @@ export function initVideo() {
     updatePlayBtn();
     renderList();
   });
+}
+
+/** 从头重新播放当前视频（预览 + 输出）；G 连按两次用 */
+export function restartVideo() {
+  const preview = $('video-preview');
+  if (current < 0 || !preview?.src) {
+    toast('请先选择视频');
+    return false;
+  }
+  try {
+    preview.currentTime = 0;
+  } catch { /* ignore */ }
+  preview.play().catch(() => {});
+  userCtlAt = performance.now();
+  if (getCurrentOutput().kind === 'video') {
+    sendVideoControl('seek', 0);
+    sendVideoControl('play');
+  } else {
+    // 输出还没推这个视频时，重新推一次并从 0 起
+    pushCurrent();
+  }
+  updatePlayBtn();
+  toast('已重新播放');
+  return true;
 }
 
 /** 节目单/外部调用；opts.stay=true 时不切换 Tab */

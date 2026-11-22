@@ -834,7 +834,8 @@
               </div>
               <div class="tr-main-actions">
                 <button type="button" class="mini-btn accent" id="tr-pick" title="可多选录音文件；批量选择后会依次转写（m4a / mp3 / wav / flac / aac / ogg）">＋ 选择音频</button>
-                <button type="button" class="mini-btn primary" id="tr-start" title="本地模型转写，不上传音频">开始转写</button>
+                <button type="button" class="mini-btn accent" id="tr-pick-pdf" title="PDF 转文字：优先抽文字层；扫描页用系统本地 OCR，不上传、不按页计费">＋ 选择 PDF</button>
+                <button type="button" class="mini-btn primary" id="tr-start" title="音频走 SenseVoice；PDF 走文字层 + 本地 OCR">开始转写</button>
                 <button type="button" class="mini-btn danger hidden" id="tr-cancel">取消转写</button>
               </div>
               <div class="tr-secondary-actions" aria-label="文字操作">
@@ -845,7 +846,7 @@
               </div>
             </div>
             <div class="tr-file-row">
-              <input type="text" id="tr-path" spellcheck="false" placeholder="音频文件路径：可直接粘贴，或点「选择音频」" />
+              <input type="text" id="tr-path" spellcheck="false" placeholder="音频或 PDF 路径：可粘贴，或点「选择音频 / 选择 PDF」" />
               <label class="tr-lang">语言
                 <select id="tr-lang" title="自动识别适合普通话/粤语/英语混合；已知语种时指定更稳">
                   <option value="auto">自动</option>
@@ -875,7 +876,7 @@
                 <div class="tr-text-wrap">
                   <div id="tr-text-highlight" aria-hidden="true"></div>
                   <textarea id="tr-text" class="tr-text" spellcheck="false"
-                    placeholder="转写结果会实时出现在这里，每段前面带时间点。&#10;首次使用会自动下载本地模型 SenseVoice（约 230MB）。"></textarea>
+                    placeholder="转写结果会实时出现在这里。&#10;音频：每段带时间点；PDF：每段带页码。&#10;首次音频转写会下载 SenseVoice（约 230MB）；PDF 优先抽文字层，扫描页用系统本地 OCR。"></textarea>
                 </div>
                 <div class="tr-proof-player hidden" id="tr-proof-player" aria-label="试听这一段原音">
                   <button type="button" class="mini-btn primary" id="tr-pp-toggle" title="播放 / 暂停">▶</button>
@@ -897,12 +898,14 @@
                 </div>
                 <div class="tr-sum-tabs is-empty" id="tr-sum-tabs"></div>
                 <div class="tr-ai-bar">
-                  <select id="tr-preset" title="总结风格">
+                  <select id="tr-preset" title="总结风格 / 模板">
+                    <option value="deep">深度结构化</option>
                     <option value="sermon">讲道 / 讲座</option>
                     <option value="meeting">会议纪要</option>
                     <option value="brief">200 字摘要</option>
                     <option value="custom">自定义</option>
                   </select>
+                  <button type="button" class="mini-btn" id="tr-prompt-manage" title="在大窗口里编辑、新建、保存总结模板">维护模板</button>
                   <button type="button" class="mini-btn primary" id="tr-sum" title="把左侧文字发给 DeepSeek 总结（仅发送文字，不发送音频）">AI 总结</button>
                   <button type="button" class="mini-btn danger hidden" id="tr-sum-stop">停止</button>
                   <button type="button" class="mini-btn" id="tr-sum-copy">复制</button>
@@ -916,6 +919,7 @@
                       <select id="tr-provider" title="选择用哪家大模型做总结">
                         <option value="deepseek">DeepSeek</option>
                         <option value="qwen">千问 Qwen</option>
+                        <option value="chatgpt">ChatGPT（sub.601730.xyz）</option>
                       </select>
                     </div>
                     <div class="tr-settings-row">
@@ -929,10 +933,16 @@
                       <button type="button" class="mini-btn danger" id="tr-key-clear" title="从本机删除已保存的 Key">清除 Key</button>
                     </div>
                     <div class="hint" id="tr-hint">Key 只写入本机配置文件，不进入节目单/导出文件。</div>
-                    <textarea id="tr-prompt" class="tr-prompt" rows="5" spellcheck="false" placeholder="总结要求（提示词）"></textarea>
+                    <div class="tr-prompt-compact">
+                      <div class="tr-prompt-compact-head">
+                        <span class="tr-lbl">当前模板预览</span>
+                        <button type="button" class="mini-btn accent" id="tr-prompt-open" title="打开大窗口编辑模板">打开维护窗口</button>
+                      </div>
+                      <textarea id="tr-prompt" class="tr-prompt" rows="4" spellcheck="false" placeholder="总结要求（提示词）；点「维护模板」可放大编辑"></textarea>
+                    </div>
                     <div class="tr-prompt-actions">
-                      <button type="button" class="mini-btn" id="tr-prompt-save">保存为提示词</button>
-                      <button type="button" class="mini-btn" id="tr-prompt-delete" disabled>删除当前提示词</button>
+                      <button type="button" class="mini-btn" id="tr-prompt-save">另存为自定义</button>
+                      <button type="button" class="mini-btn" id="tr-prompt-delete" disabled>删除当前自定义</button>
                       <button type="button" class="mini-btn" id="tr-prompt-improve">AI 改进提示词</button>
                     </div>
                   </div>
@@ -957,6 +967,41 @@
                       <button type="button" class="mini-btn primary" id="tr-refine-go" title="让 AI 按修改意见改一版（Ctrl+Enter）">精修</button>
                       <button type="button" class="mini-btn" id="tr-undo" title="回到上一版总结" disabled>↶ 撤销</button>
                     </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 总结模板维护：大窗口编辑内置 / 自定义提示词 -->
+          <div id="tr-prompt-modal" class="tr-prompt-modal hidden" role="dialog" aria-modal="true" aria-label="总结模板维护">
+            <div class="tr-prompt-modal-card">
+              <div class="tr-prompt-modal-bar">
+                <span class="tr-prompt-modal-title">总结模板维护</span>
+                <span class="tr-prompt-modal-hint">内置模板可查看；改动后请「另存为」成自定义。自定义可直接保存覆盖。</span>
+                <span class="tr-viewer-spacer"></span>
+                <button type="button" class="mini-btn primary" id="tr-pm-close" title="关闭（Esc）">关闭</button>
+              </div>
+              <div class="tr-prompt-modal-body">
+                <aside class="tr-pm-side">
+                  <div class="tr-pm-side-head">模板列表</div>
+                  <div class="tr-pm-list" id="tr-pm-list"></div>
+                  <div class="tr-pm-side-actions">
+                    <button type="button" class="mini-btn accent" id="tr-pm-new">＋ 新建空白</button>
+                  </div>
+                </aside>
+                <div class="tr-pm-main">
+                  <div class="tr-pm-meta">
+                    <label class="tr-lbl" for="tr-pm-name">名称</label>
+                    <input type="text" id="tr-pm-name" spellcheck="false" placeholder="模板名称（自定义模板可改）" />
+                    <span class="tr-pm-badge" id="tr-pm-badge">内置</span>
+                  </div>
+                  <textarea id="tr-pm-text" class="tr-pm-text" spellcheck="false" placeholder="在这里编写完整的总结提示词模板…"></textarea>
+                  <div class="tr-pm-actions">
+                    <button type="button" class="mini-btn primary" id="tr-pm-apply">应用并关闭</button>
+                    <button type="button" class="mini-btn" id="tr-pm-save">保存</button>
+                    <button type="button" class="mini-btn" id="tr-pm-saveas">另存为…</button>
+                    <button type="button" class="mini-btn danger" id="tr-pm-delete" disabled>删除</button>
+                    <button type="button" class="mini-btn" id="tr-pm-improve">AI 改进</button>
                   </div>
                 </div>
               </div>

@@ -1,4 +1,4 @@
-//! 大模型总结设置与调用（DeepSeek / 千问，可切换）。
+//! 大模型总结设置与调用（DeepSeek / 千问 / ChatGPT，可切换）。
 //! API Key 只保存在本机配置目录（ai.json），不进 localStorage / 导出文件，也不回传前端明文。
 //! 总结走 OpenAI 兼容的 chat/completions（流式 SSE），只发送文字，不发送音频（转写始终在本地）。
 
@@ -14,6 +14,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 const QWEN_CHAT_URL: &str = "https://maas.qianwenaiapi.com/compatible-mode/v1/chat/completions";
+/// ChatGPT 兼容中转（OpenAI /v1/chat/completions）
+const CHATGPT_URL: &str = "https://sub.601730.xyz/v1/chat/completions";
 /// 文稿不超过这个字数时一次性总结
 const SINGLE_MAX_CHARS: usize = 30_000;
 /// 超长文稿分段时每段字数
@@ -29,6 +31,7 @@ const SYSTEM_PROMPT: &str = "你是严谨的中文内容整理助手。只依据
 enum Vendor {
   Deepseek,
   Qwen,
+  Chatgpt,
 }
 
 impl Vendor {
@@ -36,6 +39,7 @@ impl Vendor {
     match s.trim() {
       "deepseek" => Some(Vendor::Deepseek),
       "qwen" => Some(Vendor::Qwen),
+      "chatgpt" | "openai" | "gpt" => Some(Vendor::Chatgpt),
       _ => None,
     }
   }
@@ -43,25 +47,29 @@ impl Vendor {
     match self {
       Vendor::Deepseek => "deepseek",
       Vendor::Qwen => "qwen",
+      Vendor::Chatgpt => "chatgpt",
     }
   }
   fn label(self) -> &'static str {
     match self {
       Vendor::Deepseek => "DeepSeek",
       Vendor::Qwen => "千问",
+      Vendor::Chatgpt => "ChatGPT",
     }
   }
   fn url(self) -> &'static str {
     match self {
       Vendor::Deepseek => DEEPSEEK_URL,
       Vendor::Qwen => QWEN_CHAT_URL,
+      Vendor::Chatgpt => CHATGPT_URL,
     }
   }
-  /// 模型名区分大小写：千问必须用小写 qwen3.8-flash
+  /// 模型名区分大小写：千问必须用小写 qwen3.8-flash；ChatGPT 中转用 GPT-5.6-Terra
   fn default_model(self) -> &'static str {
     match self {
       Vendor::Deepseek => "deepseek-chat",
       Vendor::Qwen => "qwen3.8-flash",
+      Vendor::Chatgpt => "gpt-6-luna",
     }
   }
 }
@@ -100,13 +108,15 @@ struct Creds {
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Stored {
-  /// 当前总结服务：deepseek | qwen
+  /// 当前总结服务：deepseek | qwen | chatgpt
   #[serde(default)]
   provider: String,
   #[serde(default)]
   deepseek: Creds,
   #[serde(default)]
   qwen: Creds,
+  #[serde(default)]
+  chatgpt: Creds,
 }
 
 impl Stored {
@@ -117,12 +127,14 @@ impl Stored {
     match v {
       Vendor::Deepseek => &self.deepseek,
       Vendor::Qwen => &self.qwen,
+      Vendor::Chatgpt => &self.chatgpt,
     }
   }
   fn creds_mut(&mut self, v: Vendor) -> &mut Creds {
     match v {
       Vendor::Deepseek => &mut self.deepseek,
       Vendor::Qwen => &mut self.qwen,
+      Vendor::Chatgpt => &mut self.chatgpt,
     }
   }
 }
@@ -190,6 +202,7 @@ pub struct AiSettingsView {
   provider: String,
   deepseek: VendorView,
   qwen: VendorView,
+  chatgpt: VendorView,
 }
 
 fn vendor_view(s: &Stored, v: Vendor) -> VendorView {
@@ -212,6 +225,7 @@ fn view_of(s: &Stored) -> AiSettingsView {
     provider: s.vendor().id().into(),
     deepseek: vendor_view(s, Vendor::Deepseek),
     qwen: vendor_view(s, Vendor::Qwen),
+    chatgpt: vendor_view(s, Vendor::Chatgpt),
   }
 }
 
@@ -231,7 +245,7 @@ pub fn ai_settings_get(app: AppHandle) -> Result<AiSettingsView, String> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSettingsInput {
-  /// 当前总结服务 deepseek | qwen
+  /// 当前总结服务 deepseek | qwen | chatgpt
   provider: Option<String>,
   /// Key / 模型所属的服务商（缺省为当前总结服务）
   vendor: Option<String>,
@@ -528,7 +542,8 @@ pub async fn ai_summarize(
     if p.is_empty() {
       "请对下面的内容做结构化总结：一句话主旨、核心要点、值得记录的细节。".to_string()
     } else {
-      p.chars().take(4000).collect()
+      // 深度结构化等长模板约 2～4 千字，留足余量
+      p.chars().take(12_000).collect()
     }
   };
   let (v, key, model) = active_creds(&app, vendor.as_deref())?;
@@ -702,6 +717,8 @@ mod tests {
   fn model_validation() {
     assert!(valid_model("deepseek-chat"));
     assert!(valid_model("qwen3.8-flash"));
+    assert!(valid_model("gpt-6-luna"));
+    assert!(valid_model("GPT-6-Luna"));
     assert!(!valid_model("a b"));
     assert!(!valid_model("../x"));
     assert!(!valid_model(""));
@@ -725,8 +742,12 @@ mod tests {
   #[test]
   fn vendor_defaults() {
     assert_eq!(Vendor::Qwen.default_model(), "qwen3.8-flash");
+    assert_eq!(Vendor::Chatgpt.default_model(), "gpt-6-luna");
     assert_eq!(Vendor::parse("qwen"), Some(Vendor::Qwen));
+    assert_eq!(Vendor::parse("chatgpt"), Some(Vendor::Chatgpt));
+    assert_eq!(Vendor::parse("openai"), Some(Vendor::Chatgpt));
     assert_eq!(Vendor::parse("x"), None);
+    assert!(Vendor::Chatgpt.url().contains("sub.601730.xyz"));
   }
 
   /// 真实千问调用：QWEN_API_KEY=sk-... cargo test --lib -- llm::tests::qwen_summary_live --ignored --nocapture

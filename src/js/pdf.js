@@ -1,7 +1,7 @@
 // PDF 播放模块：pdf.js 渲染缩略图 + 输出高清页
 
 import * as pdfjsLib from '../lib/pdfjs/pdf.min.mjs';
-import { pickFiles, esc, fileName, convertFileSrc, lsGet, lsSet, toast } from './util.js';
+import { pickFiles, esc, fileName, fileExt, convertFileSrc, lsGet, lsSet, toast } from './util.js';
 import { pushToOutput, clearOutput, currentOutputSeq } from './output-main.js';
 import {
   renderDirList, filterByFolder, folderTitle, addFolder, renameFolder, removeFolder,
@@ -9,6 +9,9 @@ import {
   getDisplayName, promptRenameMedia, setDisplayName, getViewSize, bindViewZoom,
 } from './media-library.js';
 import { pushUndo } from './undo.js';
+import { showCtxMenu } from './ctx-menu.js';
+import { requestAddToProgram } from './program-bridge.js';
+import { ensureLocalMediaMany } from './media-vault.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../lib/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
 
@@ -409,6 +412,17 @@ export function initPdf() {
     if (item && e.target.closest('[data-act="del"]')) return removeDoc(+item.dataset.i);
     if (item) selectDoc(+item.dataset.i);
   });
+  docList?.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.file-item');
+    if (!item) return;
+    const i = +item.dataset.i;
+    const d = docs[i];
+    if (!d?.path) return;
+    showCtxMenu(e, [
+      { label: '加入节目单（按页展开）', action: () => requestAddToProgram([d.path], 'pdf') },
+      { label: '从列表移除', danger: true, action: () => removeDoc(i) },
+    ]);
+  });
   $('pdf-doc-select')?.addEventListener('change', (e) => {
     const i = +e.target.value;
     if (Number.isFinite(i) && i >= 0) selectDoc(i).catch(() => {});
@@ -450,18 +464,41 @@ export function initPdf() {
     if (cell) showPage(+cell.dataset.i);
   });
 
+  async function importPdfPaths(paths) {
+    const raw = (paths || []).filter((p) => fileExt(p) === 'pdf');
+    const skipped = (paths || []).length - raw.length;
+    if (!raw.length) {
+      toast(skipped ? '当前是 PDF 页，请拖入 PDF 文件' : '没有可导入的 PDF');
+      return 0;
+    }
+    const files = await ensureLocalMediaMany(raw, 'pdf');
+    if (!files.length) return 0;
+    let added = 0;
+    for (const f of files) {
+      if (docs.some((d) => d.path === f)) continue;
+      registerStub(f);
+      added++;
+    }
+    persistPaths();
+    renderDocs();
+    if (currentDoc < 0 && docs.length) {
+      const grid = $('pdf-grid');
+      if (grid) grid.innerHTML = '<div class="empty-tip big">点击左侧文档列表打开预览</div>';
+    }
+    const tip = added ? `已添加 ${added} 个到 PDF 库（已存应用目录）` : '这些文档已在库里';
+    toast(skipped ? `${tip}（跳过 ${skipped} 个非 PDF）` : tip);
+    return added;
+  }
+
   document.addEventListener('sp:import-pdf', async () => {
     const files = await pickFiles([{ name: 'PDF', extensions: ['pdf'] }], '导入 PDF');
     if (!files.length) return;
-    for (const f of files) {
-      try {
-        const di = await openPdf(f);
-        if (currentDoc < 0) await selectDoc(di);
-      } catch (err) {
-        toast(`打开失败：${fileName(f)} — ${err}`, 6000);
-      }
-    }
-    renderDocs();
+    await importPdfPaths(files);
+  });
+
+  document.addEventListener('sp:drop-files', (e) => {
+    if (e.detail?.module !== 'pdf') return;
+    importPdfPaths(e.detail.paths || []);
   });
 
   document.addEventListener('sp:clear-list', () => {

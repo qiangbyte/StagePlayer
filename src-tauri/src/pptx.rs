@@ -751,3 +751,185 @@ fn parse_pptx_blocking(path: String, cache_root: Option<PathBuf>) -> Result<Pptx
     };
     Ok(doc)
 }
+
+/// 读文件头：OOXML（pptx）以 PK 开头，旧版二进制 ppt 是 OLE（D0 CF 11 E0）
+fn file_magic(path: &Path) -> Result<[u8; 8], String> {
+  let mut f = fs::File::open(path).map_err(|e| format!("打不开文件：{e}"))?;
+  let mut magic = [0u8; 8];
+  f.read_exact(&mut magic).map_err(|e| format!("读取文件失败：{e}"))?;
+  Ok(magic)
+}
+
+fn is_ooxml(magic: &[u8]) -> bool {
+  magic.starts_with(b"PK")
+}
+
+fn is_ole_ppt(magic: &[u8]) -> bool {
+  magic.starts_with(&[0xD0, 0xCF, 0x11, 0xE0])
+}
+
+/// 把旧版 .ppt 转成可解析的 .pptx 路径；已经是 pptx 则原样返回。
+/// Windows 上用本机已安装的 PowerPoint 做转换；没有 PowerPoint 时请先另存为 pptx。
+#[tauri::command]
+pub async fn ensure_pptx(app: AppHandle, path: String) -> Result<String, String> {
+  let path = path.trim().trim_matches('"').to_string();
+  if path.is_empty() {
+    return Err("没有选择文件".into());
+  }
+  let src = PathBuf::from(&path);
+  if !src.is_file() {
+    return Err(format!("找不到文件：{path}"));
+  }
+  let magic = file_magic(&src)?;
+  if is_ooxml(&magic) {
+    return Ok(path);
+  }
+  if !is_ole_ppt(&magic) {
+    return Err("不是 PowerPoint 文件（需要 .ppt 或 .pptx）".into());
+  }
+  #[cfg(not(windows))]
+  {
+    let _ = app;
+    return Err("旧版 .ppt 需要先用 PowerPoint / WPS 另存为 .pptx 再导入".into());
+  }
+  #[cfg(windows)]
+  {
+    let cache = app
+      .path()
+      .app_cache_dir()
+      .map_err(|e| e.to_string())?
+      .join("ppt-convert");
+    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    // 同一份 ppt（路径+修改时间+大小）只转一次
+    let meta = fs::metadata(&src).map_err(|e| e.to_string())?;
+    let mut h = Sha256::new();
+    h.update(src.to_string_lossy().as_bytes());
+    if let Ok(t) = meta.modified() {
+      if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+        h.update(d.as_secs().to_le_bytes());
+      }
+    }
+    h.update(meta.len().to_le_bytes());
+    let key = format!("{:x}", h.finalize());
+    let dst = cache.join(format!("{}.pptx", &key[..16]));
+    if dst.is_file() && dst.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+      return Ok(dst.to_string_lossy().into_owned());
+    }
+    let dst2 = dst.clone();
+    tauri::async_runtime::spawn_blocking(move || convert_ppt_with_powerpoint(&src, &dst2))
+      .await
+      .map_err(|e| e.to_string())??;
+    Ok(dst.to_string_lossy().into_owned())
+  }
+}
+
+#[cfg(windows)]
+fn convert_ppt_with_powerpoint(src: &Path, dst: &Path) -> Result<(), String> {
+  use std::process::Command;
+  // 路径写进临时 ps1，避免中文 / 空格在 -Command 里被拆坏
+  let script_path = dst.with_extension("ps1");
+  let src_s = src.to_string_lossy().replace('\'', "''");
+  let dst_s = dst.to_string_lossy().replace('\'', "''");
+  let script = format!(
+    r#"$ErrorActionPreference = 'Stop'
+$src = '{src_s}'
+$dst = '{dst_s}'
+$ppt = New-Object -ComObject PowerPoint.Application
+try {{
+  # 不能隐藏主窗口（Office 限制），但 WithWindow=$false 不单独弹文稿窗
+  $ppt.Visible = 1
+  $pres = $ppt.Presentations.Open($src, $true, $false, $false)
+  try {{
+    if (Test-Path -LiteralPath $dst) {{ Remove-Item -LiteralPath $dst -Force }}
+    $pres.SaveAs($dst, 24) # ppSaveAsOpenXMLPresentation
+  }} finally {{
+    $pres.Close()
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($pres)
+  }}
+}} finally {{
+  $ppt.Quit()
+  [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt)
+  [GC]::Collect()
+}}
+if (-not (Test-Path -LiteralPath $dst)) {{ throw '转换后没有生成 pptx 文件' }}
+"#
+  );
+  fs::write(&script_path, script).map_err(|e| format!("写转换脚本失败：{e}"))?;
+  let out = Command::new("powershell")
+    .args([
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      script_path.to_string_lossy().as_ref(),
+    ])
+    .output()
+    .map_err(|e| format!("无法启动 PowerShell：{e}"))?;
+  let _ = fs::remove_file(&script_path);
+  if !out.status.success() {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let detail = format!("{err}{stdout}").trim().to_string();
+    if detail.to_ascii_lowercase().contains("powerpoint.application")
+      || detail.contains("80040154")
+      || detail.contains("COM")
+    {
+      return Err("本机没有安装 Microsoft PowerPoint，无法直接导入旧版 .ppt。请用 PowerPoint / WPS 另存为 .pptx 后再导入".into());
+    }
+    return Err(if detail.is_empty() {
+      "旧版 .ppt 转换失败".into()
+    } else {
+      format!("旧版 .ppt 转换失败：{detail}")
+    });
+  }
+  if !dst.is_file() {
+    return Err("转换后没有生成 pptx 文件".into());
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod lyrics_import_tests {
+  use super::*;
+
+  fn slide_plain(s: &Slide) -> Vec<String> {
+    let mut boxes = s.text_boxes.clone();
+    boxes.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap().then(a.x.partial_cmp(&b.x).unwrap()));
+    let mut lines = Vec::new();
+    for b in boxes {
+      for ln in b.lines {
+        let t = ln.text.replace('\u{000b}', "\n");
+        for part in t.split('\n') {
+          let p = part.trim();
+          if !p.is_empty() {
+            lines.push(p.to_string());
+          }
+        }
+      }
+    }
+    lines
+  }
+
+  #[test]
+  fn parse_worship_pptx_title_and_lyric_slides() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tmp-worship.pptx");
+    if !path.is_file() {
+      eprintln!("skip: tmp-worship.pptx missing");
+      return;
+    }
+    let doc = parse_pptx_blocking(path.to_string_lossy().into_owned(), None).expect("parse");
+    assert_eq!(doc.slides.len(), 35);
+    let s1 = slide_plain(&doc.slides[0]);
+    assert!(s1.iter().any(|l| l.contains("如鹿切慕溪水")), "{s1:?}");
+    assert!(s1.iter().any(|l| l.contains("所属歌手")), "{s1:?}");
+    let s2 = slide_plain(&doc.slides[1]);
+    assert_eq!(s2.len(), 4, "{s2:?}");
+    let titles: Vec<_> = doc
+      .slides
+      .iter()
+      .map(slide_plain)
+      .filter(|l| l.iter().any(|x| x.contains("所属歌手")))
+      .collect();
+    assert_eq!(titles.len(), 4, "{titles:?}");
+  }
+}

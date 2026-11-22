@@ -8,6 +8,9 @@ import { pushToOutput, claimOutputSeq, getCurrentOutput } from './output-main.js
 import { renderOutput } from './output-core.js';
 import { pushUndo } from './undo.js';
 import { readPect } from './pect-import.js';
+import { readPptLyrics } from './ppt-lyrics-import.js';
+import { showCtxMenu } from './ctx-menu.js';
+import { ensureLocalMedia } from './media-vault.js';
 import {
   parseLyricSheet, paletteFromColor, hslToHex, LSHOW_SWATCHES, defaultLshowBg,
 } from './lyrics-show-render.js';
@@ -689,7 +692,7 @@ function renderList() {
         <span class="fi-icon">词</span>
         <span class="fi-name" title="${esc(s.title)}">${esc(s.title || '未命名')}</span>
       </div>`).join('')
-    : `<div class="empty-tip">${songs.length ? '没有匹配的歌' : '点「＋新歌」或「导入」添加歌词'}</div>`;
+    : `<div class="empty-tip">${songs.length ? '没有匹配的歌' : '点「＋新歌」或「导入」添加歌词（支持 txt / lrc / pect / ppt / pptx）'}</div>`;
 }
 
 function renderEditor() {
@@ -872,13 +875,32 @@ export function addLyricSongs(list) {
   return out;
 }
 
-async function importFiles() {
-  const files = await pickFiles([{ name: '歌词 / 诗歌演示', extensions: ['txt', 'lrc', 'pect'] }], '导入歌词');
+async function importLyricPaths(paths) {
+  const files = (paths || []).filter((p) => /\.(txt|lrc|pect|pptx?)$/i.test(p));
+  const skipped = (paths || []).length - files.length;
+  if (!files.length) {
+    toast(skipped ? '当前是歌词页，请拖入 txt / lrc / pect / ppt / pptx' : '没有可导入的歌词文件');
+    return 0;
+  }
+  toast(files.length > 1 ? `正在复制 ${files.length} 个文件到应用库…` : '正在复制到应用库…');
   let n = 0;
-  for (const p of files) {
+  for (const raw of files) {
+    let p = raw;
+    try {
+      p = await ensureLocalMedia(raw, 'lyrics');
+    } catch (err) {
+      toast(`复制失败：${fileName(raw)}（${err?.message || err}）`, 6000);
+      continue;
+    }
     try {
       if (/\.pect$/i.test(p)) {
         const { songs: list } = await readPect(p);
+        n += addLyricSongs(list).length;
+        continue;
+      }
+      if (/\.pptx?$/i.test(p)) {
+        toast(`正在识别 ${fileName(p)} 的歌词…`);
+        const { songs: list } = await readPptLyrics(p);
         n += addLyricSongs(list).length;
         continue;
       }
@@ -886,10 +908,21 @@ async function importFiles() {
       newSong(fileName(p).replace(/\.[^.]+$/, ''), text);
       n += 1;
     } catch (err) {
-      toast(`读取失败：${fileName(p)}（${err}）`, 5000);
+      toast(`读取失败：${fileName(p)}（${err?.message || err}）`, 7000);
     }
   }
-  if (n) toast(`已导入 ${n} 首歌词`);
+  if (n) toast(skipped ? `已导入 ${n} 首歌词（跳过 ${skipped} 个其他文件）` : `已导入 ${n} 首歌词`);
+  else if (skipped) toast(`跳过 ${skipped} 个不支持的文件`);
+  return n;
+}
+
+async function importFiles() {
+  const files = await pickFiles(
+    [{ name: '歌词 / 诗歌演示 / PPT', extensions: ['txt', 'lrc', 'pect', 'ppt', 'pptx'] }],
+    '导入歌词'
+  );
+  if (!files.length) return;
+  await importLyricPaths(files);
 }
 
 /** 从背景图取主色（经 Rust 生成的缩略图，避免跨域画布受限） */
@@ -954,12 +987,51 @@ export function initLyricsShow() {
     const s = it && libSong(it.dataset.id);
     if (s) loadSong(s);
   });
+  $('lyrics-songs')?.addEventListener('contextmenu', (e) => {
+    const it = e.target.closest('.file-item');
+    const s = it && libSong(it.dataset.id);
+    if (!s) return;
+    showCtxMenu(e, [
+      {
+        label: '加入节目单',
+        action: () => {
+          loadSong(s);
+          addToProgram();
+        },
+      },
+      {
+        label: '删除这首',
+        danger: true,
+        action: () => {
+          if (!window.confirm(`删除「${s.title || '未命名'}」？`)) return;
+          const removed = s;
+          const at = songs.findIndex((x) => x.id === removed.id);
+          songs = songs.filter((x) => x.id !== removed.id);
+          saveSongs();
+          if (song?.id === removed.id) {
+            song = null;
+            loadSong(songs[0] || null);
+          } else renderList();
+          pushUndo(`删除歌词「${removed.title}」`, () => {
+            if (libSong(removed.id)) return;
+            songs.splice(Math.min(at, songs.length), 0, removed);
+            saveSongs();
+            loadSong(removed);
+          });
+        },
+      },
+    ]);
+  });
   $('lyrics-search')?.addEventListener('input', (e) => { filter = e.target.value; renderList(); });
   $('lyrics-new')?.addEventListener('click', () => {
     newSong();
     $('lshow-title')?.select();
   });
   document.addEventListener('sp:import-lyrics', importFiles);
+  document.addEventListener('sp:drop-files', (e) => {
+    if (e.detail?.module !== 'lyrics') return;
+    importLyricPaths(e.detail.paths || []);
+  });
 
   $('lshow-title')?.addEventListener('input', (e) => {
     touchSong((s) => { s.title = e.target.value.trim() || '未命名'; });

@@ -187,6 +187,7 @@ html[data-theme="light"] {
   --c-d8dbe6: #242735;
   --c-d8e4ff: #1c59e3;
   --c-dddddd: #2e2e2e;
+  --c-e07078: #a6242d;
   --c-e0e0e6: #25252d;
   --c-e2e2e6: #26262b;
   --c-e2e2e8: #24242c;
@@ -422,6 +423,7 @@ html[data-theme="sepia"] {
   --c-d8dbe6: #2e2922;
   --c-d8e4ff: #1c59e3;
   --c-dddddd: #302b23;
+  --c-e07078: #a6242d;
   --c-e0e0e6: #2b261f;
   --c-e2e2e6: #2a261f;
   --c-e2e2e8: #2a251e;
@@ -657,6 +659,7 @@ html[data-theme="midnight"] {
   --c-d8dbe6: #bdc8e2;
   --c-d8e4ff: #d8e4ff;
   --c-dddddd: #c3c9d8;
+  --c-e07078: #e07078;
   --c-e0e0e6: #c6cee1;
   --c-e2e2e6: #c8cfe0;
   --c-e2e2e8: #c8d0e2;

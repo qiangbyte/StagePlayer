@@ -4843,7 +4843,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stage-player"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64 0.22.1",
  "cpal",
@@ -4868,6 +4868,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "windows 0.62.2",
+ "windows-future",
  "zip 2.6.1",
 ]
 

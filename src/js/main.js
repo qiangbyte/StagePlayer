@@ -1,8 +1,8 @@
 // 主控窗口入口：模块切换、侧栏、输出控制、快捷键
 
 import { initTimers } from './timers.js';
-import { initAudio, toggleAudio, audioStep, audioSelectStep, playSelectedAudio, nudgeAudioVolume } from './audio.js';
-import { initVideo } from './video.js';
+import { initAudio, toggleAudio, audioStep, audioSelectStep, playSelectedAudio, nudgeAudioVolume, restartAudio } from './audio.js';
+import { initVideo, restartVideo } from './video.js';
 import { initPpt, pptNavigate } from './ppt.js';
 import { initPdf, pdfNavigate } from './pdf.js';
 import { initProgram, programGo, programStep, programActiveType } from './program.js';
@@ -384,6 +384,10 @@ function showVolumeToast(v) {
 }
 
 function initKeyboard() {
+  // G 连按两次（约 450ms 内）= 从头重新播放当前音乐/视频
+  let lastGAt = 0;
+  const G_DOUBLE_MS = 450;
+
   // 输出窗口获得焦点时，按键转发到这里（全屏在同一块屏上时常见）
   listen('output:key', (ev) => {
     const k = ev.payload || {};
@@ -451,17 +455,32 @@ function initKeyboard() {
       return;
     }
 
-    // 演出节目单：Enter = 下一条；G = 播放当前；Shift+Enter = 上一条
-    if (module === 'program') {
-      if (e.key === 'Enter') {
+    // 演出节目单：Enter = 下一条；Shift+Enter = 上一条
+    if (module === 'program' && e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) programStep(-1);
+      else programStep(1);
+      return;
+    }
+
+    // G：播放/暂停；连按两次 = 从头重新播放（音乐 / 视频 / 节目单当前条）
+    if (e.key === 'g' || e.key === 'G') {
+      const onAudio = module === 'audio' || (module === 'program' && programActiveType() === 'audio');
+      const onVideo = module === 'video' || (module === 'program' && programActiveType() === 'video');
+      const onProgram = module === 'program';
+      if (onAudio || onVideo || onProgram) {
         e.preventDefault();
-        if (e.shiftKey) programStep(-1);
-        else programStep(1);
-        return;
-      }
-      if (e.key === 'g' || e.key === 'G') {
-        e.preventDefault();
-        programGo();
+        const now = performance.now();
+        const isDouble = now - lastGAt < G_DOUBLE_MS;
+        lastGAt = now;
+        if (isDouble) {
+          if (onAudio) restartAudio();
+          else if (onVideo) restartVideo();
+          return;
+        }
+        if (onProgram) programGo();
+        else if (module === 'audio') toggleAudio();
+        else if (module === 'video') $('video-play')?.click();
         return;
       }
     }

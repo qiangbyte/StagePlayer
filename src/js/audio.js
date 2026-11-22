@@ -1,6 +1,9 @@
 // 音频模块：波形 / 频谱 / LED 计时 + 活动目录绑定
 
-import { pickFiles, esc, fileName, lsGet, lsGetCached, lsSet, invoke, listen, toast, AUDIO_EXT } from './util.js';
+import { pickFiles, esc, fileName, fileExt, lsGet, lsGetCached, lsSet, invoke, listen, toast, AUDIO_EXT } from './util.js';
+import { showCtxMenu } from './ctx-menu.js';
+import { requestAddToProgram } from './program-bridge.js';
+import { ensureLocalMediaMany } from './media-vault.js';
 import {
   bindMetersHost, analyze, drawSpectrum, drawVU, resetMeters, resetClip, meterReadings,
 } from './audio-meters.js';
@@ -998,8 +1001,10 @@ function saveCueFromBar() {
 async function startPlayback(startAt = 0, opts = {}) {
   if (!currentPath) return;
   const cue = getItemCue(currentPath);
-  // 显式传入优先；否则用本曲设置的起播点
-  const at = Number.isFinite(startAt) && startAt > 0 ? startAt : (cue.startAt || 0);
+  // forceAt：按传入秒数起播（含 0）；否则 >0 用传入值，否则用本曲起播点
+  const at = opts.forceAt
+    ? (Number.isFinite(startAt) ? Math.max(0, startAt) : 0)
+    : (Number.isFinite(startAt) && startAt > 0 ? startAt : (cue.startAt || 0));
   fadeOutStarted = false;
   cancelFade();
   // 起播期间引擎里还是旧歌：先不认它，旧歌此时报的「播完」一律忽略
@@ -1099,6 +1104,24 @@ export async function toggleAudio() {
     paintSongActive();
   } catch (err) {
     toast('操作失败：' + err);
+  }
+}
+
+/** 从头（或本曲起播点）重新播放；G 连按两次用 */
+export async function restartAudio() {
+  if (!currentPath) {
+    const first = eventAudioItems()[0];
+    if (first) return loadFile(first.path, true, { skipList: true }).catch(() => {});
+    toast('请先导入音频');
+    return;
+  }
+  const cue = getItemCue(currentPath);
+  const at = cue.startAt || 0;
+  try {
+    await startPlayback(at, { skipList: true, forceAt: true });
+    toast(at > 0 ? `已从 ${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, '0')} 重新播放` : '已重新播放');
+  } catch (err) {
+    toast('重新播放失败：' + (err?.message || err));
   }
 }
 
@@ -1984,6 +2007,17 @@ export function initAudio() {
     if (panel?.classList.contains('active')) draw();
   }, 100);
 
+  // 右键：加入当前节目单（不删曲库）
+  list?.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.audio-card, .song-row, .file-item');
+    if (!item?.dataset.path) return;
+    const path = item.dataset.path;
+    showCtxMenu(e, [
+      { label: '加入节目单', action: () => requestAddToProgram([path], 'audio') },
+      { label: '从音乐库移除', danger: true, action: () => removeAudioItem(path) },
+    ]);
+  });
+
   // 单击卡片即播；右上角切换 单曲循环 ↔ 自动下一首
   let lastCardClick = { path: null, at: 0 };
   list?.addEventListener('click', (e) => {
@@ -2259,9 +2293,16 @@ export function initAudio() {
     else toast('请先选择音频');
   });
 
-  document.addEventListener('sp:import-audio', async () => {
-    const files = await pickFiles([{ name: '音频', extensions: AUDIO_EXT }], '导入音频');
-    if (!files.length) return;
+  /** 把音频路径写入音乐库（按钮导入 / 拖放共用）；非音频会被跳过；会先复制进应用库 */
+  async function importAudioPaths(paths) {
+    const raw = (paths || []).filter((p) => AUDIO_EXT.includes(fileExt(p)));
+    const skipped = (paths || []).length - raw.length;
+    if (!raw.length) {
+      toast(skipped ? '当前是音频页，请拖入音频文件' : '没有可导入的音频');
+      return 0;
+    }
+    const files = await ensureLocalMediaMany(raw, 'audio');
+    if (!files.length) return 0;
     let added = 0;
     const ok = updateLibrary((items) => {
       for (const f of files) {
@@ -2270,13 +2311,31 @@ export function initAudio() {
         added++;
       }
     });
-    if (!ok) return toast('保存曲库失败');
+    if (!ok) {
+      toast('保存曲库失败');
+      return 0;
+    }
     renderList();
-    toast(added ? `已添加 ${added} 首到音乐库` : '这些歌已在音乐库里');
+    const tip = added
+      ? `已添加 ${added} 首到音乐库（已存应用目录）`
+      : '这些歌已在音乐库里';
+    toast(skipped ? `${tip}（跳过 ${skipped} 个非音频）` : tip);
     if (!currentPath) {
       const first = eventAudioItems()[0];
       if (first) loadFile(first.path, false);
     }
+    return added;
+  }
+
+  document.addEventListener('sp:import-audio', async () => {
+    const files = await pickFiles([{ name: '音频', extensions: AUDIO_EXT }], '导入音频');
+    if (!files.length) return;
+    await importAudioPaths(files);
+  });
+
+  document.addEventListener('sp:drop-files', (e) => {
+    if (e.detail?.module !== 'audio') return;
+    importAudioPaths(e.detail.paths || []);
   });
 
   $('audio-pack-export')?.addEventListener('click', () => exportAudioPack());
