@@ -17,9 +17,15 @@ const QWEN_CHAT_URL: &str = "https://maas.qianwenaiapi.com/compatible-mode/v1/ch
 /// ChatGPT 兼容中转（OpenAI /v1/chat/completions）
 const CHATGPT_URL: &str = "https://sub.601730.xyz/v1/chat/completions";
 /// 文稿不超过这个字数时一次性总结
-const SINGLE_MAX_CHARS: usize = 30_000;
-/// 超长文稿分段时每段字数
-const PART_CHARS: usize = 18_000;
+const SINGLE_MAX_CHARS: usize = 28_000;
+/// 超长文稿分段时每段目标字数（优先在章节边界切开）
+const PART_CHARS: usize = 14_000;
+/// 各段笔记拼起来超过这个字数时，先做一层「组内合并」再出全书总结
+const NOTES_DIRECT_MAX: usize = 22_000;
+/// 组内合并时，每组大约覆盖多少字的笔记
+const NOTES_GROUP_CHARS: usize = 10_000;
+/// 滚动「前文脉络」带给下一段的上限，避免提示词膨胀
+const BRIDGE_MAX_CHARS: usize = 1_800;
 /// 前端传入的文稿上限（防误操作）
 const TEXT_MAX_CHARS: usize = 600_000;
 
@@ -105,6 +111,45 @@ struct Creds {
   model: String,
 }
 
+/// 长文是否先走本地蒸馏模型
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum LocalMode {
+  #[default]
+  Off,
+  /// 分段提炼用本地，终稿用云端
+  Map,
+  /// 分段 + 组内合并用本地，终稿用云端
+  MapMerge,
+}
+
+impl LocalMode {
+  fn parse(s: &str) -> LocalMode {
+    match s.trim().to_ascii_lowercase().as_str() {
+      "map" | "local_map" | "local" => LocalMode::Map,
+      "map_merge" | "mapmerge" | "merge" => LocalMode::MapMerge,
+      _ => LocalMode::Off,
+    }
+  }
+  fn id(self) -> &'static str {
+    match self {
+      LocalMode::Off => "off",
+      LocalMode::Map => "map",
+      LocalMode::MapMerge => "map_merge",
+    }
+  }
+  fn label(self) -> &'static str {
+    match self {
+      LocalMode::Off => "关闭",
+      LocalMode::Map => "本地蒸馏分段 → 云端终稿",
+      LocalMode::MapMerge => "本地分段+合并 → 云端终稿",
+    }
+  }
+}
+
+/// 默认指向 LM Studio（本机常见）；Ollama 用户可改成 http://127.0.0.1:11434/v1
+const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:1234/v1";
+const DEFAULT_LOCAL_MODEL: &str = "qwen/qwen3.6-27b";
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Stored {
@@ -117,6 +162,25 @@ struct Stored {
   qwen: Creds,
   #[serde(default)]
   chatgpt: Creds,
+  /// off | map | map_merge
+  #[serde(default)]
+  local_preprocess: String,
+  /// OpenAI 兼容根路径，如 http://127.0.0.1:11434/v1
+  #[serde(default)]
+  local_base_url: String,
+  #[serde(default)]
+  local_model: String,
+  /// 本地服务可选 Key（Ollama 可空；LM Studio 有时需要）
+  #[serde(default)]
+  local_api_key: String,
+}
+
+#[derive(Clone)]
+struct LocalCfg {
+  mode: LocalMode,
+  base_url: String,
+  model: String,
+  api_key: String,
 }
 
 impl Stored {
@@ -135,6 +199,25 @@ impl Stored {
       Vendor::Deepseek => &mut self.deepseek,
       Vendor::Qwen => &mut self.qwen,
       Vendor::Chatgpt => &mut self.chatgpt,
+    }
+  }
+  fn local_cfg(&self) -> LocalCfg {
+    let mode = LocalMode::parse(&self.local_preprocess);
+    let base = self.local_base_url.trim();
+    let model = self.local_model.trim();
+    LocalCfg {
+      mode,
+      base_url: if base.is_empty() {
+        DEFAULT_LOCAL_URL.into()
+      } else {
+        base.trim_end_matches('/').to_string()
+      },
+      model: if model.is_empty() {
+        DEFAULT_LOCAL_MODEL.into()
+      } else {
+        model.to_string()
+      },
+      api_key: self.local_api_key.trim().to_string(),
     }
   }
 }
@@ -198,11 +281,24 @@ pub struct VendorView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LocalView {
+  mode: String,
+  mode_label: String,
+  base_url: String,
+  model: String,
+  default_url: String,
+  default_model: String,
+  has_key: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiSettingsView {
   provider: String,
   deepseek: VendorView,
   qwen: VendorView,
   chatgpt: VendorView,
+  local: LocalView,
 }
 
 fn vendor_view(s: &Stored, v: Vendor) -> VendorView {
@@ -220,21 +316,36 @@ fn vendor_view(s: &Stored, v: Vendor) -> VendorView {
   }
 }
 
+fn local_view(s: &Stored) -> LocalView {
+  let cfg = s.local_cfg();
+  LocalView {
+    mode: cfg.mode.id().into(),
+    mode_label: cfg.mode.label().into(),
+    base_url: cfg.base_url,
+    model: cfg.model,
+    default_url: DEFAULT_LOCAL_URL.into(),
+    default_model: DEFAULT_LOCAL_MODEL.into(),
+    has_key: !s.local_api_key.trim().is_empty(),
+  }
+}
+
 fn view_of(s: &Stored) -> AiSettingsView {
   AiSettingsView {
     provider: s.vendor().id().into(),
     deepseek: vendor_view(s, Vendor::Deepseek),
     qwen: vendor_view(s, Vendor::Qwen),
     chatgpt: vendor_view(s, Vendor::Chatgpt),
+    local: local_view(s),
   }
 }
 
 fn valid_model(m: &str) -> bool {
+  // 允许 Ollama 的 qwen2.5:3b，以及 LM Studio 的 qwen/qwen3.6-27b、variant@quant
   !m.is_empty()
-    && m.len() <= 64
+    && m.len() <= 96
     && m
       .chars()
-      .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+      .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
 }
 
 #[tauri::command]
@@ -252,6 +363,34 @@ pub struct AiSettingsInput {
   api_key: Option<String>,
   model: Option<String>,
   clear_key: Option<bool>,
+  /// off | map | map_merge
+  local_preprocess: Option<String>,
+  local_base_url: Option<String>,
+  local_model: Option<String>,
+  local_api_key: Option<String>,
+  clear_local_key: Option<bool>,
+}
+
+fn normalize_local_url(raw: &str) -> Result<String, String> {
+  let u = raw.trim().trim_end_matches('/').to_string();
+  if u.is_empty() {
+    return Ok(DEFAULT_LOCAL_URL.into());
+  }
+  if !(u.starts_with("http://") || u.starts_with("https://")) {
+    return Err("本地地址需以 http:// 或 https:// 开头".into());
+  }
+  if u.len() > 200 {
+    return Err("本地地址过长".into());
+  }
+  // 允许用户填到 /v1 或到根；统一成 …/v1
+  let base = if u.ends_with("/v1") {
+    u
+  } else if u.contains("/v1/") {
+    u.split("/v1/").next().unwrap_or(&u).to_string() + "/v1"
+  } else {
+    format!("{u}/v1")
+  };
+  Ok(base)
 }
 
 /// 只改传入的字段；api_key 为空表示不改；clear_key=true 清除该服务商的 Key
@@ -280,6 +419,27 @@ pub fn ai_settings_set(app: AppHandle, input: AiSettingsInput) -> Result<AiSetti
       return Err("模型名只能含字母、数字和 . _ - :".into());
     }
     s.creds_mut(v).model = m.to_string();
+  }
+  if let Some(mode) = input.local_preprocess.as_deref() {
+    s.local_preprocess = LocalMode::parse(mode).id().into();
+  }
+  if let Some(url) = input.local_base_url.as_deref() {
+    s.local_base_url = normalize_local_url(url)?;
+  }
+  if let Some(m) = input.local_model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    if !valid_model(m) {
+      return Err("本地模型名只能含字母、数字和 . _ - :".into());
+    }
+    s.local_model = m.to_string();
+  }
+  if input.clear_local_key.unwrap_or(false) {
+    s.local_api_key.clear();
+  }
+  if let Some(k) = input.local_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    if k.len() > 200 {
+      return Err("本地 API Key 过长".into());
+    }
+    s.local_api_key = k.to_string();
   }
   save_stored(&app, &s)?;
   Ok(view_of(&s))
@@ -341,6 +501,175 @@ fn api_error(v: Vendor, status: u16, body: &str) -> String {
   } else {
     format!("{name}：{head}（HTTP {status}）：{detail}")
   }
+}
+
+const LOCAL_SYSTEM: &str = "你是严谨的中文文稿蒸馏助手。只依据用户提供的正文提炼要点，不要编造。\
+输出简洁 Markdown。文稿可能有错字，人名术语结合上下文合理校正，不确定则保持原样。\
+不要输出思考过程、推理链或「好的我来…」类开场，直接从要点正文开始。";
+
+fn strip_local_noise(s: &str) -> String {
+  let mut t = s.trim().to_string();
+  // 常见思考标签：保留标签后的正文
+  for (a, b) in [
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reasoning>", "</reasoning>"),
+  ] {
+    while let Some(i) = t.find(a) {
+      if let Some(j) = t[i..].find(b) {
+        let end = i + j + b.len();
+        t.replace_range(i..end, "");
+      } else {
+        // 只有开头没有结尾：丢掉思考前缀
+        t = t[i + a.len()..].to_string();
+        break;
+      }
+    }
+  }
+  // 纯英文思考草稿时，尽量取最后一段像正文的部分
+  if t.lines().filter(|l| !l.trim().is_empty()).count() > 8
+    && t.contains("Thinking")
+    && !t.contains("##")
+    && !t.contains('第')
+  {
+    if let Some(last) = t
+      .split("\n\n")
+      .map(str::trim)
+      .filter(|p| p.chars().any(|c| c > '\u{7f}') || p.starts_with('#') || p.starts_with('-'))
+      .last()
+    {
+      return last.to_string();
+    }
+  }
+  t.trim().to_string()
+}
+
+fn message_text(v: &Value) -> String {
+  let msg = v.pointer("/choices/0/message");
+  let content = msg
+    .and_then(|m| m.get("content"))
+    .and_then(|c| c.as_str())
+    .unwrap_or("")
+    .trim();
+  let reasoning = msg
+    .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+    .and_then(|c| c.as_str())
+    .unwrap_or("")
+    .trim();
+  // 优先 content；Qwen3/LM Studio 常把结果放在 reasoning_content
+  let raw = if !content.is_empty() {
+    if reasoning.is_empty() {
+      content.to_string()
+    } else {
+      format!("{reasoning}\n{content}")
+    }
+  } else {
+    reasoning.to_string()
+  };
+  strip_local_noise(&raw)
+}
+
+/// 本地 OpenAI 兼容接口：非流式一次返回（适合 LM Studio / Ollama 做分段蒸馏）
+fn chat_local(
+  client: &reqwest::blocking::Client,
+  local: &LocalCfg,
+  user: &str,
+  cancel: &AtomicBool,
+) -> Result<String, String> {
+  if cancel.load(Ordering::SeqCst) {
+    return Err("已取消".into());
+  }
+  let url = format!("{}/chat/completions", local.base_url.trim_end_matches('/'));
+  // /no_think：Qwen3 系列常用关闭思考；enable_thinking=false 给兼容中转
+  let user_forced = format!("{user}\n\n/no_think");
+  let body = json!({
+    "model": local.model,
+    "messages": [
+      { "role": "system", "content": LOCAL_SYSTEM },
+      { "role": "user", "content": user_forced },
+    ],
+    "stream": false,
+    "temperature": 0.2,
+    "max_tokens": 8192,
+    "enable_thinking": false,
+  });
+  let mut req = client
+    .post(&url)
+    .header("Content-Type", "application/json")
+    .body(body.to_string());
+  let key = if local.api_key.is_empty() {
+    "lm-studio"
+  } else {
+    &local.api_key
+  };
+  req = req.bearer_auth(key);
+  let resp = req
+    .send()
+    .map_err(|e| format!("连接本地模型失败（{}）：{e}。请在 LM Studio 打开 Local Server（默认端口 1234）。", local.base_url))?;
+  let status = resp.status();
+  let txt = resp.text().unwrap_or_default();
+  if !status.is_success() {
+    let detail = serde_json::from_str::<Value>(&txt)
+      .ok()
+      .and_then(|v| {
+        v.pointer("/error/message")
+          .and_then(|m| m.as_str())
+          .map(|s| s.to_string())
+      })
+      .unwrap_or_else(|| txt.chars().take(180).collect());
+    return Err(format!(
+      "本地模型错误（HTTP {}）：{}。模型「{}」是否已加载？",
+      status.as_u16(),
+      detail,
+      local.model
+    ));
+  }
+  let v: Value = serde_json::from_str(&txt).map_err(|e| format!("本地模型返回无法解析：{e}"))?;
+  let content = message_text(&v);
+  if content.is_empty() {
+    return Err("本地模型没有返回内容（可能还在思考模式或上下文过长；可在 LM Studio 关闭 reasoning）".into());
+  }
+  Ok(content)
+}
+
+/// 探测本地服务是否可用；尽量列出已安装模型名
+#[tauri::command]
+pub async fn ai_local_probe(app: AppHandle) -> Result<serde_json::Value, String> {
+  tauri::async_runtime::spawn_blocking(move || {
+    let cfg = load_stored(&app).local_cfg();
+    let client = http_client(12)?;
+    let models_url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let mut req = client.get(&models_url);
+    let key = if cfg.api_key.is_empty() { "ollama" } else { cfg.api_key.as_str() };
+    req = req.bearer_auth(key);
+    let resp = req
+      .send()
+      .map_err(|e| format!("连不上本地服务 {}: {e}", cfg.base_url))?;
+    let status = resp.status();
+    let txt = resp.text().unwrap_or_default();
+    if !status.is_success() {
+      return Err(format!("本地服务 HTTP {}：{}", status.as_u16(), txt.chars().take(120).collect::<String>()));
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+      if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        for it in arr {
+          if let Some(id) = it.get("id").and_then(|x| x.as_str()) {
+            names.push(id.to_string());
+          }
+        }
+      }
+    }
+    Ok(json!({
+      "ok": true,
+      "baseUrl": cfg.base_url,
+      "model": cfg.model,
+      "models": names,
+      "modelReady": names.is_empty() || names.iter().any(|n| n == &cfg.model || n.starts_with(&format!("{}:", cfg.model)) || cfg.model.starts_with(n)),
+    }))
+  })
+  .await
+  .map_err(|e| e.to_string())?
 }
 
 /// 一次流式对话；on_delta 收到每个增量文本
@@ -417,28 +746,83 @@ fn chat_stream(
   Ok((full, truncated))
 }
 
-/// 按行聚合，每段不超过 max_chars；超长单行硬切
+fn char_len(s: &str) -> usize {
+  s.chars().count()
+}
+
+fn take_chars(s: &str, max: usize) -> String {
+  s.chars().take(max).collect()
+}
+
+/// 是否像章节/小节标题行（用于优先在边界处分段）
+fn looks_like_heading(line: &str) -> bool {
+  let t = line.trim();
+  if t.is_empty() || t.chars().count() > 48 {
+    return false;
+  }
+  if t.starts_with('#') {
+    return true;
+  }
+  let cn = regex_is_match(r"^第[一二三四五六七八九十百千零〇两\d]+[章节回卷篇部]", t);
+  let en = t.to_ascii_lowercase().starts_with("chapter ");
+  let page = regex_is_match(r"^\[?(?:第\s*)?\d+\s*页\]?$", t);
+  cn || en || page
+}
+
+/// 极简匹配，避免再引 regex crate：前缀/字符类够用
+fn regex_is_match(pat: &str, text: &str) -> bool {
+  match pat {
+    r"^第[一二三四五六七八九十百千零〇两\d]+[章节回卷篇部]" => {
+      let mut it = text.chars();
+      if it.next() != Some('第') {
+        return false;
+      }
+      let mut saw = false;
+      for c in it.by_ref() {
+        if "一二三四五六七八九十百千零〇两".contains(c) || c.is_ascii_digit() {
+          saw = true;
+          continue;
+        }
+        return saw && "章节回卷篇部".contains(c);
+      }
+      false
+    }
+    r"^\[?(?:第\s*)?\d+\s*页\]?$" => {
+      let t = text.trim().trim_matches(|c| c == '[' || c == ']');
+      let t = t.trim_start_matches('第').trim();
+      let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+      !digits.is_empty() && t[digits.len()..].trim() == "页"
+    }
+    _ => false,
+  }
+}
+
+/// 按行聚合；若遇章节标题且当前段已有一定篇幅，则在标题前切开
 fn split_text(text: &str, max_chars: usize) -> Vec<String> {
   let mut parts: Vec<String> = Vec::new();
   let mut cur = String::new();
   let mut cur_n = 0usize;
+  // 当前段至少写到这么多才允许「遇标题就切」，避免碎段
+  let soft_min = max_chars / 3;
+
   for line in text.lines() {
-    let line = line.trim();
+    let raw = line.trim_end();
+    let line = raw.trim();
     if line.is_empty() {
       continue;
     }
     let chars: Vec<char> = line.chars().collect();
-    let mut pieces: Vec<String> = Vec::new();
-    if chars.len() > max_chars {
-      for c in chars.chunks(max_chars) {
-        pieces.push(c.iter().collect());
-      }
+    let pieces: Vec<String> = if chars.len() > max_chars {
+      chars.chunks(max_chars).map(|c| c.iter().collect()).collect()
     } else {
-      pieces.push(line.to_string());
-    }
-    for p in pieces {
-      let n = p.chars().count();
-      if cur_n > 0 && cur_n + n + 1 > max_chars {
+      vec![line.to_string()]
+    };
+    for (pi, p) in pieces.into_iter().enumerate() {
+      let n = char_len(&p);
+      let at_heading = pi == 0 && looks_like_heading(&p);
+      if cur_n > 0
+        && (cur_n + n + 1 > max_chars || (at_heading && cur_n >= soft_min))
+      {
         parts.push(std::mem::take(&mut cur));
         cur_n = 0;
       }
@@ -453,7 +837,159 @@ fn split_text(text: &str, max_chars: usize) -> Vec<String> {
   if !cur.is_empty() {
     parts.push(cur);
   }
+  if parts.is_empty() && !text.trim().is_empty() {
+    parts.push(text.trim().to_string());
+  }
   parts
+}
+
+/// 从本段笔记里抽出「术语 / 关联 / 线索」作下一段的前文脉络
+fn bridge_from_note(note: &str) -> String {
+  let mut keep = String::new();
+  let mut take = false;
+  for line in note.lines() {
+    let t = line.trim();
+    if t.starts_with("## ") {
+      take = t.contains("人名")
+        || t.contains("术语")
+        || t.contains("关联")
+        || t.contains("线索")
+        || t.contains("论点");
+    }
+    if take {
+      keep.push_str(line);
+      keep.push('\n');
+    }
+  }
+  if keep.trim().is_empty() {
+    keep = take_chars(note, BRIDGE_MAX_CHARS);
+  }
+  let s = keep.trim().to_string();
+  if char_len(&s) > BRIDGE_MAX_CHARS {
+    format!("{}…", take_chars(&s, BRIDGE_MAX_CHARS.saturating_sub(1)))
+  } else {
+    s
+  }
+}
+
+fn peek_title(part: &str) -> String {
+  for line in part.lines() {
+    let t = line.trim();
+    if t.is_empty() {
+      continue;
+    }
+    if looks_like_heading(t) || t.starts_with('#') {
+      return take_chars(t.trim_start_matches('#').trim(), 40);
+    }
+    return take_chars(t, 36);
+  }
+  "（本段）".into()
+}
+
+fn map_part_prompt(i: usize, n: usize, title: &str, bridge: &str, part: &str) -> String {
+  let bridge_block = if bridge.trim().is_empty() {
+    "（这是首段，暂无前文）".to_string()
+  } else {
+    bridge.to_string()
+  };
+  format!(
+    "你正在整理同一本长书/长文稿的第 {i}/{n} 段（本段开头线索：{title}）。\n\
+目标：为后续「全书总结」准备可拼接的笔记，必须保留与前后文的关联，禁止写成孤立摘要。\n\n\
+【前文脉络】（供对照呼应，勿重复扩写）\n{bridge_block}\n\n\
+请只依据【本段正文】输出 Markdown，严格使用下列小标题（没有的写「无」）：\n\
+## 本段定位\n一句话说明本段在全书中的作用（开篇/推进/转折/收束等）。\n\
+## 论点与结构\n按原顺序列 3～8 条要点，保留关键推理，不要流水账。\n\
+## 关键事实 / 案例 / 引用\n人物、事件、数据、经文或原话（短引即可）。\n\
+## 人名 / 术语 / 专名\n本段出现且后文可能再用的名称。\n\
+## 与前文的关联\n呼应、对比、延续、反转、补证；若看不出关联，写「本段未见明显关联」。\n\
+## 未完线索\n留下的问题、伏笔、待展开论点（供后段对照）。\n\n\
+要求：约 450～850 字；不要写全书总评；不要编造本段未出现的内容。\n\n\
+【本段正文】\n{part}"
+  )
+}
+
+fn merge_notes_prompt(chunk_notes: &str, group_i: usize, group_n: usize) -> String {
+  format!(
+    "下面是同一长书/长文稿的第 {group_i}/{group_n} 组分段笔记（已按原文顺序）。\n\
+请合并为一份「中层纪要」，要求：\n\
+1. 打通组内各段关联，按主题归类，禁止「第1段/第2段」流水账；\n\
+2. 保留反复出现的人物、术语、主线与未完线索；\n\
+3. 注明组内前后呼应或矛盾；\n\
+4. 输出 Markdown，约 600～1200 字，不要写全书终章总评。\n\n\
+【本组笔记】\n{chunk_notes}"
+  )
+}
+
+fn final_synth_prompt(user_prompt: &str, n_parts: usize, notes_body: &str) -> String {
+  format!(
+    "{user_prompt}\n\n\
+【长文合成说明——必须遵守】\n\
+你拿到的不是原文，而是按顺序提炼的分段笔记（全文共约 {n_parts} 段加工）。请据此完成「一整本书/整篇文稿」的总结：\n\
+1. **主线优先**：找出贯穿前后的核心问题、立场或叙事弧，写成一气呵成的整体，禁止按「第1段、第2段」复述。\n\
+2. **关联显性化**：把跨段呼应、对比、递进、反转写进「内容解读」或等价板块；前后矛盾处如实标出。\n\
+3. **人物与术语统一**：同一人/概念前后称呼不一致时，选笔记中最清楚的写法并保持一致。\n\
+4. **结构按主题**：板块按逻辑主题划分（通常 4～8 个），可对应原书章节精神，但不要机械复制分段编号。\n\
+5. **忠实笔记**：笔记未出现的情节、观点、数据不得编造；若信息不足，写「文稿/笔记未明确提及」。\n\n\
+【各段/各组笔记（原文顺序）】\n{notes_body}"
+  )
+}
+
+/// 把笔记列表按字数打包成若干组
+fn pack_note_groups(notes: &[String], max_chars: usize) -> Vec<String> {
+  let mut groups: Vec<String> = Vec::new();
+  let mut cur = String::new();
+  let mut cur_n = 0usize;
+  for note in notes {
+    let n = char_len(note);
+    if cur_n > 0 && cur_n + n + 2 > max_chars {
+      groups.push(std::mem::take(&mut cur));
+      cur_n = 0;
+    }
+    if !cur.is_empty() {
+      cur.push_str("\n\n");
+      cur_n += 2;
+    }
+    cur.push_str(note);
+    cur_n += n;
+  }
+  if !cur.is_empty() {
+    groups.push(cur);
+  }
+  groups
+}
+
+/// 分段/合并调用：优先本地蒸馏；失败则回退云端（避免整次总结中断）
+fn distill_once(
+  client: &reqwest::blocking::Client,
+  local: &LocalCfg,
+  use_local: bool,
+  v: Vendor,
+  key: &str,
+  model: &str,
+  user: &str,
+  cancel: &AtomicBool,
+  fallback_warned: &mut bool,
+  app: &AppHandle,
+) -> Result<String, String> {
+  if use_local {
+    match chat_local(client, local, user, cancel) {
+      Ok(s) => return Ok(s),
+      Err(e) => {
+        if !*fallback_warned {
+          *fallback_warned = true;
+          emit(
+            app,
+            "progress",
+            &format!("本地蒸馏暂不可用，本段起改用云端：{e}"),
+            None,
+            None,
+          );
+        }
+      }
+    }
+  }
+  let (full, _) = chat_stream(client, v, key, model, user, cancel, &mut |_: &str| {})?;
+  Ok(full)
 }
 
 fn run_summary(
@@ -463,11 +999,12 @@ fn run_summary(
   model: &str,
   prompt: &str,
   text: &str,
+  local: LocalCfg,
   cancel: &AtomicBool,
 ) -> Result<String, String> {
   let client = http_client(900)?;
   let label = v.label();
-  let total_chars = text.chars().count();
+  let total_chars = char_len(text);
   let mut on_delta = |s: &str| emit(app, "delta", "", Some(s), None);
 
   if total_chars <= SINGLE_MAX_CHARS {
@@ -477,36 +1014,112 @@ fn run_summary(
     return Ok(finish_text(full, truncated, &mut on_delta));
   }
 
-  // 超长：先分段提炼，再合并总结
+  // 超长：章节优先分段 → 带「前文脉络」提炼 →（必要时组内合并）→ 全书合成
+  // 可选：分段/合并走本地蒸馏，终稿仍走云端，减少云端污染与费用
+  let use_local_map = local.mode == LocalMode::Map || local.mode == LocalMode::MapMerge;
+  let use_local_merge = local.mode == LocalMode::MapMerge;
   let parts = split_text(text, PART_CHARS);
-  let n = parts.len();
+  let n = parts.len().max(1);
+  let mode_hint = if use_local_map {
+    format!("；分段用本地「{}」", local.model)
+  } else {
+    String::new()
+  };
+  emit(
+    app,
+    "progress",
+    &format!("长文约 {total_chars} 字，将分 {n} 段提炼并保留关联{mode_hint}…"),
+    None,
+    Some(4.0),
+  );
+
   let mut notes: Vec<String> = Vec::with_capacity(n);
+  let mut bridge = String::new();
+  let mut fallback_warned = false;
   for (i, part) in parts.iter().enumerate() {
     if cancel.load(Ordering::SeqCst) {
       return Err("已取消".into());
     }
+    let title = peek_title(part);
+    let who = if use_local_map { "本地蒸馏" } else { label };
     emit(
       app,
       "progress",
-      &format!("文稿较长，分段提炼 {}/{}…", i + 1, n),
+      &format!("{who} 提炼 {}/{}：{}…", i + 1, n, title),
       None,
-      Some(5.0 + 80.0 * i as f32 / n as f32),
+      Some(5.0 + 70.0 * i as f32 / n as f32),
     );
-    let user = format!(
-      "这是一篇长篇讲话转写的第 {}/{} 段。请按原顺序提炼本段的论点、重要经文/案例/数据、人名术语，\
-用条目列出，约 300–600 字，不要写总评。\n\n【转写文稿】\n{}",
-      i + 1,
-      n,
-      part
-    );
-    let (full, _) = chat_stream(&client, v, key, model, &user, cancel, &mut |_: &str| {})?;
-    notes.push(format!("### 第 {} 段要点\n{}", i + 1, full.trim()));
+    let user = map_part_prompt(i + 1, n, &title, &bridge, part);
+    let full = distill_once(
+      &client,
+      &local,
+      use_local_map,
+      v,
+      key,
+      model,
+      &user,
+      cancel,
+      &mut fallback_warned,
+      app,
+    )?;
+    let note = format!("### 第 {}/{} 段 · {}\n{}", i + 1, n, title, full.trim());
+    bridge = bridge_from_note(&note);
+    notes.push(note);
   }
-  emit(app, "progress", "合并各段，生成整体总结…", None, Some(88.0));
-  let user = format!(
-    "{prompt}\n\n以下是同一篇讲话按先后顺序分成 {n} 段整理出的要点，请据此完成整体总结（不要逐段复述）：\n\n{}",
-    notes.join("\n\n")
+
+  // 笔记仍过长：先做一层组内合并
+  let mut synth_notes = notes;
+  let joined_len: usize = synth_notes.iter().map(|s| char_len(s)).sum();
+  if joined_len > NOTES_DIRECT_MAX && synth_notes.len() > 2 {
+    let groups = pack_note_groups(&synth_notes, NOTES_GROUP_CHARS);
+    let gn = groups.len();
+    let who = if use_local_merge { "本地" } else { "云端" };
+    emit(
+      app,
+      "progress",
+      &format!("笔记较长，{who}组内合并关联 {} 组…", gn),
+      None,
+      Some(78.0),
+    );
+    let mut mid: Vec<String> = Vec::with_capacity(gn);
+    for (gi, g) in groups.iter().enumerate() {
+      if cancel.load(Ordering::SeqCst) {
+        return Err("已取消".into());
+      }
+      emit(
+        app,
+        "progress",
+        &format!("组内合并 {}/{}…", gi + 1, gn),
+        None,
+        Some(78.0 + 8.0 * gi as f32 / gn.max(1) as f32),
+      );
+      let user = merge_notes_prompt(g, gi + 1, gn);
+      let full = distill_once(
+        &client,
+        &local,
+        use_local_merge,
+        v,
+        key,
+        model,
+        &user,
+        cancel,
+        &mut fallback_warned,
+        app,
+      )?;
+      mid.push(format!("### 第 {}/{} 组纪要\n{}", gi + 1, gn, full.trim()));
+    }
+    synth_notes = mid;
+  }
+
+  emit(
+    app,
+    "progress",
+    &format!("云端 {label} 打通各段关联，生成全书总结…"),
+    None,
+    Some(90.0),
   );
+  let body = synth_notes.join("\n\n");
+  let user = final_synth_prompt(prompt, n, &body);
   let (full, truncated) = chat_stream(&client, v, key, model, &user, cancel, &mut on_delta)?;
   Ok(finish_text(full, truncated, &mut on_delta))
 }
@@ -547,12 +1160,18 @@ pub async fn ai_summarize(
     }
   };
   let (v, key, model) = active_creds(&app, vendor.as_deref())?;
+  let local = load_stored(&app).local_cfg();
+  let start = if local.mode == LocalMode::Off {
+    format!("连接{}…", v.label())
+  } else {
+    format!("本地蒸馏「{}」→ 云端 {}…", local.model, v.label())
+  };
   run_job(
     app,
     &state,
-    format!("连接{}…", v.label()),
+    start,
     "总结完成",
-    move |app, cancel| run_summary(app, v, &key, &model, &prompt, &text, cancel),
+    move |app, cancel| run_summary(app, v, &key, &model, &prompt, &text, local, cancel),
   )
   .await
 }
@@ -704,6 +1323,23 @@ mod tests {
     let parts = split_text(&text, 18_000);
     assert_eq!(parts.len(), 3);
     assert!(parts.iter().all(|p| p.chars().count() <= 18_000));
+  }
+
+  #[test]
+  fn split_prefers_chapter_boundary() {
+    let chap1 = format!("第一章 开篇\n{}", "甲".repeat(6000));
+    let chap2 = format!("第二章 转折\n{}", "乙".repeat(6000));
+    let text = format!("{chap1}\n{chap2}");
+    let parts = split_text(&text, 10_000);
+    assert!(parts.len() >= 2, "parts={}", parts.len());
+    assert!(parts[1].contains("第二章") || parts.iter().any(|p| p.starts_with("第二章")), "{:?}", parts.iter().map(|p| take_chars(p, 20)).collect::<Vec<_>>());
+  }
+
+  #[test]
+  fn heading_detects_cn_chapter() {
+    assert!(looks_like_heading("第一章 引言"));
+    assert!(looks_like_heading("## 小结"));
+    assert!(!looks_like_heading("这是一句普通的正文，很长很长很长很长很长很长很长。"));
   }
 
   #[test]

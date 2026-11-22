@@ -1,5 +1,6 @@
 // 录音转文字：本地 SenseVoice 离线转写（Rust 后端）+ DeepSeek / 千问总结（流式，可切换）
-// 记录存 localStorage（sp.transcribe.records）；DeepSeek Key 只在 Rust 侧保存，前端拿不到明文。
+// 记录经 localStorage 缓存，并由 store-sync 落盘到安装目录 data/store.json（升级保留）。
+// DeepSeek Key 只在 Rust 侧保存，前端拿不到明文。
 
 import { esc, lsGet, lsSet, toast, invoke, listen, pickFiles, convertFileSrc, fileExt } from './util.js';
 import { renderMarkdown } from './markdown.js';
@@ -13,10 +14,19 @@ const LS_PROMPT = 'sp.transcribe.prompt';
 const LS_PROMPT_LIBRARY = 'sp.transcribe.promptLibrary';
 const AUDIO_PICK_EXT = ['m4a', 'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4b', 'mp4', 'mka', 'webm'];
 const PDF_PICK_EXT = ['pdf'];
+const DOC_PICK_EXT = ['txt', 'text', 'md', 'markdown', 'epub', 'mobi', 'prc', 'azw'];
 const $ = (id) => document.getElementById(id);
 
 function isPdfPath(path) {
   return fileExt(path) === 'pdf';
+}
+
+function isDocPath(path) {
+  return DOC_PICK_EXT.includes(fileExt(path));
+}
+
+function isDocLikePath(path) {
+  return isPdfPath(path) || isDocPath(path);
 }
 
 let records = []; // 在 initTranscribe 里加载（loadRecords 依赖后面定义的常量）
@@ -293,6 +303,7 @@ function paintButtons() {
   $('tr-start').disabled = busy;
   $('tr-pick').disabled = busy;
   if ($('tr-pick-pdf')) $('tr-pick-pdf').disabled = busy;
+  if ($('tr-pick-doc')) $('tr-pick-doc').disabled = busy;
   $('tr-cancel').classList.toggle('hidden', !running);
   $('tr-sum').disabled = busy;
   $('tr-sum-stop').classList.toggle('hidden', !summarizing);
@@ -388,13 +399,393 @@ function applySummaryMode() {
   if (!source) renderSummary();
 }
 
+/** 从原文识别章节，返回 { id, title, level, start }[]（start 为字符偏移） */
+function detectChapters(text) {
+  const src = String(text || '');
+  if (!src.trim()) return [];
+  const lines = src.split('\n');
+  const out = [];
+  let pos = 0;
+  const md = /^(#{1,3})\s+(.+?)\s*$/;
+  const cn = /^(第[一二三四五六七八九十百千零〇两\d]+[章节回卷篇部][^\n]{0,48})$/;
+  const en = /^(chapter\s+\d+(?:[:.\s—-].{0,60})?)$/i;
+  const page = /^\[(?:第\s*)?(\d+)\s*页\]/;
+  const stampOnly = /^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.trim();
+    const start = pos;
+    pos += raw.length + 1; // + \n
+    if (!line) continue;
+
+    let m = line.match(md);
+    if (m) {
+      out.push({ id: `ch-${out.length}`, title: m[2].trim(), level: m[1].length, start });
+      continue;
+    }
+    if (cn.test(line) || en.test(line)) {
+      out.push({ id: `ch-${out.length}`, title: line.slice(0, 48), level: 1, start });
+      continue;
+    }
+    const pm = line.match(page);
+    if (pm && (line.length <= 24 || /^\[.+\]\s*$/.test(line))) {
+      out.push({ id: `ch-${out.length}`, title: `第 ${pm[1]} 页`, level: 2, start });
+      continue;
+    }
+    // 短标题行：前后空行、无句号结尾、不太像正文
+    const prevBlank = i === 0 || !lines[i - 1].trim();
+    const nextBlank = i === lines.length - 1 || !lines[i + 1]?.trim();
+    if (
+      prevBlank &&
+      nextBlank &&
+      line.length >= 2 &&
+      line.length <= 36 &&
+      !/[。！？；…]/.test(line) &&
+      !stampOnly.test(line) &&
+      !/^\[\d/.test(line)
+    ) {
+      out.push({ id: `ch-${out.length}`, title: line, level: 2, start });
+    }
+  }
+
+  // 没有章节时：按时间戳大段做目录（约每 5 分钟一条，或至少每隔若干段）
+  if (!out.length) {
+    const re = /\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g;
+    let lastMin = -999;
+    let m;
+    while ((m = re.exec(src))) {
+      const h = m[3] != null ? Number(m[1]) : 0;
+      const min = m[3] != null ? h * 60 + Number(m[2]) : Number(m[1]);
+      const sec = m[3] != null ? Number(m[3]) : Number(m[2]);
+      const totalMin = min + sec / 60;
+      if (totalMin - lastMin >= 5 || lastMin < 0) {
+        lastMin = totalMin;
+        const title = m[0];
+        const snippet = src.slice(m.index, Math.min(src.length, m.index + 48)).replace(/\s+/g, ' ').trim();
+        out.push({
+          id: `ch-${out.length}`,
+          title: snippet.length > 4 ? snippet : title,
+          level: 2,
+          start: m.index,
+        });
+      }
+    }
+  }
+
+  // 过多时抽稀
+  if (out.length > 80) {
+    const step = Math.ceil(out.length / 60);
+    return out.filter((_, i) => i % step === 0);
+  }
+  return out;
+}
+
+function formatParaHtml(p) {
+  return esc(p).replace(
+    /^\[(\d{1,2}:\d{2}(?::\d{2})?)\]/,
+    '<span class="tr-ts">[$1]</span>',
+  );
+}
+
+/** 带章节锚点的格式化 HTML；chapters 可选，不传则现场识别 */
+function textToStructuredHtml(t, chapters) {
+  const src = String(t || '');
+  if (!src.trim()) return '';
+  const chs = chapters || detectChapters(src);
+  const cuts = chs
+    .map((c, i) => ({ ...c, i }))
+    .sort((a, b) => a.start - b.start);
+  const parts = [];
+  let cursor = 0;
+  const pushBody = (chunk) => {
+    const paras = chunk
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    for (const p of paras) parts.push(`<p>${formatParaHtml(p)}</p>`);
+  };
+  for (const c of cuts) {
+    if (c.start < cursor) continue;
+    if (c.start > cursor) pushBody(src.slice(cursor, c.start));
+    const lv = Math.min(3, Math.max(1, c.level || 1));
+    parts.push(`<h${lv + 1} class="tr-ch lv${lv}" id="${esc(c.id)}" data-start="${c.start}">${esc(c.title)}</h${lv + 1}>`);
+    // 跳过标题行本身（到行尾）
+    let end = src.indexOf('\n', c.start);
+    if (end < 0) end = src.length;
+    else end += 1;
+    // 若该行就是标题，从下一行开始；否则从 start 起保留正文（时间戳目录项）
+    const line = src.slice(c.start, end).trim();
+    const isHeadingLine =
+      /^(#{1,3})\s+/.test(line) ||
+      /^第[一二三四五六七八九十百千零〇两\d]+[章节回卷篇部]/.test(line) ||
+      /^chapter\s+\d+/i.test(line) ||
+      /^\[(?:第\s*)?\d+\s*页\]/.test(line);
+    cursor = isHeadingLine ? end : c.start;
+  }
+  if (cursor < src.length) pushBody(src.slice(cursor));
+  return parts.join('') || `<p>${formatParaHtml(src.trim())}</p>`;
+}
+
 function textToHtml(t) {
-  return String(t || '')
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => `<p>${esc(p).replace(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]/, '<span class="tr-ts">[$1]</span>')}</p>`)
-    .join('');
+  return textToStructuredHtml(t);
+}
+
+function tocHtml(chapters) {
+  if (!chapters?.length) {
+    return '<div class="tr-toc-empty">暂无识别到章节。<br/>可用 Markdown 标题或「第一章」等写法。</div>';
+  }
+  return (
+    '<div class="tr-toc-head">目录</div>' +
+    chapters
+      .map(
+        (c) =>
+          `<button type="button" class="tr-toc-item lv${Math.min(3, c.level || 1)}" data-id="${esc(c.id)}" data-start="${c.start}" title="${esc(c.title)}">${esc(c.title)}</button>`,
+      )
+      .join('')
+  );
+}
+
+let textMode = lsGet('sp.transcribe.textMode', 'edit'); // edit | read
+let findState = { q: '', hits: [], i: -1, scope: 'panel' }; // panel | viewer
+
+function applyTextMode() {
+  const read = textMode === 'read';
+  $('tr-text-mode').textContent = read ? '编辑' : '阅读';
+  $('tr-text-mode').title = read ? '切回编辑原文' : '阅读：章节目录 + 格式展示';
+  $('tr-text-edit')?.classList.toggle('hidden', read);
+  $('tr-read-view')?.classList.toggle('hidden', !read);
+  $('tr-toc')?.classList.toggle('hidden', !read);
+  if (read) {
+    renderReadView();
+    $('tr-read-view')?.focus({ preventScroll: true });
+  }
+}
+
+function renderReadView() {
+  const text = $('tr-text')?.value || '';
+  const chapters = detectChapters(text);
+  const body = $('tr-read-body');
+  const toc = $('tr-toc');
+  if (toc) toc.innerHTML = tocHtml(chapters);
+  if (body) {
+    body.innerHTML = text.trim()
+      ? textToStructuredHtml(text, chapters)
+      : '<div class="tr-md-empty">还没有转写文字</div>';
+  }
+  // 阅读模式下若有搜索词，重新高亮
+  if (findState.scope === 'panel' && findState.q) applyFindHighlight('panel');
+}
+
+function scrollToChapter(start, id, scope = 'panel') {
+  if (scope === 'panel' && textMode === 'edit') {
+    const ta = $('tr-text');
+    if (!ta) return;
+    ta.focus();
+    const pos = Math.max(0, Number(start) || 0);
+    ta.setSelectionRange(pos, pos);
+    // 估算滚动
+    const ratio = ta.value.length ? pos / ta.value.length : 0;
+    ta.scrollTop = Math.max(0, ta.scrollHeight * ratio - 40);
+    return;
+  }
+  const root = scope === 'viewer'
+    ? $('tr-viewer-cols')?.querySelector('.tr-vcol[data-key="text"] .tr-viewer-content')
+    : $('tr-read-body');
+  const safeId = id && (window.CSS?.escape?.(id) || String(id).replace(/"/g, ''));
+  const el = (safeId && root?.querySelector(`#${safeId}`)) || root?.querySelector(`[data-start="${start}"]`);
+  el?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  const tocRoot = scope === 'viewer'
+    ? $('tr-viewer-cols')?.querySelector('.tr-vcol[data-key="text"] .tr-toc')
+    : $('tr-toc');
+  tocRoot?.querySelectorAll('.tr-toc-item').forEach((b) => {
+    b.classList.toggle('on', b.dataset.id === id || String(b.dataset.start) === String(start));
+  });
+}
+
+function collectFindHits(root) {
+  return root ? [...root.querySelectorAll('mark.tr-hit')] : [];
+}
+
+function clearFindMarks(root) {
+  if (!root) return;
+  root.querySelectorAll('mark.tr-hit').forEach((m) => {
+    const t = document.createTextNode(m.textContent || '');
+    m.replaceWith(t);
+  });
+  root.normalize();
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function highlightQueryInElement(root, q) {
+  clearFindMarks(root);
+  const query = String(q || '').trim();
+  if (!query || !root) return [];
+  const re = new RegExp(escapeRegExp(query), 'gi');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      if (node.parentElement?.closest('mark.tr-hit, .tr-toc, script, style')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const text = node.nodeValue;
+    re.lastIndex = 0;
+    if (!re.test(text)) continue;
+    re.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mark = document.createElement('mark');
+      mark.className = 'tr-hit';
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+  return collectFindHits(root);
+}
+
+function findRoot(scope) {
+  if (scope === 'viewer') {
+    return $('tr-viewer-cols')?.querySelector('.tr-vcol[data-key="text"] .tr-viewer-content');
+  }
+  if (textMode === 'read') return $('tr-read-body');
+  return null;
+}
+
+function updateFindCount(scope) {
+  const el = $(scope === 'viewer' ? 'tr-viewer-find-count' : 'tr-find-count');
+  if (!el) return;
+  const n = findState.hits.length;
+  if (!findState.q.trim()) {
+    el.textContent = '';
+    return;
+  }
+  el.textContent = n ? `${findState.i + 1}/${n}` : '无结果';
+}
+
+function focusFindHit(delta = 0) {
+  const hits = findState.hits;
+  if (!hits.length) {
+    updateFindCount(findState.scope);
+    return;
+  }
+  if (delta) findState.i = (findState.i + delta + hits.length) % hits.length;
+  if (findState.i < 0) findState.i = 0;
+  hits.forEach((h, i) => h.classList.toggle('on', i === findState.i));
+  hits[findState.i]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  updateFindCount(findState.scope);
+}
+
+function applyFindHighlight(scope, { keepIndex = false } = {}) {
+  findState.scope = scope;
+  const input = $(scope === 'viewer' ? 'tr-viewer-find' : 'tr-find');
+  const q = (input?.value || '').trim();
+  findState.q = q;
+
+  // 编辑模式：用 textarea 选区跳转
+  if (scope === 'panel' && textMode === 'edit') {
+    findState.hits = [];
+    findState.i = -1;
+    const ta = $('tr-text');
+    const countEl = $('tr-find-count');
+    if (!q || !ta) {
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    const lower = ta.value.toLowerCase();
+    const needle = q.toLowerCase();
+    const idxs = [];
+    let from = 0;
+    while (from < lower.length) {
+      const at = lower.indexOf(needle, from);
+      if (at < 0) break;
+      idxs.push(at);
+      from = at + Math.max(1, needle.length);
+    }
+    if (!idxs.length) {
+      if (countEl) countEl.textContent = '无结果';
+      return;
+    }
+    const cur = ta.selectionStart || 0;
+    let i = idxs.findIndex((p) => p >= cur);
+    if (i < 0) i = 0;
+    findState.hits = idxs.map((p) => ({ start: p, end: p + q.length }));
+    findState.i = i;
+    const hit = findState.hits[i];
+    ta.focus();
+    ta.setSelectionRange(hit.start, hit.end);
+    const ratio = ta.value.length ? hit.start / ta.value.length : 0;
+    ta.scrollTop = Math.max(0, ta.scrollHeight * ratio - 60);
+    if (countEl) countEl.textContent = `${i + 1}/${idxs.length}`;
+    return;
+  }
+
+  const root = findRoot(scope);
+  const prev = keepIndex ? findState.i : -1;
+  findState.hits = highlightQueryInElement(root, q);
+  findState.i = prev >= 0 && prev < findState.hits.length ? prev : findState.hits.length ? 0 : -1;
+  if (findState.i >= 0) focusFindHit(0);
+  else updateFindCount(scope);
+}
+
+function findStep(scope, delta) {
+  findState.scope = scope;
+  if (scope === 'panel' && textMode === 'edit') {
+    const ta = $('tr-text');
+    const q = ($('tr-find')?.value || '').trim();
+    if (!q || !ta) return;
+    const lower = ta.value.toLowerCase();
+    const needle = q.toLowerCase();
+    const idxs = [];
+    let from = 0;
+    while (from < lower.length) {
+      const at = lower.indexOf(needle, from);
+      if (at < 0) break;
+      idxs.push(at);
+      from = at + Math.max(1, needle.length);
+    }
+    if (!idxs.length) {
+      $('tr-find-count').textContent = '无结果';
+      return;
+    }
+    const cur = ta.selectionStart || 0;
+    let i = idxs.findIndex((p) => (delta > 0 ? p > cur : p >= cur));
+    if (delta > 0) {
+      if (i < 0) i = 0;
+      else if (idxs[i] === cur && ta.selectionEnd - ta.selectionStart === q.length) i = (i + 1) % idxs.length;
+    } else {
+      // 上一个
+      i = -1;
+      for (let k = idxs.length - 1; k >= 0; k--) {
+        if (idxs[k] < cur) {
+          i = k;
+          break;
+        }
+      }
+      if (i < 0) i = idxs.length - 1;
+    }
+    const pos = idxs[i];
+    ta.focus();
+    ta.setSelectionRange(pos, pos + q.length);
+    const ratio = ta.value.length ? pos / ta.value.length : 0;
+    ta.scrollTop = Math.max(0, ta.scrollHeight * ratio - 60);
+    $('tr-find-count').textContent = `${i + 1}/${idxs.length}`;
+    return;
+  }
+  if (!findState.hits.length || findState.scope !== scope) applyFindHighlight(scope);
+  else focusFindHit(delta);
 }
 
 // 放大查看可以并排显示：原文 + 每份总结（一份总结就只显示那一份）
@@ -418,12 +809,21 @@ function colIsLive(col) {
 function paintPane(pane, col) {
   const scroller = pane.querySelector('.tr-vscroll');
   const box = pane.querySelector('.tr-viewer-content');
+  if (!scroller || !box) return;
   const keepBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
   const src = colSource(col);
   if (col.md) {
     box.innerHTML = src.trim() ? renderMarkdown(src) : '<div class="tr-md-empty">还没有总结内容</div>';
   } else {
-    box.innerHTML = textToHtml(src) || '<div class="tr-md-empty">还没有转写文字</div>';
+    const chapters = detectChapters(src);
+    const toc = pane.querySelector('.tr-toc');
+    if (toc) toc.innerHTML = tocHtml(chapters);
+    box.innerHTML = src.trim()
+      ? textToStructuredHtml(src, chapters)
+      : '<div class="tr-md-empty">还没有转写文字</div>';
+    if (findState.scope === 'viewer' && ($('tr-viewer-find')?.value || '').trim()) {
+      applyFindHighlight('viewer', { keepIndex: true });
+    }
   }
   if (colIsLive(col) && keepBottom) scroller.scrollTop = scroller.scrollHeight;
 }
@@ -465,14 +865,17 @@ function buildViewer() {
     .filter((c) => viewerShow.has(c.key))
     .forEach((c) => {
       const pane = old.get(c.key) || document.createElement('section');
-      if (!pane.firstChild) {
+      const needShell = !pane.firstChild || (c.key === 'text' && !pane.querySelector('.tr-toc'));
+      if (needShell) {
         pane.className = 'tr-vcol';
         pane.dataset.key = c.key;
         pane.innerHTML = `<header class="tr-vcol-head"><span class="tr-vcol-title"></span><span class="tr-vcol-btns"><button type="button" class="mini-btn" data-copy="1">复制</button><button type="button" class="mini-btn" data-export="1" title="导出这一列">导出</button></span></header>
-          <div class="tr-vscroll" tabindex="0"><div class="tr-viewer-content"></div></div>`;
+          <div class="tr-vcol-body">${c.key === 'text' ? '<aside class="tr-toc" data-scope="viewer" aria-label="章节目录"></aside>' : ''}
+          <div class="tr-vscroll" tabindex="0"><div class="tr-viewer-content"></div></div></div>`;
       }
       pane.querySelector('.tr-vcol-title').textContent = c.title;
-      pane.querySelector('.tr-viewer-content').className = `tr-viewer-content${c.md ? ' tr-md' : ''}`;
+      const content = pane.querySelector('.tr-viewer-content');
+      if (content) content.className = `tr-viewer-content${c.md ? ' tr-md' : ''}`;
       wrap.appendChild(pane);
     });
   wrap.dataset.n = String(wrap.children.length);
@@ -561,6 +964,8 @@ function paintEditor() {
   if (r?.language) $('tr-lang').value = r.language;
   setProgress(0, '');
   paintButtons();
+  if (textMode === 'read') renderReadView();
+  else if (($('tr-find')?.value || '').trim()) applyFindHighlight('panel');
 }
 
 function readEditorInto(r) {
@@ -730,6 +1135,11 @@ async function pickPdf() {
   assignPickedFiles(files, 'PDF');
 }
 
+async function pickDoc() {
+  const files = await pickFiles(DOC_PICK_EXT, '选择 TXT / EPUB / MOBI 文稿');
+  assignPickedFiles(files, '文稿');
+}
+
 async function startTranscribe() {
   if (running || summarizing) return;
   if (queuedPaths.length) {
@@ -753,7 +1163,7 @@ async function startTranscribe() {
     return;
   }
   const path = cleanPath($('tr-path').value);
-  if (!path) return toast('先选择录音或 PDF，或粘贴文件路径');
+  if (!path) return toast('先选择录音 / PDF / 文稿，或粘贴文件路径');
   $('tr-path').value = path;
 
   let r = cur();
@@ -772,6 +1182,7 @@ async function startTranscribe() {
 
 async function transcribeOne(path, r, batchProgress = '') {
   if (isPdfPath(path)) return transcribePdfOne(path, r, batchProgress);
+  if (isDocPath(path)) return transcribeDocOne(path, r, batchProgress);
   r.path = path;
   r.language = $('tr-lang').value || 'auto';
   lsSet(LS_LANG, r.language);
@@ -814,6 +1225,69 @@ async function transcribeOne(path, r, batchProgress = '') {
       return 'failed';
     }
     return 'cancelled';
+  } finally {
+    running = false;
+    paintButtons();
+    paintList();
+  }
+}
+
+async function transcribeDocOne(path, r, batchProgress = '') {
+  r.path = path;
+  r.language = $('tr-lang').value || 'auto';
+  lsSet(LS_LANG, r.language);
+  $('tr-text').value = '';
+  setSummary('');
+  r.text = '';
+  r.sums = [];
+  r.active = 0;
+  paintTabs();
+  persist();
+  paintList();
+
+  running = true;
+  paintButtons();
+  const kindLabel = fileExt(path).toUpperCase() || '文稿';
+  setProgress(0, batchProgress ? `批量文稿 ${batchProgress}：正在读取…` : `正在读取 ${kindLabel}…`);
+  const t0 = Date.now();
+  try {
+    const res = await invoke('extract_doc_text', { path });
+    const text = String(res?.text || '').trim();
+    const title = String(res?.title || '').trim();
+    $('tr-text').value = text;
+    if (viewerOpen) refreshViewer('text');
+    const rec = records.find((x) => x.id === r.id);
+    if (rec) {
+      rec.text = text;
+      if (title && (!rec.title || rec.title === '新转写' || rec.title === baseName(path))) {
+        rec.title = title;
+      }
+      rec.durationSec = 0;
+      rec.updatedAt = Date.now();
+    }
+    persist();
+    paintList();
+    paintEditor();
+    setProgress(100, `已导入 ${kindLabel} · ${res?.chars || text.length} 字`, 'done');
+    const elapsed = (Date.now() - t0) / 1000;
+    if (!text) {
+      if (!batchProgress) toast('没有抽出文字');
+      return 'failed';
+    }
+    if (!batchProgress) {
+      toast(`文稿导入完成：${title || baseName(path)}（${res?.chars || text.length} 字，用时 ${fmtDur(elapsed)}）`, 6000);
+    }
+    return 'done';
+  } catch (err) {
+    const msg = String(err?.message || err);
+    const rec = records.find((x) => x.id === r.id);
+    if (rec) {
+      rec.text = $('tr-text').value.trim();
+      persist();
+    }
+    if (!batchProgress) toast('文稿导入失败：' + msg, 8000);
+    setProgress(0, msg, 'error');
+    return 'failed';
   } finally {
     running = false;
     paintButtons();
@@ -901,6 +1375,7 @@ function onTranscribeEvent(p) {
       const ta = $('tr-text');
       ta.value += `[${fmtTs(p.start)}] ${p.text}\n\n`;
       ta.scrollTop = ta.scrollHeight;
+      if (textMode === 'read') renderReadView();
       if (viewerOpen) refreshViewer('text');
       if (typeof p.percent === 'number') setProgress(p.percent, `转写中… ${Math.round(p.percent)}%`);
       break;
@@ -942,15 +1417,78 @@ function curVendor() {
 function paintAiLabels() {
   if (!aiState) return;
   const sum = aiState[aiState.provider];
-  $('tr-sum').title = `把左侧文字发给 ${sum.label} 总结（仅发送文字，不发送音频）`;
+  const loc = aiState.local;
+  $('tr-sum').title = loc && loc.mode !== 'off'
+    ? `长文先本地「${loc.model}」蒸馏，再用 ${sum.label} 出终稿（短文仍直接云端）`
+    : `把左侧文字发给 ${sum.label} 总结（仅发送文字，不发送音频）`;
   const el = $('tr-key-state');
   if (el) {
-    el.textContent = `${sum.label}：${sum.hasKey ? '已保存 ' + sum.keyHint : '未设置 Key'}`;
+    const localBit = loc && loc.mode !== 'off' ? ` · 本地${loc.modeLabel || loc.mode}` : '';
+    el.textContent = `${sum.label}：${sum.hasKey ? '已保存 ' + sum.keyHint : '未设置 Key'}${localBit}`;
     el.classList.toggle('is-ok', !!sum.hasKey);
   }
   $('tr-provider').value = aiState.provider;
+  paintLocalFields();
   $('tr-hint').textContent =
-    '转写始终在本机离线完成，音频不出电脑；总结只把文字发给所选的 AI。Key 只写入本机配置文件，不进入导出文件。';
+    '转写始终在本机离线完成；长文可先本地蒸馏再云端终稿。Key 只写入本机配置文件，不进入导出文件。';
+}
+
+function paintLocalFields() {
+  const loc = aiState?.local;
+  if (!loc) return;
+  if ($('tr-local-mode')) $('tr-local-mode').value = loc.mode || 'off';
+  if ($('tr-local-url')) $('tr-local-url').value = loc.baseUrl || loc.defaultUrl || '';
+  if ($('tr-local-model')) $('tr-local-model').value = loc.model || loc.defaultModel || '';
+  const on = (loc.mode || 'off') !== 'off';
+  $('tr-local-cfg')?.classList.toggle('is-dim', !on);
+  if ($('tr-local-hint')) {
+    $('tr-local-hint').textContent = on
+      ? `已启用：分段用本地「${loc.model}」，终稿用云端。原文分段不出本机整本上传；本地失败会自动回退云端。`
+      : '可选：安装 Ollama 后执行 ollama pull qwen2.5:3b。长文分段在本地完成，只有终稿笔记发给云端。';
+  }
+}
+
+async function saveLocalSettings() {
+  const mode = $('tr-local-mode')?.value || 'off';
+  const baseUrl = $('tr-local-url')?.value?.trim() || '';
+  const model = $('tr-local-model')?.value?.trim() || '';
+  try {
+    aiState = await invoke('ai_settings_set', {
+      input: {
+        localPreprocess: mode,
+        localBaseUrl: baseUrl || null,
+        localModel: model || null,
+      },
+    });
+    paintAiLabels();
+    toast(mode === 'off' ? '已关闭本地预处理' : `已保存：${aiState.local?.modeLabel || mode}`);
+  } catch (err) {
+    toast('保存本地设置失败：' + (err?.message || err));
+  }
+}
+
+async function probeLocal() {
+  // 先把界面上的地址/模型写入，再探测
+  await saveLocalSettings();
+  try {
+    const r = await invoke('ai_local_probe');
+    const list = Array.isArray(r?.models) ? r.models : [];
+    if (list.length) {
+      $('tr-local-model-list').innerHTML = list
+        .slice(0, 40)
+        .map((m) => `<option value="${esc(m)}"></option>`)
+        .join('');
+    }
+    const ready = r?.modelReady !== false;
+    toast(
+      ready
+        ? `本地可用：${r.baseUrl} · 模型 ${r.model}${list.length ? `（已发现 ${list.length} 个）` : ''}`
+        : `已连上 ${r.baseUrl}，但未看到模型「${r.model}」。可 ollama pull ${r.model}`,
+      7000,
+    );
+  } catch (err) {
+    toast('本地检测失败：' + (err?.message || err), 8000);
+  }
 }
 
 // 切换服务商时才刷新 Key 输入框占位、模型名、模型建议
@@ -1128,7 +1666,20 @@ async function summarize(addVendor = '') {
   const vendor = addVendor || aiState?.provider || 'deepseek';
   if (!(await ensureKey(vendor))) return;
   const label = aiState?.[vendor]?.label || VENDOR_LABEL[vendor] || 'AI';
-  if (text.length > 100000 && !window.confirm(`文稿约 ${Math.round(text.length / 1000)} 千字，会分段调用 ${label}，费用相应增加。继续？`)) return;
+  if (text.length > 28000) {
+    const approxParts = Math.max(2, Math.ceil(text.length / 14000));
+    const loc = aiState?.local;
+    const localOn = loc && loc.mode && loc.mode !== 'off';
+    const okLong = window.confirm(
+      `文稿约 ${Math.round(text.length / 1000)} 千字，将分约 ${approxParts} 段提炼（带前文关联），`
+      + (text.length > 80000 ? '必要时再组内合并，' : '')
+      + (localOn
+        ? `分段走本地「${loc.model}」，终稿走 ${label}（原文不整本上传云端）。`
+        : `全程调用 ${label}，费用较高；可在设置里改「长文预处理」用本地蒸馏。`)
+      + `\n\n长书建议模板选「长书 / 长文」。继续？`,
+    );
+    if (!okLong) return;
+  }
 
   const r = cur() || newRecord('');
   readEditorInto(r);
@@ -2286,6 +2837,7 @@ export function initTranscribe() {
 
   $('tr-pick').addEventListener('click', () => pickAudio());
   $('tr-pick-pdf')?.addEventListener('click', () => pickPdf());
+  $('tr-pick-doc')?.addEventListener('click', () => pickDoc());
   $('tr-start').addEventListener('click', () => startTranscribe());
   $('tr-cancel').addEventListener('click', () => {
     cancelPdfExtract();
@@ -2359,6 +2911,55 @@ export function initTranscribe() {
   });
   initProofPlayer();
   $('tr-text-export').addEventListener('click', () => $('tr-export').click());
+  // 阅读 / 编辑 + 章节目录 + 全文搜索
+  applyTextMode();
+  $('tr-text-mode')?.addEventListener('click', () => {
+    textMode = textMode === 'read' ? 'edit' : 'read';
+    lsSet('sp.transcribe.textMode', textMode);
+    applyTextMode();
+  });
+  $('tr-toc')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.tr-toc-item');
+    if (!btn) return;
+    scrollToChapter(btn.dataset.start, btn.dataset.id, 'panel');
+  });
+  const onFindInput = (scope) => {
+    clearTimeout(onFindInput._t);
+    onFindInput._t = setTimeout(() => applyFindHighlight(scope), 160);
+  };
+  $('tr-find')?.addEventListener('input', () => onFindInput('panel'));
+  $('tr-find')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      findStep('panel', e.shiftKey ? -1 : 1);
+    }
+  });
+  $('tr-find-next')?.addEventListener('click', () => findStep('panel', 1));
+  $('tr-find-prev')?.addEventListener('click', () => findStep('panel', -1));
+  $('tr-viewer-find')?.addEventListener('input', () => onFindInput('viewer'));
+  $('tr-viewer-find')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      findStep('viewer', e.shiftKey ? -1 : 1);
+    }
+  });
+  $('tr-viewer-find-next')?.addEventListener('click', () => findStep('viewer', 1));
+  $('tr-viewer-find-prev')?.addEventListener('click', () => findStep('viewer', -1));
+  $('tr-viewer-cols')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.tr-toc-item');
+    if (!btn) return;
+    scrollToChapter(btn.dataset.start, btn.dataset.id, 'viewer');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || (e.key !== 'f' && e.key !== 'F')) return;
+    const viewerOn = viewerOpen && !$('tr-viewer')?.classList.contains('hidden');
+    const panelOn = $('panel-transcribe')?.classList.contains('active');
+    if (!viewerOn && !panelOn) return;
+    e.preventDefault();
+    const input = viewerOn ? $('tr-viewer-find') : $('tr-find');
+    input?.focus();
+    input?.select();
+  });
   $('tr-preset').addEventListener('change', () => applyPreset($('tr-preset').value));
   $('tr-prompt-save').addEventListener('click', () => {
     const text = $('tr-prompt').value.trim(); if (!text) return toast('先填写提示词');
@@ -2473,6 +3074,12 @@ export function initTranscribe() {
   $('tr-provider').addEventListener('change', () => onProviderChange());
   $('tr-key-save').addEventListener('click', () => saveKey());
   $('tr-key-clear').addEventListener('click', () => clearKey());
+  $('tr-local-mode')?.addEventListener('change', () => {
+    const on = ($('tr-local-mode')?.value || 'off') !== 'off';
+    $('tr-local-cfg')?.classList.toggle('is-dim', !on);
+  });
+  $('tr-local-save')?.addEventListener('click', () => saveLocalSettings());
+  $('tr-local-probe')?.addEventListener('click', () => probeLocal());
   $('tr-key').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') saveKey();
   });

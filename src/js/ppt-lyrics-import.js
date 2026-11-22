@@ -9,7 +9,8 @@ const ARTIST_RE = /所属歌手|演唱者?|歌手\s*[：:]|^Artist\s*[：:]/i;
 
 /** 一页上的文字：按文本框位置从上到下、从左到右拼行 */
 export function slideLines(slide) {
-  const boxes = [...(slide?.textBoxes || [])].sort((a, b) => (a.y - b.y) || (a.x - b.x));
+  // Rust 侧字段是 text_boxes（snake_case）；兼容旧 camelCase
+  const boxes = [...(slide?.text_boxes || slide?.textBoxes || [])].sort((a, b) => (a.y - b.y) || (a.x - b.x));
   const lines = [];
   for (const box of boxes) {
     for (const ln of box.lines || []) {

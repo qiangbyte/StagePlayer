@@ -1,5 +1,5 @@
-// localStorage ⇄ 应用数据目录 store.json
-// localStorage 是运行时缓存（同步读写快）；store.json 是真正的存档，带自动备份
+// localStorage ⇄ 安装目录 data/store.json（不可写时回退 AppData）
+// localStorage 是运行时缓存；store.json 是真正的存档（转写文字、节目单），升级换 exe 也保留
 // 启动：boot.js 先 hydrateFromFile()，再加载 main.js
 import { invoke, setLsWriteHook, toast } from './util.js';
 

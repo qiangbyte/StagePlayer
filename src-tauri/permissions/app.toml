@@ -63,8 +63,10 @@ commands.allow = [
   "transcribe_cancel",
   "ocr_status",
   "ocr_image",
+  "extract_doc_text",
   "ai_settings_get",
   "ai_settings_set",
+  "ai_local_probe",
   "ai_summarize",
   "ai_refine",
   "ai_cancel"

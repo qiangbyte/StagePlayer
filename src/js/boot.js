@@ -12,10 +12,17 @@ function withTimeout(promise, ms, label) {
 }
 
 try {
-  window.__spStoreAction = await withTimeout(hydrateFromFile(), 2000, '数据恢复');
+  // 转写正文可能较大，给足落盘恢复时间，避免超时后模块读到空记录
+  window.__spStoreAction = await withTimeout(hydrateFromFile(), 12000, '数据恢复');
 } catch (err) {
   console.warn('[boot] 数据恢复跳过，使用本地缓存', err);
   window.__spStoreAction = 'skip';
+  // 超时/失败时仍挂上落盘钩子，避免之后改动只留在 WebView 缓存
+  try {
+    const { setLsWriteHook } = await import('./util.js');
+    const { flushStore } = await import('./store-sync.js');
+    setLsWriteHook(() => { flushStore(); });
+  } catch { /* ignore */ }
 }
 
 await import('./main.js');

@@ -835,6 +835,7 @@
               <div class="tr-main-actions">
                 <button type="button" class="mini-btn accent" id="tr-pick" title="可多选录音文件；批量选择后会依次转写（m4a / mp3 / wav / flac / aac / ogg）">＋ 选择音频</button>
                 <button type="button" class="mini-btn accent" id="tr-pick-pdf" title="PDF 转文字：优先抽文字层；扫描页用系统本地 OCR，不上传、不按页计费">＋ 选择 PDF</button>
+                <button type="button" class="mini-btn accent" id="tr-pick-doc" title="导入 TXT / EPUB / MOBI 文稿为纯文本，本地解析不上传；AZW3 请先转 EPUB">＋ 选择文稿</button>
                 <button type="button" class="mini-btn primary" id="tr-start" title="音频走 SenseVoice；PDF 走文字层 + 本地 OCR">开始转写</button>
                 <button type="button" class="mini-btn danger hidden" id="tr-cancel">取消转写</button>
               </div>
@@ -846,7 +847,7 @@
               </div>
             </div>
             <div class="tr-file-row">
-              <input type="text" id="tr-path" spellcheck="false" placeholder="音频或 PDF 路径：可粘贴，或点「选择音频 / 选择 PDF」" />
+              <input type="text" id="tr-path" spellcheck="false" placeholder="音频 / PDF / 文稿路径：可粘贴，或点「选择音频 / PDF / 文稿」" />
               <label class="tr-lang">语言
                 <select id="tr-lang" title="自动识别适合普通话/粤语/英语混合；已知语种时指定更稳">
                   <option value="auto">自动</option>
@@ -866,17 +867,34 @@
             <div class="tr-split">
               <div class="tr-box">
                 <div class="tr-box-head">
-                  <span class="talk-live-label">转写文字（可直接修改）</span>
+                  <span class="talk-live-label">转写文字</span>
                   <span class="tr-box-tools">
+                    <button type="button" class="mini-btn" id="tr-text-mode" title="阅读：章节目录 + 格式展示；编辑：可改原文">阅读</button>
                     <button type="button" class="mini-btn" id="tr-proofread" title="AI 逐段往下检查全文，边查边把疑点标在原文里；每条建议由你决定是否采纳，随时可停止">AI 校对</button>
                     <button type="button" class="mini-btn" id="tr-text-export" title="导出原文为 txt（含时间点）">导出</button>
                     <button type="button" class="mini-btn" id="tr-text-zoom" title="放大查看，可滚动阅读">⤢ 放大</button>
                   </span>
                 </div>
-                <div class="tr-text-wrap">
-                  <div id="tr-text-highlight" aria-hidden="true"></div>
-                  <textarea id="tr-text" class="tr-text" spellcheck="false"
-                    placeholder="转写结果会实时出现在这里。&#10;音频：每段带时间点；PDF：每段带页码。&#10;首次音频转写会下载 SenseVoice（约 230MB）；PDF 优先抽文字层，扫描页用系统本地 OCR。"></textarea>
+                <div class="tr-findbar" id="tr-findbar">
+                  <input type="search" id="tr-find" spellcheck="false" placeholder="搜索原文…（Ctrl+F）" title="全文搜索" />
+                  <button type="button" class="mini-btn" id="tr-find-prev" title="上一个（Shift+Enter）">↑</button>
+                  <button type="button" class="mini-btn" id="tr-find-next" title="下一个（Enter）">↓</button>
+                  <span class="tr-find-count mono" id="tr-find-count"></span>
+                </div>
+                <div class="tr-text-pane" id="tr-text-pane">
+                  <aside class="tr-toc hidden" id="tr-toc" aria-label="章节目录"></aside>
+                  <div class="tr-text-main">
+                    <div class="tr-text-wrap" id="tr-text-edit">
+                      <div id="tr-text-highlight" aria-hidden="true"></div>
+                      <textarea id="tr-text" class="tr-text" spellcheck="false"
+                        placeholder="转写结果会实时出现在这里。&#10;音频：每段带时间点；PDF：每段带页码。&#10;点「阅读」可看章节目录与格式正文，并支持全文搜索。"></textarea>
+                    </div>
+                    <div class="tr-read-view hidden" id="tr-read-view" tabindex="0" aria-label="原文阅读">
+                      <div class="tr-read-scroll" id="tr-read-scroll">
+                        <div class="tr-read-body" id="tr-read-body"></div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
                 <div class="tr-proof-player hidden" id="tr-proof-player" aria-label="试听这一段原音">
                   <button type="button" class="mini-btn primary" id="tr-pp-toggle" title="播放 / 暂停">▶</button>
@@ -900,6 +918,7 @@
                 <div class="tr-ai-bar">
                   <select id="tr-preset" title="总结风格 / 模板">
                     <option value="deep">深度结构化</option>
+                    <option value="book">长书 / 长文</option>
                     <option value="sermon">讲道 / 讲座</option>
                     <option value="meeting">会议纪要</option>
                     <option value="brief">200 字摘要</option>
@@ -932,6 +951,27 @@
                       <button type="button" class="mini-btn primary" id="tr-key-save">保存</button>
                       <button type="button" class="mini-btn danger" id="tr-key-clear" title="从本机删除已保存的 Key">清除 Key</button>
                     </div>
+                    <div class="tr-settings-row">
+                      <label class="tr-lbl" for="tr-local-mode">长文预处理</label>
+                      <select id="tr-local-mode" title="长文先本地蒸馏再云端终稿，可减少污染与费用；短文仍直接云端">
+                        <option value="off">关闭（全程云端）</option>
+                        <option value="map">本地蒸馏分段 → 云端终稿</option>
+                        <option value="map_merge">本地分段+合并 → 云端终稿</option>
+                      </select>
+                    </div>
+                    <div class="tr-settings-row" id="tr-local-cfg">
+                      <input type="text" id="tr-local-url" spellcheck="false" placeholder="本地地址 http://127.0.0.1:1234/v1" title="LM Studio Local Server（默认 1234）或 Ollama 11434" />
+                      <input type="text" id="tr-local-model" list="tr-local-model-list" spellcheck="false" placeholder="本地模型 qwen/qwen3.6-27b" />
+                      <datalist id="tr-local-model-list">
+                        <option value="qwen/qwen3.6-27b"></option>
+                        <option value="qwen2.5:7b"></option>
+                        <option value="qwen2.5:3b"></option>
+                        <option value="phi3:mini"></option>
+                      </datalist>
+                      <button type="button" class="mini-btn" id="tr-local-probe" title="检测本机 LM Studio / Ollama 是否可用">检测本地</button>
+                      <button type="button" class="mini-btn primary" id="tr-local-save">保存本地</button>
+                    </div>
+                    <div class="hint" id="tr-local-hint">已适配 LM Studio：先在 LM Studio 开启 Local Server（端口 1234）并加载模型。长文分段本地完成，终稿再交云端。</div>
                     <div class="hint" id="tr-hint">Key 只写入本机配置文件，不进入节目单/导出文件。</div>
                     <div class="tr-prompt-compact">
                       <div class="tr-prompt-compact-head">
@@ -1013,6 +1053,12 @@
               <span class="tr-viewer-title" id="tr-viewer-title"></span>
               <span class="tr-vtabs" id="tr-viewer-tabs"></span>
               <span class="tr-viewer-spacer"></span>
+              <div class="tr-findbar tr-findbar-inline" id="tr-viewer-findbar">
+                <input type="search" id="tr-viewer-find" spellcheck="false" placeholder="搜索…（Ctrl+F）" />
+                <button type="button" class="mini-btn" id="tr-viewer-find-prev" title="上一个">↑</button>
+                <button type="button" class="mini-btn" id="tr-viewer-find-next" title="下一个">↓</button>
+                <span class="tr-find-count mono" id="tr-viewer-find-count"></span>
+              </div>
               <button type="button" class="mini-btn hidden" id="tr-viewer-copy" title="复制当前显示的内容">复制</button>
               <button type="button" class="mini-btn hidden" id="tr-viewer-export" title="导出当前显示的内容（原文为 txt，总结为 md）">导出</button>
               <span class="tr-viewer-size" id="tr-viewer-size"></span>

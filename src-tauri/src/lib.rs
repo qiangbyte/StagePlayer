@@ -6,6 +6,7 @@ mod dictation_polish;
 mod fileio;
 mod karaoke;
 mod lyric_follow;
+mod ebook;
 mod ocr;
 mod output;
 mod pect;
@@ -182,8 +183,10 @@ pub fn run() {
             transcribe::transcribe_cancel,
             ocr::ocr_status,
             ocr::ocr_image,
+            ebook::extract_doc_text,
             llm::ai_settings_get,
             llm::ai_settings_set,
+            llm::ai_local_probe,
             llm::ai_summarize,
             llm::ai_refine,
             llm::ai_cancel
